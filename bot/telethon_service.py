@@ -137,10 +137,22 @@ class TelethonService:
         entity_id = int(utils.get_peer_id(entity))
         if not entity_id:
             raise ValueError("Telegram entity did not have a valid ID.")
+
+        # Only public channels/groups/bots/users are allowed as source or
+        # destination. A missing `.username` means it has no public link,
+        # i.e. it is a private channel/group — reject it explicitly.
+        is_user = getattr(entity, "first_name", None) is not None
+        has_username = bool(getattr(entity, "username", None))
+        if not is_user and not has_username:
+            raise ValueError(
+                "This looks like a private channel/group (no public @username). "
+                "Only public channels, groups, bots, or users are supported."
+            )
+
         return {
             "chat_id": entity_id,
-            "label": value.strip(),
-            "entity_ref": value.strip(),
+            "label": getattr(entity, "username", None) or value.strip(),
+            "entity_ref": entity_id,
         }
 
     async def cancel_all_logins(self) -> None:
