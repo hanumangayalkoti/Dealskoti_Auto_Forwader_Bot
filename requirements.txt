@@ -1,0 +1,13 @@
+aiogram>=3.22,<4
+APScheduler>=3.11,<4
+asyncpg>=0.30,<1
+cryptography>=45,<49
+fastapi>=0.116,<1
+httpx>=0.28,<1
+Telethon>=1.42,<2
+uvicorn[standard]>=0.35,<1
+aiogram
+APScheduler
+asyncpg
+httpx
+Telethon
