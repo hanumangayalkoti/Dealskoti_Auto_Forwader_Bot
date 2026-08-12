@@ -84,13 +84,20 @@ class RazorpayBilling:
         if event not in {"payment.captured", "payment_link.paid"}:
             return None
         payment_entity = (
-            payload.get("payload", {}).get("payment", {}).get("entity", {})
+            payload.get("payload", {}).get("payment", {}).get("entity", {}) or {}
         )
         link_entity = (
-            payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+            payload.get("payload", {}).get("payment_link", {}).get("entity", {}) or {}
         )
+        # We store the Razorpay *Payment Link* ID (plink_...) as our reference,
+        # since payments are created via /v1/payment_links, not raw /v1/orders.
+        # A plain "payment.captured" event carries a different order_id (order_...)
+        # that won't match what we stored, so prefer the payment link's own ID
+        # wherever the payload actually contains it, regardless of which event fired.
         order_id = (
-            link_entity.get("id") if event == "payment_link.paid" else payment_entity.get("order_id")
+            link_entity.get("id")
+            or payment_entity.get("payment_link_id")
+            or payment_entity.get("order_id")
         )
         payment_id = payment_entity.get("id")
         amount = payment_entity.get("amount") or link_entity.get("amount")
