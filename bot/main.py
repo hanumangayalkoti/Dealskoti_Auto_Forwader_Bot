@@ -57,6 +57,7 @@ class TaskStates(StatesGroup):
     waiting_name = State()
     waiting_source = State()
     waiting_destination = State()
+    waiting_rename = State()
 
 
 class TaskSettingsStates(StatesGroup):
@@ -257,6 +258,10 @@ async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
                             callback_data=f"task:resume:{task['id']}",
                         ),
                         InlineKeyboardButton(
+                            text=f"✏️ Edit #{task['id']}",
+                            callback_data=f"task:edit:{task['id']}",
+                        ),
+                        InlineKeyboardButton(
                             text=f"🗑️ Delete #{task['id']}",
                             callback_data=f"task:delete:{task['id']}",
                         ),
@@ -268,6 +273,10 @@ async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
                         InlineKeyboardButton(
                             text=f"⏸️ Pause #{task['id']}",
                             callback_data=f"task:pause:{task['id']}",
+                        ),
+                        InlineKeyboardButton(
+                            text=f"✏️ Edit #{task['id']}",
+                            callback_data=f"task:edit:{task['id']}",
                         ),
                         InlineKeyboardButton(
                             text=f"🗑️ Delete #{task['id']}",
@@ -761,6 +770,134 @@ async def task_delete_callback(
     await callback.answer("Task deleted" if changed else "Task not found", show_alert=not changed)
 
 
+@router.callback_query(F.data.startswith("task:edit:"))
+async def task_edit_menu(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    task_id = int(callback.data.rsplit(":", 1)[1])
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != callback.from_user.id:
+        await callback.answer("Task not found", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"✏️ Editing task #{task_id} — {task['task_name']}\n\nWhat would you like to change?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Rename", callback_data=f"task:edit-name:{task_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📥 Edit Sources", callback_data=f"task:edit-source:{task_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📤 Edit Destinations",
+                        callback_data=f"task:edit-dest:{task_id}",
+                    )
+                ],
+                [InlineKeyboardButton(text="🔙 Back", callback_data="menu:tasks")],
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task:edit-name:"))
+async def task_edit_name_start(
+    callback: CallbackQuery, db: Database, state: FSMContext
+) -> None:
+    if callback.message is None:
+        return
+    task_id = int(callback.data.rsplit(":", 1)[1])
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != callback.from_user.id:
+        await callback.answer("Task not found", show_alert=True)
+        return
+    await state.set_state(TaskStates.waiting_rename)
+    await state.update_data(edit_task_id=task_id)
+    await callback.message.edit_text(
+        f"✏️ Send the new name for task #{task_id} (current: {task['task_name']}).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")]
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(TaskStates.waiting_rename)
+async def task_edit_name_finish(
+    message: Message, state: FSMContext, db: Database
+) -> None:
+    if not message.text:
+        return
+    data = await state.get_data()
+    task_id = int(data["edit_task_id"])
+    new_name = message.text.strip()[:100]
+    changed = await db.rename_task(message.from_user.id, task_id, new_name)
+    await state.clear()
+    await message.answer(
+        f"✅ Task #{task_id} renamed to '{new_name}'." if changed else "⚠️ Task not found."
+    )
+
+
+@router.callback_query(F.data.startswith("task:edit-source:"))
+async def task_edit_source_start(
+    callback: CallbackQuery, db: Database, state: FSMContext
+) -> None:
+    if callback.message is None:
+        return
+    task_id = int(callback.data.rsplit(":", 1)[1])
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != callback.from_user.id:
+        await callback.answer("Task not found", show_alert=True)
+        return
+    language = await _language_for_callback(db, callback)
+    await state.set_state(TaskStates.waiting_source)
+    await state.update_data(edit_task_id=task_id, edit_field="sources", sources=[])
+    await callback.message.edit_text(
+        f"📥 Editing sources for task #{task_id}. This replaces the existing sources.\n\n"
+        + t(language, "task_source"),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")]
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task:edit-dest:"))
+async def task_edit_dest_start(
+    callback: CallbackQuery, db: Database, state: FSMContext
+) -> None:
+    if callback.message is None:
+        return
+    task_id = int(callback.data.rsplit(":", 1)[1])
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != callback.from_user.id:
+        await callback.answer("Task not found", show_alert=True)
+        return
+    language = await _language_for_callback(db, callback)
+    await state.set_state(TaskStates.waiting_destination)
+    await state.update_data(edit_task_id=task_id, edit_field="destinations", destinations=[])
+    await callback.message.edit_text(
+        f"📤 Editing destinations for task #{task_id}. This replaces the existing destinations.\n\n"
+        + t(language, "task_destination"),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")]
+            ]
+        ),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "flow:cancel")
 async def cancel_flow(
     callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings
@@ -1045,6 +1182,9 @@ async def view_tasks(message: Message, db: Database) -> None:
                     callback_data=f"task:{'resume' if task['is_paused'] else 'pause'}:{task['id']}",
                 ),
                 InlineKeyboardButton(
+                    text="✏️ Edit", callback_data=f"task:edit:{task['id']}"
+                ),
+                InlineKeyboardButton(
                     text="🗑️ Delete", callback_data=f"task:delete:{task['id']}"
                 ),
             ]
@@ -1117,7 +1257,11 @@ def _text_or_forwarded_chat_id(message: Message) -> str | None:
 
 @router.message(TaskStates.waiting_source)
 async def task_source(
-    message: Message, state: FSMContext, db: Database, telethon: TelethonService
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    telethon: TelethonService,
+    forwarding: ForwardingEngine,
 ) -> None:
     text = _text_or_forwarded_chat_id(message)
     if not text:
@@ -1125,11 +1269,13 @@ async def task_source(
     language = await _language_for_message(db, message)
     if text == "/back":
         await state.clear()
-        await message.answer("↩️ Task creation cancelled.")
+        await message.answer("↩️ Cancelled.")
         return
 
     data = await state.get_data()
     sources: list[dict] = list(data.get("sources", []))
+    edit_task_id = data.get("edit_task_id")
+    is_editing_sources_only = edit_task_id is not None and data.get("edit_field") == "sources"
     user = await db.get_user(message.from_user.id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
 
@@ -1139,6 +1285,19 @@ async def task_source(
                 "⚠️ Kam se kam ek source zaroori hai."
                 if language == "hinglish"
                 else "⚠️ You need at least one source."
+            )
+            return
+        if is_editing_sources_only:
+            changed = await db.update_task_sources(
+                message.from_user.id, int(edit_task_id), sources
+            )
+            await state.clear()
+            if changed:
+                await forwarding.refresh_task(int(edit_task_id))
+            await message.answer(
+                f"✅ Sources updated for task #{edit_task_id}."
+                if changed
+                else "⚠️ Task not found."
             )
             return
         await state.update_data(sources=sources, destinations=[])
@@ -1169,10 +1328,21 @@ async def task_source(
             if language == "hinglish"
             else f"✅ Source #{len(sources)} added. Send another, or /done ({remaining} more allowed)."
         )
-    else:
-        await state.update_data(destinations=[])
-        await state.set_state(TaskStates.waiting_destination)
-        await message.answer(t(language, "task_destination"))
+        return
+
+    if is_editing_sources_only:
+        changed = await db.update_task_sources(message.from_user.id, int(edit_task_id), sources)
+        await state.clear()
+        if changed:
+            await forwarding.refresh_task(int(edit_task_id))
+        await message.answer(
+            f"✅ Sources updated for task #{edit_task_id}." if changed else "⚠️ Task not found."
+        )
+        return
+
+    await state.update_data(destinations=[])
+    await state.set_state(TaskStates.waiting_destination)
+    await message.answer(t(language, "task_destination"))
 
 
 @router.message(TaskStates.waiting_destination)
@@ -1195,6 +1365,10 @@ async def task_destination(
 
     data = await state.get_data()
     destinations: list[dict] = list(data.get("destinations", []))
+    edit_task_id = data.get("edit_task_id")
+    is_editing_destinations_only = (
+        edit_task_id is not None and data.get("edit_field") == "destinations"
+    )
     user = await db.get_user(message.from_user.id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
 
@@ -1229,7 +1403,21 @@ async def task_destination(
                 else f"✅ Destination #{len(destinations)} added. Send another, or /done ({remaining} more allowed)."
             )
             return
-        # limit reached, fall through to create the task automatically
+        # limit reached, fall through to save automatically
+
+    if is_editing_destinations_only:
+        changed = await db.update_task_destinations(
+            message.from_user.id, int(edit_task_id), destinations
+        )
+        await state.clear()
+        if changed:
+            await forwarding.refresh_task(int(edit_task_id))
+        await message.answer(
+            f"✅ Destinations updated for task #{edit_task_id}."
+            if changed
+            else "⚠️ Task not found."
+        )
+        return
 
     data = await state.get_data()
     task_id = await db.create_task_multi(
@@ -1896,6 +2084,8 @@ def build_app(
             user = await db.get_user(user_id)
             if user is not None:
                 language = language_for(user["preferred_language"])
+                expiry = user["plan_expiry"]
+                expiry_str = expiry.strftime("%d %b %Y, %I:%M %p") if expiry else "—"
                 await bot.send_message(
                     user_id,
                     t(
@@ -1903,6 +2093,9 @@ def build_app(
                         "payment_success",
                         plan=stored_plan.title(),
                         days=duration_days(stored_cycle),
+                        amount=format_paise(captured.amount_paise),
+                        txn_id=captured.payment_id,
+                        expiry=expiry_str,
                     ),
                 )
                 await _notify_admins(
