@@ -59,6 +59,16 @@ class TaskStates(StatesGroup):
     waiting_destination = State()
 
 
+class TaskSettingsStates(StatesGroup):
+    waiting_blacklist = State()
+    waiting_whitelist = State()
+    waiting_replace = State()
+    waiting_header = State()
+    waiting_footer = State()
+    waiting_auto_delete = State()
+    waiting_user_filter = State()
+
+
 class AdminBroadcastStates(StatesGroup):
     waiting_message = State()
 
@@ -630,16 +640,37 @@ async def task_create_callback(
     if callback.message is None:
         return
     language = await _language_for_callback(db, callback)
-    if await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
-        await state.set_state(TaskStates.waiting_name)
+    if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
+        await callback.answer()
+        return
+    user = await db.get_user(callback.from_user.id)
+    if user is None:
+        await callback.answer()
+        return
+    plan = PLANS.get(str(user["plan"]), PLANS["free"])
+    if await db.count_tasks(callback.from_user.id) >= plan.tasks:
         await callback.message.edit_text(
-            t(language, "task_name"),
+            f"⚠️ {plan.name} plan ki {plan.tasks} task limit reach ho gayi hai."
+            if language == "hinglish"
+            else f"⚠️ Your {plan.name} plan allows only {plan.tasks} task(s).",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")]
+                    [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
+                    [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
                 ]
             ),
         )
+        await callback.answer()
+        return
+    await state.set_state(TaskStates.waiting_name)
+    await callback.message.edit_text(
+        t(language, "task_name"),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")]
+            ]
+        ),
+    )
     await callback.answer()
 
 
@@ -1069,25 +1100,79 @@ async def task_name(message: Message, state: FSMContext, db: Database) -> None:
     await message.answer(t(language, "task_source"))
 
 
+def _text_or_forwarded_chat_id(message: Message) -> str | None:
+    """Accept either typed @username/ID text, or a forwarded message from
+    the source/destination chat (its chat ID is read from the forward)."""
+    if message.text:
+        return message.text.strip()
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None) if origin is not None else None
+    if chat is not None and getattr(chat, "id", None) is not None:
+        return str(chat.id)
+    legacy_chat = getattr(message, "forward_from_chat", None)
+    if legacy_chat is not None and getattr(legacy_chat, "id", None) is not None:
+        return str(legacy_chat.id)
+    return None
+
+
 @router.message(TaskStates.waiting_source)
 async def task_source(
     message: Message, state: FSMContext, db: Database, telethon: TelethonService
 ) -> None:
-    if not message.text:
+    text = _text_or_forwarded_chat_id(message)
+    if not text:
         return
     language = await _language_for_message(db, message)
-    if message.text.strip() == "/back":
+    if text == "/back":
         await state.clear()
         await message.answer("↩️ Task creation cancelled.")
         return
+
+    data = await state.get_data()
+    sources: list[dict] = list(data.get("sources", []))
+    user = await db.get_user(message.from_user.id)
+    plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
+
+    if text.lower() == "/done":
+        if not sources:
+            await message.answer(
+                "⚠️ Kam se kam ek source zaroori hai."
+                if language == "hinglish"
+                else "⚠️ You need at least one source."
+            )
+            return
+        await state.update_data(sources=sources, destinations=[])
+        await state.set_state(TaskStates.waiting_destination)
+        await message.answer(t(language, "task_destination"))
+        return
+
+    if len(sources) >= plan.sources_per_task:
+        await message.answer(
+            f"⚠️ {plan.name} plan me max {plan.sources_per_task} source allowed hai. /done bhejo aage badhne ke liye."
+            if language == "hinglish"
+            else f"⚠️ Your {plan.name} plan allows max {plan.sources_per_task} source(s). Send /done to continue."
+        )
+        return
+
     try:
-        entity = await telethon.validate_for_user(message.from_user.id, message.text.strip())
+        entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         await message.answer(f"⚠️ {exc}")
         return
-    await state.update_data(source=entity)
-    await state.set_state(TaskStates.waiting_destination)
-    await message.answer(t(language, "task_destination"))
+
+    sources.append(entity)
+    await state.update_data(sources=sources)
+    remaining = plan.sources_per_task - len(sources)
+    if remaining > 0:
+        await message.answer(
+            f"✅ Source #{len(sources)} add ho gaya. Ek aur bhej sakte ho, ya /done ({remaining} aur allowed)."
+            if language == "hinglish"
+            else f"✅ Source #{len(sources)} added. Send another, or /done ({remaining} more allowed)."
+        )
+    else:
+        await state.update_data(destinations=[])
+        await state.set_state(TaskStates.waiting_destination)
+        await message.answer(t(language, "task_destination"))
 
 
 @router.message(TaskStates.waiting_destination)
@@ -1099,26 +1184,59 @@ async def task_destination(
     forwarding: ForwardingEngine,
     settings: Settings,
 ) -> None:
-    if not message.text:
+    text = _text_or_forwarded_chat_id(message)
+    if not text:
         return
     language = await _language_for_message(db, message)
-    if message.text.strip() == "/back":
+    if text == "/back":
         await state.clear()
         await message.answer("↩️ Task creation cancelled.")
         return
-    try:
-        destination = await telethon.validate_for_user(
-            message.from_user.id, message.text.strip()
-        )
-    except ValueError as exc:
-        await message.answer(f"⚠️ {exc}")
-        return
+
     data = await state.get_data()
-    task_id = await db.create_task(
+    destinations: list[dict] = list(data.get("destinations", []))
+    user = await db.get_user(message.from_user.id)
+    plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
+
+    if text.lower() == "/done":
+        if not destinations:
+            await message.answer(
+                "⚠️ Kam se kam ek destination zaroori hai."
+                if language == "hinglish"
+                else "⚠️ You need at least one destination."
+            )
+            return
+    elif len(destinations) >= plan.destinations_per_task:
+        await message.answer(
+            f"⚠️ {plan.name} plan me max {plan.destinations_per_task} destination allowed hai. /done bhejo aage badhne ke liye."
+            if language == "hinglish"
+            else f"⚠️ Your {plan.name} plan allows max {plan.destinations_per_task} destination(s). Send /done to continue."
+        )
+        return
+    else:
+        try:
+            destination = await telethon.validate_for_user(message.from_user.id, text)
+        except ValueError as exc:
+            await message.answer(f"⚠️ {exc}")
+            return
+        destinations.append(destination)
+        await state.update_data(destinations=destinations)
+        remaining = plan.destinations_per_task - len(destinations)
+        if remaining > 0:
+            await message.answer(
+                f"✅ Destination #{len(destinations)} add ho gaya. Ek aur bhej sakte ho, ya /done ({remaining} aur allowed)."
+                if language == "hinglish"
+                else f"✅ Destination #{len(destinations)} added. Send another, or /done ({remaining} more allowed)."
+            )
+            return
+        # limit reached, fall through to create the task automatically
+
+    data = await state.get_data()
+    task_id = await db.create_task_multi(
         message.from_user.id,
         str(data["task_name"]),
-        data["source"],
-        destination,
+        list(data["sources"]),
+        list(data["destinations"]),
     )
     await state.clear()
     await forwarding.refresh_task(task_id)
@@ -1166,6 +1284,185 @@ async def task_action(
     await message.answer(result)
 
 
+# Which task-settings keys each plan unlocks. Checked before any setter runs.
+TIER_FEATURES: dict[str, set[str]] = {
+    "free": set(),
+    "silver": {"header", "footer"},
+    "gold": {"header", "footer", "blacklist", "whitelist", "replace"},
+    "platinum": {
+        "header", "footer", "blacklist", "whitelist", "replace",
+        "watermark", "auto_delete_seconds", "edit_sync", "user_filter",
+    },
+}
+
+
+async def _check_task_feature(
+    message: Message, db: Database, task_id: int, feature: str
+) -> bool:
+    user = await db.get_user(message.from_user.id)
+    plan_name = str(user["plan"]) if user else "free"
+    if feature not in TIER_FEATURES.get(plan_name, set()):
+        await message.answer(
+            f"⚠️ Your current plan ({plan_name.title()}) doesn't include this feature. "
+            "Use /plans to upgrade."
+        )
+        return False
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != message.from_user.id:
+        await message.answer("⚠️ Task not found.")
+        return False
+    return True
+
+
+@router.message(Command("setheader"))
+async def set_header_command(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Usage: /setheader <task_id> <text> (omit text to clear)")
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "header"):
+        return
+    header_text = parts[2] if len(parts) > 2 else ""
+    await db.update_task_settings(message.from_user.id, task_id, {"header": header_text})
+    await forwarding.refresh_task(task_id)
+    await message.answer("✅ Header updated." if header_text else "✅ Header cleared.")
+
+
+@router.message(Command("setfooter"))
+async def set_footer_command(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Usage: /setfooter <task_id> <text> (omit text to clear)")
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "footer"):
+        return
+    footer_text = parts[2] if len(parts) > 2 else ""
+    await db.update_task_settings(message.from_user.id, task_id, {"footer": footer_text})
+    await forwarding.refresh_task(task_id)
+    await message.answer("✅ Footer updated." if footer_text else "✅ Footer cleared.")
+
+
+@router.message(Command("setblacklist", "setwhitelist"))
+async def set_filter_command(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    command = parts[0].lstrip("/").lower() if parts else ""
+    key = "blacklist" if command == "setblacklist" else "whitelist"
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(f"Usage: /{command} <task_id> <word1,word2,...> (omit to clear)")
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, key):
+        return
+    words = [w.strip() for w in parts[2].split(",") if w.strip()] if len(parts) > 2 else []
+    await db.update_task_settings(message.from_user.id, task_id, {key: words})
+    await forwarding.refresh_task(task_id)
+    await message.answer(f"✅ {key.title()} updated: {len(words)} word(s).")
+
+
+@router.message(Command("setreplace"))
+async def set_replace_command(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "Usage: /setreplace <task_id> <old1=>new1,old2=>new2> (omit to clear)"
+        )
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "replace"):
+        return
+    mapping: dict[str, str] = {}
+    if len(parts) > 2:
+        for pair in parts[2].split(","):
+            if "=>" not in pair:
+                continue
+            old, new = pair.split("=>", 1)
+            mapping[old.strip()] = new.strip()
+    await db.update_task_settings(message.from_user.id, task_id, {"replace": mapping})
+    await forwarding.refresh_task(task_id)
+    await message.answer(f"✅ Replace rules updated: {len(mapping)} rule(s).")
+
+
+@router.message(Command("togglewatermark"))
+async def toggle_watermark_command(
+    message: Message, db: Database, forwarding: ForwardingEngine
+) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2].lower() not in ("on", "off"):
+        await message.answer("Usage: /togglewatermark <task_id> <on|off>")
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "watermark"):
+        return
+    enabled = parts[2].lower() == "on"
+    await db.update_task_settings(message.from_user.id, task_id, {"watermark": enabled})
+    await forwarding.refresh_task(task_id)
+    await message.answer(f"✅ Watermark turned {'on' if enabled else 'off'}.")
+
+
+@router.message(Command("toggleeditsync"))
+async def toggle_edit_sync_command(
+    message: Message, db: Database, forwarding: ForwardingEngine
+) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2].lower() not in ("on", "off"):
+        await message.answer("Usage: /toggleeditsync <task_id> <on|off>")
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "edit_sync"):
+        return
+    enabled = parts[2].lower() == "on"
+    await db.update_task_settings(message.from_user.id, task_id, {"edit_sync": enabled})
+    await forwarding.refresh_task(task_id)
+    await message.answer(f"✅ Live edit-sync turned {'on' if enabled else 'off'}.")
+
+
+@router.message(Command("setautodelete"))
+async def set_auto_delete_command(
+    message: Message, db: Database, forwarding: ForwardingEngine
+) -> None:
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit() or not (parts[2].isdigit() or parts[2].lower() == "off"):
+        await message.answer("Usage: /setautodelete <task_id> <seconds|off>")
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "auto_delete_seconds"):
+        return
+    seconds = 0 if parts[2].lower() == "off" else int(parts[2])
+    await db.update_task_settings(
+        message.from_user.id, task_id, {"auto_delete_seconds": seconds}
+    )
+    await forwarding.refresh_task(task_id)
+    await message.answer(
+        "✅ Auto-delete turned off." if seconds == 0 else f"✅ Auto-delete set to {seconds}s."
+    )
+
+
+@router.message(Command("setuserfilter"))
+async def set_user_filter_command(
+    message: Message, db: Database, forwarding: ForwardingEngine
+) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "Usage: /setuserfilter <task_id> <sender_id1,sender_id2,...> (omit to clear)"
+        )
+        return
+    task_id = int(parts[1])
+    if not await _check_task_feature(message, db, task_id, "user_filter"):
+        return
+    ids: list[int] = []
+    if len(parts) > 2:
+        for raw in parts[2].split(","):
+            raw = raw.strip()
+            if raw.lstrip("-").isdigit():
+                ids.append(int(raw))
+    await db.update_task_settings(message.from_user.id, task_id, {"user_filter": ids})
+    await forwarding.refresh_task(task_id)
+    await message.answer(f"✅ User filter updated: {len(ids)} sender(s) allowed.")
+
+
 @router.message(Command("stats"))
 async def stats_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
@@ -1204,6 +1501,17 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 
 def _admin_check(settings: Settings, user_id: int) -> bool:
     return _is_admin(settings, user_id)
+
+
+async def _resolve_target_user(db: Database, raw: str) -> int | None:
+    """Admin commands accept either a numeric Telegram user ID or an
+    @username — resolve either form to a numeric user ID, or None if the
+    user can't be found."""
+    raw = raw.strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    user = await db.get_user_by_username(raw)
+    return int(user["telegram_user_id"]) if user is not None else None
 
 
 @router.callback_query(F.data == "admin:home")
@@ -1388,10 +1696,13 @@ async def block_user_command(message: Message, db: Database, settings: Settings,
         await message.answer(t(language, "admin_only"))
         return
     parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Usage: /block <telegram_user_id>")
+    if len(parts) != 2:
+        await message.answer("Usage: /block <telegram_user_id or @username>")
         return
-    user_id = int(parts[1])
+    user_id = await _resolve_target_user(db, parts[1])
+    if user_id is None:
+        await message.answer("⚠️ User not found.")
+        return
     blocked = parts[0].lower() == "/block"
     changed = await db.set_blocked(user_id, blocked)
     if blocked:
@@ -1407,10 +1718,16 @@ async def grant_days_command(message: Message, db: Database, settings: Settings)
         await message.answer("⛔ Admin only")
         return
     parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[1].lstrip("-").isdigit() or not parts[2].isdigit():
-        await message.answer("Usage: /grantdays <telegram_user_id> <days>")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await message.answer("Usage: /grantdays <telegram_user_id or @username> <days>")
         return
-    changed = await db.set_plan(int(parts[1]), "silver", int(parts[2]))
+    user_id = await _resolve_target_user(db, parts[1])
+    if user_id is None:
+        await message.answer("⚠️ User not found.")
+        return
+    target = await db.get_user(user_id)
+    current_plan = str(target["plan"]) if target and target["plan"] != "free" else "silver"
+    changed = await db.set_plan(user_id, current_plan, int(parts[2]))
     await message.answer("✅ Plan extended." if changed else "⚠️ User not found.")
 
 
@@ -1420,10 +1737,16 @@ async def set_plan_command(message: Message, db: Database, settings: Settings) -
         await message.answer("⛔ Admin only")
         return
     parts = (message.text or "").split()
-    if len(parts) != 4 or not parts[1].lstrip("-").isdigit() or parts[2].lower() not in PLANS or not parts[3].isdigit():
-        await message.answer("Usage: /setplan <telegram_user_id> <free|silver|gold|platinum> <days>")
+    if len(parts) != 4 or parts[2].lower() not in PLANS or not parts[3].isdigit():
+        await message.answer(
+            "Usage: /setplan <telegram_user_id or @username> <free|silver|gold|platinum> <days>"
+        )
         return
-    changed = await db.set_plan(int(parts[1]), parts[2].lower(), int(parts[3]))
+    user_id = await _resolve_target_user(db, parts[1])
+    if user_id is None:
+        await message.answer("⚠️ User not found.")
+        return
+    changed = await db.set_plan(user_id, parts[2].lower(), int(parts[3]))
     await message.answer("✅ Plan updated." if changed else "⚠️ User not found.")
 
 
@@ -1446,12 +1769,27 @@ async def list_users_command(message: Message, db: Database, settings: Settings)
 
 
 @router.message(Command("referralpayout"))
-async def referral_payout_command(message: Message, settings: Settings) -> None:
+async def referral_payout_command(message: Message, db: Database, settings: Settings) -> None:
     if not _admin_check(settings, message.from_user.id):
         await message.answer("⛔ Admin only")
         return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Usage: /referralpayout <referred_user_id or @username>")
+        return
+    user_id = await _resolve_target_user(db, parts[1])
+    if user_id is None:
+        await message.answer("⚠️ User not found.")
+        return
+    result = await db.mark_referral_paid(user_id)
+    if result is None:
+        await message.answer("⚠️ No unpaid referral commission found for this user.")
+        return
+    from .plans import format_paise
+
     await message.answer(
-        "ℹ️ Referral payout records are preserved, but automatic payout is not enabled yet."
+        f"✅ Marked as paid. Referrer: {result['referrer_id']}, "
+        f"Amount: {format_paise(int(result['commission_amount_paise']))}"
     )
 
 
@@ -1461,10 +1799,11 @@ async def user_info_command(message: Message, db: Database, settings: Settings) 
         await message.answer("⛔ Admin only")
         return
     parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Usage: /userinfo <telegram_user_id>")
+    if len(parts) != 2:
+        await message.answer("Usage: /userinfo <telegram_user_id or @username>")
         return
-    user = await db.get_user(int(parts[1]))
+    user_id = await _resolve_target_user(db, parts[1])
+    user = await db.get_user(user_id) if user_id is not None else None
     if user is None:
         await message.answer("⚠️ User not found.")
         return
@@ -1672,10 +2011,51 @@ async def _run(settings: Settings) -> None:
     async def send_weekly_report() -> None:
         await _notify_admins(bot, settings, await _weekly_report(db))
 
+    async def send_expiry_reminders() -> None:
+        for days_ahead in (3, 1):
+            for row in await db.get_expiring_users(days_ahead):
+                language = str(row["preferred_language"] or "en")
+                plan_name = str(row["plan"]).title()
+                text = (
+                    f"⏳ Tumhara {plan_name} plan {days_ahead} din me expire ho raha hai. "
+                    "Renew karne ke liye /plans use karo."
+                    if language == "hinglish"
+                    else f"⏳ Your {plan_name} plan expires in {days_ahead} day(s). "
+                    "Use /plans to renew."
+                )
+                with suppress(TelegramForbiddenError, TelegramBadRequest):
+                    await bot.send_message(int(row["telegram_user_id"]), text)
+
+    async def downgrade_expired_plans() -> None:
+        downgraded = await db.downgrade_expired_users()
+        for row in downgraded:
+            language = str(row["preferred_language"] or "en")
+            text = (
+                "❌ Tumhara plan expire ho gaya hai aur Free tier pe downgrade ho gaya hai. "
+                "Dobara subscribe karne ke liye /plans use karo."
+                if language == "hinglish"
+                else "❌ Your plan has expired and you've been downgraded to Free. "
+                "Use /plans to resubscribe."
+            )
+            with suppress(TelegramForbiddenError, TelegramBadRequest):
+                await bot.send_message(int(row["telegram_user_id"]), text)
+
     scheduler.add_job(
         send_weekly_report,
         CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=timezone),
         id="weekly-admin-report",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_expiry_reminders,
+        CronTrigger(hour=10, minute=0, timezone=timezone),
+        id="plan-expiry-reminders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        downgrade_expired_plans,
+        CronTrigger(hour="*", minute=5, timezone=timezone),
+        id="plan-auto-downgrade",
         replace_existing=True,
     )
     scheduler.start()
