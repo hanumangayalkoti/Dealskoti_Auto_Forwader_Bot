@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import traceback
 from contextlib import suppress
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    ErrorEvent,
     BotCommand,
     BotCommandScopeChat,
     CallbackQuery,
@@ -108,6 +110,44 @@ async def _notify_admins(bot: Bot, settings: Settings, text: str) -> None:
             await bot.send_message(admin_id, text)
         except (TelegramForbiddenError, TelegramBadRequest):
             logger.warning("Could not notify admin %s", admin_id)
+
+
+@router.errors()
+async def global_error_handler(event: ErrorEvent, settings: Settings) -> bool:
+    """Catches any exception raised inside a handler so buttons/commands
+    never fail silently: the user sees a message, and admins get the
+    full traceback so the bug can actually be diagnosed."""
+    logger.exception("Unhandled error while processing update", exc_info=event.exception)
+    update = event.update
+    chat_bot: Bot | None = None
+    if update.callback_query is not None:
+        chat_bot = update.callback_query.bot
+        with suppress(Exception):
+            await update.callback_query.answer(
+                "⚠️ Something went wrong. Please try again.", show_alert=True
+            )
+        with suppress(Exception):
+            if update.callback_query.message is not None:
+                await update.callback_query.message.answer(
+                    "⚠️ Something went wrong processing that. Please try again, "
+                    "or contact support if it keeps happening."
+                )
+    elif update.message is not None:
+        chat_bot = update.message.bot
+        with suppress(Exception):
+            await update.message.answer(
+                "⚠️ Something went wrong processing that. Please try again, "
+                "or contact support if it keeps happening."
+            )
+    if chat_bot is not None:
+        tb = "".join(
+            traceback.format_exception(
+                type(event.exception), event.exception, event.exception.__traceback__
+            )
+        )[-3500:]
+        with suppress(Exception):
+            await _notify_admins(chat_bot, settings, f"🚨 Bot error:\n<pre>{tb}</pre>")
+    return True
 
 
 def _nav_keyboard(*, back: str = "menu:home", include_cancel: bool = False) -> InlineKeyboardMarkup:
@@ -1906,17 +1946,31 @@ async def grant_days_command(message: Message, db: Database, settings: Settings)
         await message.answer("⛔ Admin only")
         return
     parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[2].isdigit():
-        await message.answer("Usage: /grantdays <telegram_user_id or @username> <days>")
+    if len(parts) not in (3, 4) or not parts[2].isdigit():
+        await message.answer(
+            "Usage: /grantdays <telegram_user_id or @username> <days> [plan]\n"
+            "If [plan] is omitted, their current plan is extended (or Silver if they're on Free).\n"
+            "Tip: use /listusers for a button-based flow instead."
+        )
         return
     user_id = await _resolve_target_user(db, parts[1])
     if user_id is None:
         await message.answer("⚠️ User not found.")
         return
-    target = await db.get_user(user_id)
-    current_plan = str(target["plan"]) if target and target["plan"] != "free" else "silver"
-    changed = await db.set_plan(user_id, current_plan, int(parts[2]))
-    await message.answer("✅ Plan extended." if changed else "⚠️ User not found.")
+    if len(parts) == 4:
+        plan_key = parts[3].lower()
+        if plan_key not in PLANS or plan_key == "free":
+            await message.answer("⚠️ Plan must be one of: silver, gold, platinum.")
+            return
+    else:
+        target = await db.get_user(user_id)
+        plan_key = str(target["plan"]) if target and target["plan"] != "free" else "silver"
+    changed = await db.set_plan(user_id, plan_key, int(parts[2]))
+    await message.answer(
+        f"✅ {PLANS[plan_key].name} plan extended by {parts[2]} day(s)."
+        if changed
+        else "⚠️ User not found."
+    )
 
 
 @router.message(Command("setplan"))
@@ -1938,22 +1992,157 @@ async def set_plan_command(message: Message, db: Database, settings: Settings) -
     await message.answer("✅ Plan updated." if changed else "⚠️ User not found.")
 
 
+class AdminStates(StatesGroup):
+    waiting_grant_days = State()
+
+
 @router.message(Command("listusers"))
 async def list_users_command(message: Message, db: Database, settings: Settings) -> None:
     if not _admin_check(settings, message.from_user.id):
         await message.answer("⛔ Admin only")
         return
-    users = await db.list_users(30)
+    users = await db.list_users(15)
     if not users:
         await message.answer("No users found.")
         return
-    await message.answer(
-        "👥 Recent users\n\n"
-        + "\n".join(
-            f"{u['telegram_user_id']} — {u['first_name'] or u['username'] or 'No name'} — {u['plan']}"
-            for u in users
+    for u in users:
+        label = u["first_name"] or u["username"] or "No name"
+        block_label = "✅ Unblock" if u["is_blocked"] else "⛔ Block"
+        block_action = "unblock" if u["is_blocked"] else "block"
+        await message.answer(
+            f"👤 {label}\nID: {u['telegram_user_id']}\nPlan: {u['plan']}\n"
+            f"Expiry: {u['plan_expiry'] or '—'}\nBlocked: {'Yes' if u['is_blocked'] else 'No'}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🎁 Grant Days",
+                            callback_data=f"admin:grant:{u['telegram_user_id']}",
+                        ),
+                        InlineKeyboardButton(
+                            text=block_label,
+                            callback_data=f"admin:{block_action}:{u['telegram_user_id']}",
+                        ),
+                    ]
+                ]
+            ),
         )
+
+
+@router.callback_query(F.data.startswith("admin:grant:"))
+async def admin_grant_pick_plan(callback: CallbackQuery, settings: Settings) -> None:
+    if not _admin_check(settings, callback.from_user.id):
+        await callback.answer("Admin only", show_alert=True)
+        return
+    target_user_id = int(callback.data.rsplit(":", 1)[1])
+    await callback.message.edit_text(
+        f"🎁 Grant which plan to user {target_user_id}?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=plan.name,
+                        callback_data=f"admin:grantplan:{target_user_id}:{key}",
+                    )
+                    for key, plan in PLANS.items()
+                    if key != "free"
+                ],
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")],
+            ]
+        ),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:grantplan:"))
+async def admin_grant_pick_days(
+    callback: CallbackQuery, settings: Settings, state: FSMContext
+) -> None:
+    if not _admin_check(settings, callback.from_user.id):
+        await callback.answer("Admin only", show_alert=True)
+        return
+    _, _, target_user_id, plan_key = callback.data.split(":")
+    await state.set_state(AdminStates.waiting_grant_days)
+    await state.update_data(target_user_id=int(target_user_id), plan=plan_key)
+    await callback.message.edit_text(
+        f"📅 {PLANS[plan_key].name} plan chosen for user {target_user_id}.\n"
+        "Ab kitne din ke liye grant karna hai? Number bhejo (e.g. 30)."
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_grant_days)
+async def admin_grant_days_finish(
+    message: Message, state: FSMContext, db: Database, settings: Settings
+) -> None:
+    if not _admin_check(settings, message.from_user.id):
+        return
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("⚠️ Sirf number bhejo, jaise 30.")
+        return
+    data = await state.get_data()
+    target_user_id = int(data["target_user_id"])
+    plan_key = str(data["plan"])
+    days = int(message.text.strip())
+    changed = await db.set_plan(target_user_id, plan_key, days)
+    await state.clear()
+    if changed:
+        await message.answer(
+            f"✅ {PLANS[plan_key].name} granted to user {target_user_id} for {days} day(s)."
+        )
+        with suppress(TelegramForbiddenError, TelegramBadRequest):
+            target = await db.get_user(target_user_id)
+            language = language_for(target["preferred_language"]) if target else "en"
+            text = (
+                f"🎁 Aapko {PLANS[plan_key].name} plan {days} din ke liye mila hai!"
+                if language == "hinglish"
+                else f"🎁 You've been granted the {PLANS[plan_key].name} plan for {days} day(s)!"
+            )
+            await message.bot.send_message(target_user_id, text)
+    else:
+        await message.answer("⚠️ User not found.")
+
+
+@router.callback_query(F.data.startswith("admin:block:") | F.data.startswith("admin:unblock:"))
+async def admin_block_toggle(
+    callback: CallbackQuery, db: Database, forwarding: ForwardingEngine, settings: Settings
+) -> None:
+    if not _admin_check(settings, callback.from_user.id):
+        await callback.answer("Admin only", show_alert=True)
+        return
+    action, target_user_id = callback.data.split(":")[1], int(callback.data.split(":")[2])
+    blocked = action == "block"
+    changed = await db.set_blocked(target_user_id, blocked)
+    if blocked:
+        await forwarding.remove_user(target_user_id)
+    else:
+        await forwarding.refresh_user(target_user_id)
+    await callback.answer(
+        f"User {'blocked' if blocked else 'unblocked'}." if changed else "User not found.",
+        show_alert=True,
+    )
+    if callback.message is not None and changed:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="🎁 Grant Days",
+                                callback_data=f"admin:grant:{target_user_id}",
+                            ),
+                            InlineKeyboardButton(
+                                text="✅ Unblock" if blocked else "⛔ Block",
+                                callback_data=(
+                                    f"admin:unblock:{target_user_id}"
+                                    if blocked
+                                    else f"admin:block:{target_user_id}"
+                                ),
+                            ),
+                        ]
+                    ]
+                )
+            )
 
 
 @router.message(Command("referralpayout"))
