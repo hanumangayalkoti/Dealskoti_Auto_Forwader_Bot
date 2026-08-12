@@ -322,6 +322,27 @@ class Database:
         assert row is not None
         return int(row["id"])
 
+    async def create_task_multi(
+        self,
+        user_id: int,
+        task_name: str,
+        sources: list[dict[str, Any]],
+        destinations: list[dict[str, Any]],
+    ) -> int:
+        row = await self._pool().fetchrow(
+            """
+            INSERT INTO tasks (user_id, task_name, sources, destinations)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb)
+            RETURNING id
+            """,
+            user_id,
+            task_name,
+            json.dumps(sources),
+            json.dumps(destinations),
+        )
+        assert row is not None
+        return int(row["id"])
+
     async def list_tasks(self, user_id: int) -> list[asyncpg.Record]:
         return await self._pool().fetch(
             "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id", user_id
@@ -350,6 +371,116 @@ class Database:
     async def get_task(self, task_id: int) -> asyncpg.Record | None:
         return await self._pool().fetchrow(
             "SELECT * FROM tasks WHERE id = $1", task_id
+        )
+
+    async def add_source(self, user_id: int, task_id: int, entity: dict[str, Any]) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE tasks
+            SET sources = sources || $3::jsonb, updated_at = NOW()
+            WHERE user_id = $1 AND id = $2
+            """,
+            user_id,
+            task_id,
+            json.dumps([entity]),
+        )
+        return result.endswith("1")
+
+    async def add_destination(
+        self, user_id: int, task_id: int, entity: dict[str, Any]
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE tasks
+            SET destinations = destinations || $3::jsonb, updated_at = NOW()
+            WHERE user_id = $1 AND id = $2
+            """,
+            user_id,
+            task_id,
+            json.dumps([entity]),
+        )
+        return result.endswith("1")
+
+    async def update_task_settings(
+        self, user_id: int, task_id: int, settings: dict[str, Any]
+    ) -> bool:
+        """Shallow-merge new keys into the task's settings JSONB blob."""
+        result = await self._pool().execute(
+            """
+            UPDATE tasks
+            SET settings = settings || $3::jsonb, updated_at = NOW()
+            WHERE user_id = $1 AND id = $2
+            """,
+            user_id,
+            task_id,
+            json.dumps(settings),
+        )
+        return result.endswith("1")
+
+    async def get_user_by_username(self, username: str) -> asyncpg.Record | None:
+        return await self._pool().fetchrow(
+            "SELECT * FROM users WHERE lower(username) = lower($1)",
+            username.lstrip("@"),
+        )
+
+    async def save_message_map(
+        self, task_id: int, source_msg_id: int, destination_msg_id: int
+    ) -> None:
+        await self._pool().execute(
+            """
+            INSERT INTO message_map (task_id, source_msg_id, destination_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            """,
+            task_id,
+            source_msg_id,
+            destination_msg_id,
+        )
+
+    async def get_mapped_destination_messages(
+        self, task_id: int, source_msg_id: int
+    ) -> list[int]:
+        rows = await self._pool().fetch(
+            """
+            SELECT destination_msg_id FROM message_map
+            WHERE task_id = $1 AND source_msg_id = $2
+            """,
+            task_id,
+            source_msg_id,
+        )
+        return [int(r["destination_msg_id"]) for r in rows]
+
+    async def get_expiring_users(self, days_ahead: int) -> list[asyncpg.Record]:
+        return await self._pool().fetch(
+            """
+            SELECT telegram_user_id, preferred_language, plan, plan_expiry
+            FROM users
+            WHERE plan != 'free' AND is_blocked = FALSE AND plan_expiry IS NOT NULL
+              AND plan_expiry::date = (CURRENT_DATE + $1::int)
+            """,
+            days_ahead,
+        )
+
+    async def downgrade_expired_users(self) -> list[asyncpg.Record]:
+        rows = await self._pool().fetch(
+            """
+            UPDATE users
+            SET plan = 'free', plan_expiry = NULL, updated_at = NOW()
+            WHERE plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry <= NOW()
+            RETURNING telegram_user_id, preferred_language
+            """
+        )
+        return rows
+
+    async def mark_referral_paid(self, referred_user_id: int) -> asyncpg.Record | None:
+        return await self._pool().fetchrow(
+            """
+            UPDATE referrals
+            SET is_paid = TRUE, paid_at = NOW()
+            WHERE referred_user_id = $1 AND is_paid = FALSE
+            RETURNING referrer_id, commission_amount_paise
+            """,
+            referred_user_id,
         )
 
     async def task_can_forward(self, task_id: int) -> bool:
