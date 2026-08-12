@@ -343,6 +343,43 @@ class Database:
         assert row is not None
         return int(row["id"])
 
+    async def rename_task(self, user_id: int, task_id: int, new_name: str) -> bool:
+        result = await self._pool().execute(
+            "UPDATE tasks SET task_name = $3, updated_at = NOW() WHERE user_id = $1 AND id = $2",
+            user_id,
+            task_id,
+            new_name,
+        )
+        return result.endswith("1")
+
+    async def update_task_sources(
+        self, user_id: int, task_id: int, sources: list[dict[str, Any]]
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE tasks SET sources = $3::jsonb, updated_at = NOW()
+            WHERE user_id = $1 AND id = $2
+            """,
+            user_id,
+            task_id,
+            json.dumps(sources),
+        )
+        return result.endswith("1")
+
+    async def update_task_destinations(
+        self, user_id: int, task_id: int, destinations: list[dict[str, Any]]
+    ) -> bool:
+        result = await self._pool().execute(
+            """
+            UPDATE tasks SET destinations = $3::jsonb, updated_at = NOW()
+            WHERE user_id = $1 AND id = $2
+            """,
+            user_id,
+            task_id,
+            json.dumps(destinations),
+        )
+        return result.endswith("1")
+
     async def list_tasks(self, user_id: int) -> list[asyncpg.Record]:
         return await self._pool().fetch(
             "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id", user_id
