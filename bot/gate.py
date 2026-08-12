@@ -41,6 +41,7 @@ async def enforce_gate(
     member = await user_is_member(bot, settings, user_id)
     await db.set_membership(user_id, member)
     if member:
+        await db.resume_channel_gate_tasks(user_id)
         return True
     await db.mark_channel_gate_paused_tasks(user_id)
     if notify:
