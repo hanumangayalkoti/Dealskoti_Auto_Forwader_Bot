@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.errors import (
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -134,10 +134,14 @@ class TelethonService:
             entity = await client.get_entity(candidate)
         except Exception as exc:
             raise ValueError("Telegram entity could not be resolved by this account.") from exc
-        entity_id = int(getattr(entity, "id", 0))
+        entity_id = int(utils.get_peer_id(entity))
         if not entity_id:
             raise ValueError("Telegram entity did not have a valid ID.")
-        return {"chat_id": entity_id, "label": value.strip()}
+        return {
+            "chat_id": entity_id,
+            "label": value.strip(),
+            "entity_ref": value.strip(),
+        }
 
     async def cancel_all_logins(self) -> None:
         for user_id in list(self._attempts):
