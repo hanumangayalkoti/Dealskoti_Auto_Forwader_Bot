@@ -351,7 +351,7 @@ class Database:
     async def get_active_tasks(self) -> list[asyncpg.Record]:
         return await self._pool().fetch(
             """
-            SELECT id, user_id, task_name, sources, destinations, settings
+            SELECT id, user_id, task_name, sources, destinations, settings, is_paused
             FROM tasks
             WHERE is_paused = FALSE
             ORDER BY user_id, id
