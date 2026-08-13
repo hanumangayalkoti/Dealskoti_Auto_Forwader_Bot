@@ -700,7 +700,7 @@ class Database:
                     UPDATE users
                     SET plan = $2,
                         plan_expiry = GREATEST(COALESCE(plan_expiry, NOW()), NOW())
-                                     + ($3 || ' days')::interval,
+                                     + make_interval(days => $3),
                         first_paid_order_at = COALESCE(first_paid_order_at, NOW()),
                         updated_at = NOW()
                     WHERE telegram_user_id = $1
@@ -799,7 +799,7 @@ class Database:
                 plan_expiry = CASE
                     WHEN $2 = 'free' THEN NULL
                     ELSE GREATEST(COALESCE(plan_expiry, NOW()), NOW())
-                         + ($3 || ' days')::interval
+                         + make_interval(days => $3)
                 END,
                 updated_at = NOW()
             WHERE telegram_user_id = $1
