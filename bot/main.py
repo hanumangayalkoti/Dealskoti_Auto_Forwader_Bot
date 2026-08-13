@@ -539,7 +539,20 @@ async def menu_plans(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None:
         return
     language = await _language_for_callback(db, callback)
-    await callback.message.edit_text(t(language, "choose_plan"), reply_markup=plans_keyboard())
+    user = await db.get_user(callback.from_user.id)
+    if user and user["plan"] != "free":
+        ist_zone = ZoneInfo("Asia/Kolkata")
+        current_plan = str(user["plan"]).title()
+        expiry_ist = user["plan_expiry"].astimezone(ist_zone).strftime("%d %b %Y, %I:%M %p IST") if user["plan_expiry"] else "Lifetime"
+        prefix = (
+            f"👤 <b>Current Plan:</b> {current_plan}\n⏳ <b>Expiry:</b> {expiry_ist}\n\n"
+            if language == "en" else
+            f"👤 <b>Aapka Plan:</b> {current_plan}\n⏳ <b>Expiry:</b> {expiry_ist}\n\n"
+        )
+    else:
+        prefix = "👤 <b>Current Plan:</b> Free\n\n" if language == "en" else "👤 <b>Aapka Plan:</b> Free\n\n"
+
+    await callback.message.edit_text(prefix + t(language, "choose_plan"), reply_markup=plans_keyboard())
     await callback.answer()
 
 
@@ -991,7 +1004,8 @@ async def menu_account(callback: CallbackQuery, db: Database) -> None:
     )
     language = language_for(user["preferred_language"])
     session = "connected" if await db.has_active_session(callback.from_user.id) else "not connected"
-    expiry = user["plan_expiry"].isoformat() if user["plan_expiry"] else "—"
+    ist_zone = ZoneInfo("Asia/Kolkata")
+    expiry = user["plan_expiry"].astimezone(ist_zone).strftime("%d %b %Y, %I:%M %p IST") if user["plan_expiry"] else "—"
     tasks = await db.count_tasks(callback.from_user.id)
     usage = await db.daily_usage(callback.from_user.id)
     await callback.message.edit_text(
@@ -1008,7 +1022,7 @@ async def menu_account(callback: CallbackQuery, db: Database) -> None:
             tasks=tasks,
             forwarding=f"{usage} messages today",
             membership="Verified" if user["updates_channel_member"] else "Not verified",
-            language=user["preferred_language"],
+            user_language=user["preferred_language"],
         ),
         reply_markup=_nav_keyboard(),
     )
@@ -1056,7 +1070,8 @@ async def account_command(message: Message, db: Database) -> None:
     user = await _ensure_user(db, message)
     language = language_for(user["preferred_language"])
     session = "connected" if await db.has_active_session(message.from_user.id) else "not connected"
-    expiry = user["plan_expiry"].isoformat() if user["plan_expiry"] else "—"
+    ist_zone = ZoneInfo("Asia/Kolkata")
+    expiry = user["plan_expiry"].astimezone(ist_zone).strftime("%d %b %Y, %I:%M %p IST") if user["plan_expiry"] else "—"
     tasks = await db.count_tasks(message.from_user.id)
     usage = await db.daily_usage(message.from_user.id)
     await message.answer(
@@ -1073,7 +1088,7 @@ async def account_command(message: Message, db: Database) -> None:
             tasks=tasks,
             forwarding=f"{usage} messages today",
             membership="Verified" if user["updates_channel_member"] else "Not verified",
-            language=user["preferred_language"],
+            user_language=user["preferred_language"],
         ),
         reply_markup=_nav_keyboard(),
     )
@@ -1243,7 +1258,20 @@ async def login_2fa(
 @router.message(Command("plans"))
 async def plans_command(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
-    await message.answer(t(language, "choose_plan"), reply_markup=plans_keyboard())
+    user = await db.get_user(message.from_user.id)
+    if user and user["plan"] != "free":
+        ist_zone = ZoneInfo("Asia/Kolkata")
+        current_plan = str(user["plan"]).title()
+        expiry_ist = user["plan_expiry"].astimezone(ist_zone).strftime("%d %b %Y, %I:%M %p IST") if user["plan_expiry"] else "Lifetime"
+        prefix = (
+            f"👤 <b>Current Plan:</b> {current_plan}\n⏳ <b>Expiry:</b> {expiry_ist}\n\n"
+            if language == "en" else
+            f"👤 <b>Aapka Plan:</b> {current_plan}\n⏳ <b>Expiry:</b> {expiry_ist}\n\n"
+        )
+    else:
+        prefix = "👤 <b>Current Plan:</b> Free\n\n" if language == "en" else "👤 <b>Aapka Plan:</b> Free\n\n"
+
+    await message.answer(prefix + t(language, "choose_plan"), reply_markup=plans_keyboard())
 
 
 @router.message(Command("subscribe"))
@@ -2290,14 +2318,13 @@ def build_app(
             captured = billing.parse_captured_payment(payload)
             if captured is None:
                 return JSONResponse({"status": "ignored"})
+            
+            # --- START OF FIX: Silently ignore Razorpay webhook spam if the payment isn't in our DB ---
             stored_payment = await db.get_payment_for_order(captured.order_id)
             if stored_payment is None:
-                await _notify_admins(
-                    bot,
-                    settings,
-                    f"🚨 Unknown Razorpay payment link/order: {captured.order_id}",
-                )
-                raise ValueError("Razorpay order was not created by this service")
+                return JSONResponse({"status": "ignored"})
+            # --- END OF FIX ---
+            
             stored_plan = str(stored_payment["plan"])
             stored_cycle = str(stored_payment["cycle"])
             user_id = await db.activate_payment(
