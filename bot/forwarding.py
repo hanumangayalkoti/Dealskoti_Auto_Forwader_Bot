@@ -15,20 +15,6 @@ from .telethon_service import TelethonService
 
 logger = logging.getLogger("dealskoti.forwarding")
 
-# ---------------------------------------------------------------------------
-# Task settings schema (stored in tasks.settings JSONB, set via bot commands):
-#   blacklist: list[str]      -> skip message if it contains any of these words
-#   whitelist: list[str]      -> only forward if message contains one of these
-#   replace: dict[str, str]   -> word/phrase replacements applied to text
-#   header: str                -> text prepended to forwarded message
-#   footer: str                -> text appended to forwarded message
-#   watermark: bool             -> overlay a text watermark on photos (Platinum)
-#   auto_delete_seconds: int    -> delete the destination copy after N seconds
-#   edit_sync: bool              -> mirror source edits onto destination copies
-#   user_filter: list[int]       -> only forward messages from these sender IDs
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TaskRuntime:
     client: TelegramClient
@@ -51,10 +37,6 @@ class ForwardingEngine:
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Startup: DO NOT eagerly connect every user's session. We only bring
-    # a session online when it actually has at least one active task.
-    # ------------------------------------------------------------------
     async def start(self) -> None:
         for task in await self.db.get_active_tasks():
             await self._register_task_if_possible(task)
@@ -85,8 +67,6 @@ class ForwardingEngine:
             return client
 
     async def _maybe_disconnect_user(self, user_id: int) -> None:
-        """Disconnect a user's session once it has zero active tasks, to
-        keep Railway resource usage low (connect-on-demand)."""
         async with self._lock:
             if self.active_task_count.get(user_id, 0) > 0:
                 return
@@ -100,7 +80,6 @@ class ForwardingEngine:
                 await client.disconnect()
 
     async def refresh_user(self, user_id: int) -> None:
-        """Reload all of one user's tasks (after connect/disconnect/block)."""
         for task in await self.db.get_tasks_for_user(user_id):
             await self.refresh_task(int(task["id"]))
 
@@ -119,7 +98,6 @@ class ForwardingEngine:
         return value if not isinstance(value, str) else json.loads(value)
 
     def _apply_text_transforms(self, text: str, settings: dict[str, Any]) -> str | None:
-        """Returns transformed text, or None if the message should be skipped."""
         blacklist = settings.get("blacklist") or []
         whitelist = settings.get("whitelist") or []
         replace = settings.get("replace") or {}
@@ -142,8 +120,6 @@ class ForwardingEngine:
         return text
 
     async def _apply_watermark(self, client: TelegramClient, message: Any) -> Any:
-        """Downloads a photo, stamps a text watermark on it, returns a BytesIO
-        ready for send_file, or None if watermarking isn't applicable/failed."""
         try:
             from PIL import Image, ImageDraw, ImageFont
         except ImportError:
@@ -343,7 +319,11 @@ class ForwardingEngine:
                 return await client.send_message(destination, message)
             except FloodWaitError as exc:
                 logger.warning("FloodWait while forwarding: %s seconds", exc.seconds)
-                await asyncio.sleep(exc.seconds)
+                # Safely wait for either the timeout or the engine to stop
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=exc.seconds)
+                except asyncio.TimeoutError:
+                    pass
             except (RPCError, OSError):
                 logger.warning("Forwarding failed for one destination", exc_info=False)
                 return None
