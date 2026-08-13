@@ -10,6 +10,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -115,9 +116,6 @@ async def _notify_admins(bot: Bot, settings: Settings, text: str) -> None:
 
 @router.errors()
 async def global_error_handler(event: ErrorEvent, settings: Settings) -> bool:
-    """Catches any exception raised inside a handler so buttons/commands
-    never fail silently: the user sees a message, and admins get the
-    full traceback so the bug can actually be diagnosed."""
     logger.exception("Unhandled error while processing update", exc_info=event.exception)
     update = event.update
     chat_bot: Bot | None = None
@@ -649,11 +647,6 @@ async def confirm_payment(
     original, discount, payable = payable_amount_paise(
         plan_name, cycle, first_paid_order=first_order
     )
-    # Razorpay requires a unique reference_id per payment link. A receipt
-    # keyed only on user+plan+cycle collides on every repeat purchase
-    # (renewal, retry after a failed webhook, etc.) and Razorpay then
-    # refuses to create a fresh link — so a short unique suffix is added
-    # to every attempt.
     unique_suffix = uuid4().hex[:10]
     try:
         link = await billing.create_payment_link(
@@ -1347,8 +1340,6 @@ async def task_name(message: Message, state: FSMContext, db: Database) -> None:
 
 
 def _text_or_forwarded_chat_id(message: Message) -> str | None:
-    """Accept either typed @username/ID text, or a forwarded message from
-    the source/destination chat (its chat ID is read from the forward)."""
     if message.text:
         return message.text.strip()
     origin = getattr(message, "forward_origin", None)
@@ -1509,7 +1500,6 @@ async def task_destination(
                 else f"✅ Destination #{len(destinations)} added. Send another, or /done ({remaining} more allowed)."
             )
             return
-        # limit reached, fall through to save automatically
 
     if is_editing_destinations_only:
         changed = await db.update_task_destinations(
@@ -1578,7 +1568,6 @@ async def task_action(
     await message.answer(result)
 
 
-# Which task-settings keys each plan unlocks. Checked before any setter runs.
 TIER_FEATURES: dict[str, set[str]] = {
     "free": set(),
     "silver": {"header", "footer"},
@@ -1790,9 +1779,6 @@ def _admin_check(settings: Settings, user_id: int) -> bool:
 
 
 async def _resolve_target_user(db: Database, raw: str) -> int | None:
-    """Admin commands accept either a numeric Telegram user ID or an
-    @username — resolve either form to a numeric user ID, or None if the
-    user can't be found."""
     raw = raw.strip()
     if raw.lstrip("-").isdigit():
         return int(raw)
@@ -2220,8 +2206,6 @@ async def referral_payout_command(message: Message, db: Database, settings: Sett
     if result is None:
         await message.answer("⚠️ No unpaid referral commission found for this user.")
         return
-    from .plans import format_paise
-
     await message.answer(
         f"✅ Marked as paid. Referrer: {result['referrer_id']}, "
         f"Amount: {format_paise(int(result['commission_amount_paise']))}"
@@ -2405,7 +2389,10 @@ async def _run(settings: Settings) -> None:
     )
     db = Database(settings.database_url)
     await db.connect()
-    bot = Bot(settings.telegram_bot_token)
+    bot = Bot(
+        settings.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode="HTML")
+    )
     telethon = TelethonService(settings, db)
     billing = RazorpayBilling(settings)
     forwarding = ForwardingEngine(db, telethon, settings.max_concurrent_forward_tasks)
