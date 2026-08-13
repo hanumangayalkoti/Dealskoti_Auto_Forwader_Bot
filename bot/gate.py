@@ -25,7 +25,8 @@ async def user_is_member(bot: Bot, settings: Settings, user_id: int) -> bool:
     except (TelegramBadRequest, TelegramForbiddenError):
         return False
     except Exception:
-        return False
+        # Prevent accidental pause on Telegram network/API errors
+        return True
     return member.status in {"creator", "administrator", "member", "restricted"}
 
 
