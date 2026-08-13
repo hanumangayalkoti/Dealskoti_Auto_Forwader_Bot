@@ -6,6 +6,7 @@ import logging
 import os
 import traceback
 from contextlib import suppress
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -507,10 +508,31 @@ async def menu_connect(
     if callback.message is None:
         return
     language = await _language_for_callback(db, callback)
-    if await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
-        await telethon.cancel_login(callback.from_user.id)
-        await state.set_state(LoginStates.waiting_phone)
-        await callback.message.answer(t(language, "login_phone"))
+    if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
+        await callback.answer()
+        return
+    if await db.has_active_session(callback.from_user.id):
+        await callback.message.answer(
+            "ℹ️ Aap already connected ho. Dobara connect karoge to purana session "
+            "replace ho jaayega."
+            if language == "hinglish"
+            else "ℹ️ You're already connected. Reconnecting will replace your existing session.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Reconnect anyway", callback_data="connect:force"
+                        )
+                    ],
+                    [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+    await telethon.cancel_login(callback.from_user.id)
+    await state.set_state(LoginStates.waiting_phone)
+    await callback.message.answer(t(language, "login_phone"))
     await callback.answer()
 
 
@@ -620,14 +642,23 @@ async def confirm_payment(
         await callback.answer("Invalid payment option", show_alert=True)
         return
     language = await _language_for_callback(db, callback)
+    if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
+        await callback.answer()
+        return
     first_order = not await db.has_paid_order(callback.from_user.id)
     original, discount, payable = payable_amount_paise(
         plan_name, cycle, first_paid_order=first_order
     )
+    # Razorpay requires a unique reference_id per payment link. A receipt
+    # keyed only on user+plan+cycle collides on every repeat purchase
+    # (renewal, retry after a failed webhook, etc.) and Razorpay then
+    # refuses to create a fresh link — so a short unique suffix is added
+    # to every attempt.
+    unique_suffix = uuid4().hex[:10]
     try:
         link = await billing.create_payment_link(
             amount_paise=payable,
-            receipt=f"dk_{callback.from_user.id}_{plan_name}_{cycle}",
+            receipt=f"dk_{callback.from_user.id}_{plan_name}_{cycle}_{unique_suffix}",
             plan=plan_name,
             cycle=cycle,
             user_id=callback.from_user.id,
@@ -672,8 +703,12 @@ async def confirm_payment(
 
 
 @router.callback_query(F.data == "menu:tasks")
-async def menu_tasks(callback: CallbackQuery, db: Database) -> None:
+async def menu_tasks(callback: CallbackQuery, db: Database, settings: Settings) -> None:
     if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
+        await callback.answer()
         return
     await _render_tasks(callback.message, db, callback.from_user.id)
     await callback.answer()
@@ -1085,9 +1120,40 @@ async def connect_command(
     language = await _language_for_message(db, message)
     if not await enforce_gate(message.bot, db, settings, message.from_user.id, language):
         return
+    if await db.has_active_session(message.from_user.id):
+        await message.answer(
+            "ℹ️ Aap already connected ho. Dobara connect karoge to purana session "
+            "replace ho jaayega."
+            if language == "hinglish"
+            else "ℹ️ You're already connected. Reconnecting will replace your existing session.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Reconnect anyway", callback_data="connect:force"
+                        )
+                    ],
+                    [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                ]
+            ),
+        )
+        return
     await telethon.cancel_login(message.from_user.id)
     await state.set_state(LoginStates.waiting_phone)
     await message.answer(t(language, "login_phone"))
+
+
+@router.callback_query(F.data == "connect:force")
+async def connect_force(
+    callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService
+) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await telethon.cancel_login(callback.from_user.id)
+    await state.set_state(LoginStates.waiting_phone)
+    await callback.message.edit_text(t(language, "login_phone"))
+    await callback.answer()
 
 
 @router.message(LoginStates.waiting_phone)
@@ -1553,7 +1619,6 @@ async def set_header_command(message: Message, db: Database, forwarding: Forward
         return
     header_text = parts[2] if len(parts) > 2 else ""
     await db.update_task_settings(message.from_user.id, task_id, {"header": header_text})
-    await forwarding.refresh_task(task_id)
     await message.answer("✅ Header updated." if header_text else "✅ Header cleared.")
 
 
@@ -1568,7 +1633,6 @@ async def set_footer_command(message: Message, db: Database, forwarding: Forward
         return
     footer_text = parts[2] if len(parts) > 2 else ""
     await db.update_task_settings(message.from_user.id, task_id, {"footer": footer_text})
-    await forwarding.refresh_task(task_id)
     await message.answer("✅ Footer updated." if footer_text else "✅ Footer cleared.")
 
 
@@ -1585,7 +1649,6 @@ async def set_filter_command(message: Message, db: Database, forwarding: Forward
         return
     words = [w.strip() for w in parts[2].split(",") if w.strip()] if len(parts) > 2 else []
     await db.update_task_settings(message.from_user.id, task_id, {key: words})
-    await forwarding.refresh_task(task_id)
     await message.answer(f"✅ {key.title()} updated: {len(words)} word(s).")
 
 
@@ -1608,7 +1671,6 @@ async def set_replace_command(message: Message, db: Database, forwarding: Forwar
             old, new = pair.split("=>", 1)
             mapping[old.strip()] = new.strip()
     await db.update_task_settings(message.from_user.id, task_id, {"replace": mapping})
-    await forwarding.refresh_task(task_id)
     await message.answer(f"✅ Replace rules updated: {len(mapping)} rule(s).")
 
 
@@ -1625,7 +1687,6 @@ async def toggle_watermark_command(
         return
     enabled = parts[2].lower() == "on"
     await db.update_task_settings(message.from_user.id, task_id, {"watermark": enabled})
-    await forwarding.refresh_task(task_id)
     await message.answer(f"✅ Watermark turned {'on' if enabled else 'off'}.")
 
 
@@ -1642,7 +1703,6 @@ async def toggle_edit_sync_command(
         return
     enabled = parts[2].lower() == "on"
     await db.update_task_settings(message.from_user.id, task_id, {"edit_sync": enabled})
-    await forwarding.refresh_task(task_id)
     await message.answer(f"✅ Live edit-sync turned {'on' if enabled else 'off'}.")
 
 
@@ -1661,7 +1721,6 @@ async def set_auto_delete_command(
     await db.update_task_settings(
         message.from_user.id, task_id, {"auto_delete_seconds": seconds}
     )
-    await forwarding.refresh_task(task_id)
     await message.answer(
         "✅ Auto-delete turned off." if seconds == 0 else f"✅ Auto-delete set to {seconds}s."
     )
@@ -1687,7 +1746,6 @@ async def set_user_filter_command(
             if raw.lstrip("-").isdigit():
                 ids.append(int(raw))
     await db.update_task_settings(message.from_user.id, task_id, {"user_filter": ids})
-    await forwarding.refresh_task(task_id)
     await message.answer(f"✅ User filter updated: {len(ids)} sender(s) allowed.")
 
 
