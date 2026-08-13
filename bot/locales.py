@@ -47,7 +47,7 @@ TEXT: dict[Language, dict[str, str]] = {
         "payment_failed": "⚠️ Payment link could not be created. Please try again shortly.",
         "tasks_title": "📋 <b>Your forwarding tasks:</b>",
         "no_tasks_short": "📋 No tasks yet.",
-        "account_details": "👤 <b>My Account</b>\n\nName: {name}\nUsername: {username}\nTelegram ID: <code>{user_id}</code>\nPlan: <b>{plan}</b>\nExpiry: <code>{expiry}</code>\nPayment: {payment}\nTelegram session: {session}\nActive tasks: {tasks}\nForwarding: {forwarding}\nUpdates membership: {membership}\nLanguage: {language}",
+        "account_details": "👤 <b>My Account</b>\n\nName: {name}\nUsername: {username}\nTelegram ID: <code>{user_id}</code>\nPlan: <b>{plan}</b>\nExpiry: <code>{expiry}</code>\nPayment: {payment}\nTelegram session: {session}\nActive tasks: {tasks}\nForwarding: {forwarding}\nUpdates membership: {membership}\nLanguage: {user_language}",
         "broadcast_message": "📣 Send the broadcast text to continue. /back to cancel.",
     },
     "hinglish": {
@@ -91,10 +91,11 @@ TEXT: dict[Language, dict[str, str]] = {
         "payment_failed": "⚠️ Payment link nahi ban paaya. Thodi der baad dobara try karo.",
         "tasks_title": "📋 <b>Aapke forwarding tasks:</b>",
         "no_tasks_short": "📋 Abhi koi task nahi hai.",
-        "account_details": "👤 <b>My Account</b>\n\nName: {name}\nUsername: {username}\nTelegram ID: <code>{user_id}</code>\nPlan: <b>{plan}</b>\nExpiry: <code>{expiry}</code>\nPayment: {payment}\nTelegram session: {session}\nActive tasks: {tasks}\nForwarding: {forwarding}\nUpdates membership: {membership}\nLanguage: {language}",
+        "account_details": "👤 <b>My Account</b>\n\nName: {name}\nUsername: {username}\nTelegram ID: <code>{user_id}</code>\nPlan: <b>{plan}</b>\nExpiry: <code>{expiry}</code>\nPayment: {payment}\nTelegram session: {session}\nActive tasks: {tasks}\nForwarding: {forwarding}\nUpdates membership: {membership}\nLanguage: {user_language}",
         "broadcast_message": "📣 Broadcast message bhejo. Cancel ke liye /back.",
     },
 }
+
 
 USER_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("/start", "Start the bot", "Bot start karo"),
