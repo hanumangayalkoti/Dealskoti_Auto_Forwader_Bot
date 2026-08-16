@@ -84,6 +84,7 @@ class ForwardingEngine:
         user_id = task["user_id"]
         if task["is_paused"]:
             self._active_tasks.pop(task_id, None)
+            await self._release_if_idle(user_id)
         else:
             self._active_tasks[task_id] = dict(task)
             user = await self.db.get_user(user_id)
@@ -91,8 +92,10 @@ class ForwardingEngine:
             await self._attach_handlers(user_id)
 
     async def remove_task(self, task_id: int) -> None:
-        self._active_tasks.pop(task_id, None)
+        task = self._active_tasks.pop(task_id, None)
         self._edit_map.pop(task_id, None)
+        if task is not None:
+            await self._release_if_idle(task["user_id"])
 
     async def refresh_user(self, user_id: int) -> None:
         # Reload all tasks for this user
@@ -104,8 +107,17 @@ class ForwardingEngine:
         # Remove all tasks for this user from active memory
         to_remove = [tid for tid, t in self._active_tasks.items() if t["user_id"] == user_id]
         for tid in to_remove:
-            await self.remove_task(tid)
+            self._active_tasks.pop(tid, None)
+            self._edit_map.pop(tid, None)
         self._user_plans.pop(user_id, None)
+        await self.telethon.release_client(user_id)
+
+    async def _release_if_idle(self, user_id: int) -> None:
+        """If a user has no more active (unpaused) tasks, drop their live
+        Telethon connection so it doesn't sit open indefinitely."""
+        still_active = any(t["user_id"] == user_id for t in self._active_tasks.values())
+        if not still_active:
+            await self.telethon.release_client(user_id)
 
     # --- TELETHON EVENT HANDLERS ---
 
