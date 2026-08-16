@@ -387,12 +387,19 @@ class Database:
 
     async def get_expiring_users(self, days: int) -> list[asyncpg.Record]:
         if self.pool is None: return []
-        now = datetime.now(timezone.utc)
-        target = now + timedelta(days=days)
-        start = target - timedelta(hours=1)
-        end = target + timedelta(hours=1)
         async with self.pool.acquire() as conn:
-            return await conn.fetch("SELECT telegram_user_id, plan, preferred_language FROM users WHERE plan != 'free' AND plan_expiry BETWEEN $1 AND $2", start, end)
+            # Match on calendar date, not a narrow time-of-day window — a
+            # user's plan_expiry timestamp is whatever time they originally
+            # paid, which rarely lines up with the scheduler's run time, so
+            # a tight +/-1hr window silently misses almost everyone.
+            return await conn.fetch(
+                """
+                SELECT telegram_user_id, plan, preferred_language FROM users
+                WHERE plan != 'free' AND plan_expiry IS NOT NULL
+                  AND plan_expiry::date = (CURRENT_DATE + $1::int)
+                """,
+                days,
+            )
 
     async def downgrade_expired_users(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
