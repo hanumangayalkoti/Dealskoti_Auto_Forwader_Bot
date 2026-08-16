@@ -1,859 +1,477 @@
-from __future__ import annotations
-
 import json
-from typing import Any
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Sequence
 
 import asyncpg
 
+from .plans import PLANS
 
-SCHEMA_SQL = """
+logger = logging.getLogger("dealskoti.db")
+
+PLAN_RANKS = {
+    "free": 0,
+    "silver": 1,
+    "gold": 2,
+    "platinum": 3,
+}
+
+# ---------------------------------------------------------
+# SAFE MIGRATIONS: Adds new columns without dropping old ones
+# ---------------------------------------------------------
+MIGRATIONS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    telegram_user_id BIGINT PRIMARY KEY,
-    username TEXT,
-    first_name TEXT,
-    preferred_language TEXT NOT NULL DEFAULT 'en'
-        CHECK (preferred_language IN ('en', 'hinglish')),
-    language_selected BOOLEAN NOT NULL DEFAULT FALSE,
-    plan TEXT NOT NULL DEFAULT 'free',
-    plan_expiry TIMESTAMPTZ,
-    trial_started_at TIMESTAMPTZ,
-    trial_expires_at TIMESTAMPTZ,
-    first_paid_order_at TIMESTAMPTZ,
-    is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
-    referred_by BIGINT REFERENCES users(telegram_user_id),
-    updates_channel_member BOOLEAN NOT NULL DEFAULT FALSE,
-    last_membership_check_at TIMESTAMPTZ,
-    last_gate_notice_at TIMESTAMPTZ,
-    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    new_user_notified BOOLEAN NOT NULL DEFAULT FALSE,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id SERIAL PRIMARY KEY,
+    telegram_user_id BIGINT UNIQUE NOT NULL,
+    username VARCHAR(255),
+    first_name VARCHAR(255),
+    plan VARCHAR(50) DEFAULT 'free',
+    plan_expiry TIMESTAMP WITH TIME ZONE,
+    preferred_language VARCHAR(20) DEFAULT 'en',
+    language_selected BOOLEAN DEFAULT FALSE,
+    is_blocked BOOLEAN DEFAULT FALSE,
+    updates_channel_member BOOLEAN DEFAULT FALSE,
+    last_seen_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Upgrading schema safely for scheduled plans (Downgrade queues)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_plan VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_days INTEGER;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_notified BOOLEAN DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+    task_name VARCHAR(255) NOT NULL,
+    sources JSONB DEFAULT '[]'::jsonb,
+    destinations JSONB DEFAULT '[]'::jsonb,
+    settings JSONB DEFAULT '{}'::jsonb,
+    is_paused BOOLEAN DEFAULT FALSE,
+    pause_reason VARCHAR(50),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
     user_id BIGINT PRIMARY KEY REFERENCES users(telegram_user_id) ON DELETE CASCADE,
-    encrypted_session_string TEXT NOT NULL,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    last_connected_at TIMESTAMPTZ,
-    last_error_code TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS tasks (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
-    task_name TEXT NOT NULL,
-    sources JSONB NOT NULL DEFAULT '[]'::jsonb,
-    destinations JSONB NOT NULL DEFAULT '[]'::jsonb,
-    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
-    is_paused BOOLEAN NOT NULL DEFAULT FALSE,
-    pause_reason TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    session_string TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS payments (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(telegram_user_id),
-    razorpay_order_id TEXT UNIQUE NOT NULL,
-    razorpay_payment_id TEXT UNIQUE,
-    plan TEXT NOT NULL,
-    cycle TEXT NOT NULL,
-    original_amount_paise BIGINT NOT NULL,
-    discount_amount_paise BIGINT NOT NULL DEFAULT 0,
-    payable_amount_paise BIGINT NOT NULL,
-    captured_amount_paise BIGINT,
-    status TEXT NOT NULL DEFAULT 'created',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    captured_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS referrals (
-    referrer_id BIGINT NOT NULL REFERENCES users(telegram_user_id),
-    referred_user_id BIGINT PRIMARY KEY REFERENCES users(telegram_user_id),
-    commission_amount_paise BIGINT NOT NULL DEFAULT 0,
-    is_paid BOOLEAN NOT NULL DEFAULT FALSE,
-    payout_upi_encrypted TEXT,
-    requested_at TIMESTAMPTZ,
-    paid_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS message_map (
-    task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    source_msg_id BIGINT NOT NULL,
-    destination_msg_id BIGINT NOT NULL,
-    PRIMARY KEY (task_id, source_msg_id, destination_msg_id)
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(telegram_user_id),
+    order_id VARCHAR(255) UNIQUE NOT NULL,
+    payment_id VARCHAR(255),
+    plan VARCHAR(50) NOT NULL,
+    cycle VARCHAR(50) NOT NULL,
+    amount_paise INTEGER NOT NULL,
+    original_amount_paise INTEGER DEFAULT 0,
+    discount_amount_paise INTEGER DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'created',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS usage_daily (
-    user_id BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(telegram_user_id) ON DELETE CASCADE,
     usage_date DATE NOT NULL,
-    forwarded_messages BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (user_id, usage_date)
+    message_count INTEGER DEFAULT 0,
+    UNIQUE (user_id, usage_date)
 );
 
-CREATE TABLE IF NOT EXISTS admin_audit_events (
-    id BIGSERIAL PRIMARY KEY,
-    admin_user_id BIGINT NOT NULL,
-    action TEXT NOT NULL,
-    target_user_id BIGINT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS broadcasts (
+    id SERIAL PRIMARY KEY,
+    admin_id BIGINT NOT NULL,
+    audience VARCHAR(50) NOT NULL,
+    message TEXT NOT NULL,
+    total_users INTEGER DEFAULT 0,
+    sent INTEGER DEFAULT 0,
+    failed INTEGER DEFAULT 0,
+    blocked INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS broadcast_history (
-    id BIGSERIAL PRIMARY KEY,
-    admin_user_id BIGINT NOT NULL,
-    audience TEXT NOT NULL,
-    message_text TEXT NOT NULL,
-    total_recipients BIGINT NOT NULL DEFAULT 0,
-    sent_count BIGINT NOT NULL DEFAULT 0,
-    failed_count BIGINT NOT NULL DEFAULT 0,
-    blocked_count BIGINT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ
-);
-"""
-
-MIGRATIONS_SQL = """
-ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-ALTER TABLE users ADD COLUMN IF NOT EXISTS new_user_notified BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-CREATE TABLE IF NOT EXISTS broadcast_history (
-    id BIGSERIAL PRIMARY KEY,
-    admin_user_id BIGINT NOT NULL,
-    audience TEXT NOT NULL,
-    message_text TEXT NOT NULL,
-    total_recipients BIGINT NOT NULL DEFAULT 0,
-    sent_count BIGINT NOT NULL DEFAULT 0,
-    failed_count BIGINT NOT NULL DEFAULT 0,
-    blocked_count BIGINT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ
+CREATE TABLE IF NOT EXISTS referrals (
+    id SERIAL PRIMARY KEY,
+    referrer_id BIGINT REFERENCES users(telegram_user_id),
+    referred_id BIGINT REFERENCES users(telegram_user_id),
+    commission_amount_paise INTEGER NOT NULL,
+    is_paid BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 """
-
 
 class Database:
-    def __init__(self, url: str) -> None:
-        self.url = url
+    def __init__(self, dsn: str):
+        self.dsn = dsn
         self.pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(self.url, min_size=1, max_size=10)
-        await self.pool.execute(SCHEMA_SQL)
-        await self.pool.execute(MIGRATIONS_SQL)
+        self.pool = await asyncpg.create_pool(self.dsn)
+        if self.pool is None:
+            raise RuntimeError("Database pool creation failed")
+        async with self.pool.acquire() as conn:
+            await conn.execute(MIGRATIONS_SQL)
+        logger.info("Database connected and schema verified safely.")
 
     async def close(self) -> None:
         if self.pool is not None:
             await self.pool.close()
-            self.pool = None
 
-    def _pool(self) -> asyncpg.Pool:
-        if self.pool is None:
-            raise RuntimeError("Database is not connected")
-        return self.pool
+    # --- USER MANAGEMENT ---
 
-    async def ensure_user(
-        self, user_id: int, username: str | None, first_name: str | None = None
-    ) -> asyncpg.Record:
-        row, _ = await self.ensure_user_with_status(user_id, username, first_name)
-        return row
+    async def ensure_user(self, user_id: int, username: str | None, first_name: str | None) -> asyncpg.Record:
+        user, _ = await self.ensure_user_with_status(user_id, username, first_name)
+        return user
 
-    async def ensure_user_with_status(
-        self, user_id: int, username: str | None, first_name: str | None = None
-    ) -> tuple[asyncpg.Record, bool]:
-        inserted = await self._pool().fetchval(
-            """
-            INSERT INTO users (telegram_user_id, username)
-            VALUES ($1, $2)
-            ON CONFLICT (telegram_user_id) DO NOTHING
-            RETURNING TRUE
-            """,
-            user_id,
-            username,
-        )
-        row = await self._pool().fetchrow(
-            """
-            UPDATE users
-            SET username = COALESCE($2, username),
-                first_name = COALESCE($3, first_name),
-                last_seen_at = NOW(),
-                updated_at = NOW()
-            WHERE telegram_user_id = $1
-            RETURNING *
-            """,
-            user_id,
-            username,
-            first_name,
-        )
-        assert row is not None
-        if inserted:
-            await self._pool().execute(
-                """
-                UPDATE users SET first_name = $2, last_seen_at = NOW()
-                WHERE telegram_user_id = $1
-                """,
-                user_id,
-                first_name,
-            )
-        return row, bool(inserted)
+    async def ensure_user_with_status(self, user_id: int, username: str | None, first_name: str | None) -> tuple[asyncpg.Record, bool]:
+        if self.pool is None: raise RuntimeError("Database not connected")
+        async with self.pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE telegram_user_id = $1", user_id)
+            if user:
+                await conn.execute(
+                    "UPDATE users SET username = $1, first_name = $2, last_seen_at = CURRENT_TIMESTAMP WHERE telegram_user_id = $3",
+                    username, first_name, user_id
+                )
+                return await conn.fetchrow("SELECT * FROM users WHERE telegram_user_id = $1", user_id), False
+            else:
+                await conn.execute(
+                    "INSERT INTO users (telegram_user_id, username, first_name) VALUES ($1, $2, $3)",
+                    user_id, username, first_name
+                )
+                return await conn.fetchrow("SELECT * FROM users WHERE telegram_user_id = $1", user_id), True
 
     async def mark_new_user_notified(self, user_id: int) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE users SET new_user_notified = TRUE, updated_at = NOW()
-            WHERE telegram_user_id = $1 AND new_user_notified = FALSE
-            """,
-            user_id,
-        )
-        return result.endswith("1")
+        if self.pool is None: raise RuntimeError("DB Error")
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT is_new_notified FROM users WHERE telegram_user_id = $1", user_id)
+            if val: return False
+            await conn.execute("UPDATE users SET is_new_notified = TRUE WHERE telegram_user_id = $1", user_id)
+            return True
 
     async def get_user(self, user_id: int) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            "SELECT * FROM users WHERE telegram_user_id = $1", user_id
-        )
-
-    async def get_users_for_membership_check(self) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            """
-            SELECT DISTINCT u.telegram_user_id
-            FROM users u
-            JOIN tasks t ON t.user_id = u.telegram_user_id
-            WHERE t.is_paused = FALSE AND u.is_blocked = FALSE
-            """
-        )
-
-    async def set_language(self, user_id: int, language: str) -> None:
-        await self._pool().execute(
-            """
-            UPDATE users
-            SET preferred_language = $2, language_selected = TRUE, updated_at = NOW()
-            WHERE telegram_user_id = $1
-            """,
-            user_id,
-            language,
-        )
-
-    async def set_membership(self, user_id: int, is_member: bool) -> None:
-        await self._pool().execute(
-            """
-            UPDATE users
-            SET updates_channel_member = $2, last_membership_check_at = NOW(),
-                updated_at = NOW()
-            WHERE telegram_user_id = $1
-            """,
-            user_id,
-            is_member,
-        )
-
-    async def save_session(self, user_id: int, encrypted_session: str) -> None:
-        await self._pool().execute(
-            """
-            INSERT INTO sessions (user_id, encrypted_session_string, is_active,
-                                  last_connected_at)
-            VALUES ($1, $2, TRUE, NOW())
-            ON CONFLICT (user_id) DO UPDATE SET
-                encrypted_session_string = EXCLUDED.encrypted_session_string,
-                is_active = TRUE, last_connected_at = NOW(),
-                last_error_code = NULL, updated_at = NOW()
-            """,
-            user_id,
-            encrypted_session,
-        )
-
-    async def deactivate_session(self, user_id: int) -> None:
-        await self._pool().execute(
-            "UPDATE sessions SET is_active = FALSE, updated_at = NOW() WHERE user_id = $1",
-            user_id,
-        )
-
-    async def has_active_session(self, user_id: int) -> bool:
-        value = await self._pool().fetchval(
-            "SELECT EXISTS (SELECT 1 FROM sessions WHERE user_id = $1 AND is_active = TRUE)",
-            user_id,
-        )
-        return bool(value)
-
-    async def get_active_sessions(self) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            """
-            SELECT u.telegram_user_id, u.plan, u.is_blocked,
-                   u.updates_channel_member, s.encrypted_session_string
-            FROM users u
-            JOIN sessions s ON s.user_id = u.telegram_user_id
-            WHERE s.is_active = TRUE AND u.is_blocked = FALSE
-            """
-        )
-
-    async def get_active_session(self, user_id: int) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            """
-            SELECT u.telegram_user_id, u.plan, u.is_blocked,
-                   u.updates_channel_member, s.encrypted_session_string
-            FROM users u
-            JOIN sessions s ON s.user_id = u.telegram_user_id
-            WHERE s.user_id = $1 AND s.is_active = TRUE
-            """,
-            user_id,
-        )
-
-    async def create_task(
-        self,
-        user_id: int,
-        task_name: str,
-        source: dict[str, Any],
-        destination: dict[str, Any],
-    ) -> int:
-        row = await self._pool().fetchrow(
-            """
-            INSERT INTO tasks (user_id, task_name, sources, destinations)
-            VALUES ($1, $2, $3::jsonb, $4::jsonb)
-            RETURNING id
-            """,
-            user_id,
-            task_name,
-            json.dumps([source]),
-            json.dumps([destination]),
-        )
-        assert row is not None
-        return int(row["id"])
-
-    async def create_task_multi(
-        self,
-        user_id: int,
-        task_name: str,
-        sources: list[dict[str, Any]],
-        destinations: list[dict[str, Any]],
-    ) -> int:
-        row = await self._pool().fetchrow(
-            """
-            INSERT INTO tasks (user_id, task_name, sources, destinations)
-            VALUES ($1, $2, $3::jsonb, $4::jsonb)
-            RETURNING id
-            """,
-            user_id,
-            task_name,
-            json.dumps(sources),
-            json.dumps(destinations),
-        )
-        assert row is not None
-        return int(row["id"])
-
-    async def rename_task(self, user_id: int, task_id: int, new_name: str) -> bool:
-        result = await self._pool().execute(
-            "UPDATE tasks SET task_name = $3, updated_at = NOW() WHERE user_id = $1 AND id = $2",
-            user_id,
-            task_id,
-            new_name,
-        )
-        return result.endswith("1")
-
-    async def update_task_sources(
-        self, user_id: int, task_id: int, sources: list[dict[str, Any]]
-    ) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE tasks SET sources = $3::jsonb, updated_at = NOW()
-            WHERE user_id = $1 AND id = $2
-            """,
-            user_id,
-            task_id,
-            json.dumps(sources),
-        )
-        return result.endswith("1")
-
-    async def update_task_destinations(
-        self, user_id: int, task_id: int, destinations: list[dict[str, Any]]
-    ) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE tasks SET destinations = $3::jsonb, updated_at = NOW()
-            WHERE user_id = $1 AND id = $2
-            """,
-            user_id,
-            task_id,
-            json.dumps(destinations),
-        )
-        return result.endswith("1")
-
-    async def list_tasks(self, user_id: int) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id", user_id
-        )
-
-    async def get_active_tasks(self) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            """
-            SELECT id, user_id, task_name, sources, destinations, settings, is_paused
-            FROM tasks
-            WHERE is_paused = FALSE
-            ORDER BY user_id, id
-            """
-        )
-
-    async def get_tasks_for_user(self, user_id: int) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            """
-            SELECT id, user_id, task_name, sources, destinations, settings,
-                   is_paused, pause_reason
-            FROM tasks WHERE user_id = $1 ORDER BY id
-            """,
-            user_id,
-        )
-
-    async def get_task(self, task_id: int) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            "SELECT * FROM tasks WHERE id = $1", task_id
-        )
-
-    async def add_source(self, user_id: int, task_id: int, entity: dict[str, Any]) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE tasks
-            SET sources = sources || $3::jsonb, updated_at = NOW()
-            WHERE user_id = $1 AND id = $2
-            """,
-            user_id,
-            task_id,
-            json.dumps([entity]),
-        )
-        return result.endswith("1")
-
-    async def add_destination(
-        self, user_id: int, task_id: int, entity: dict[str, Any]
-    ) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE tasks
-            SET destinations = destinations || $3::jsonb, updated_at = NOW()
-            WHERE user_id = $1 AND id = $2
-            """,
-            user_id,
-            task_id,
-            json.dumps([entity]),
-        )
-        return result.endswith("1")
-
-    async def update_task_settings(
-        self, user_id: int, task_id: int, settings: dict[str, Any]
-    ) -> bool:
-        """Shallow-merge new keys into the task's settings JSONB blob."""
-        result = await self._pool().execute(
-            """
-            UPDATE tasks
-            SET settings = settings || $3::jsonb, updated_at = NOW()
-            WHERE user_id = $1 AND id = $2
-            """,
-            user_id,
-            task_id,
-            json.dumps(settings),
-        )
-        return result.endswith("1")
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE telegram_user_id = $1", user_id)
 
     async def get_user_by_username(self, username: str) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            "SELECT * FROM users WHERE lower(username) = lower($1)",
-            username.lstrip("@"),
-        )
+        if self.pool is None: return None
+        username = username.lstrip("@")
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE username ILIKE $1", username)
 
-    async def save_message_map(
-        self, task_id: int, source_msg_id: int, destination_msg_id: int
-    ) -> None:
-        await self._pool().execute(
-            """
-            INSERT INTO message_map (task_id, source_msg_id, destination_msg_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT DO NOTHING
-            """,
-            task_id,
-            source_msg_id,
-            destination_msg_id,
-        )
+    async def list_users(self, limit: int = 15) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT * FROM users ORDER BY created_at DESC LIMIT $1", limit)
 
-    async def get_mapped_destination_messages(
-        self, task_id: int, source_msg_id: int
-    ) -> list[int]:
-        rows = await self._pool().fetch(
-            """
-            SELECT destination_msg_id FROM message_map
-            WHERE task_id = $1 AND source_msg_id = $2
-            """,
-            task_id,
-            source_msg_id,
-        )
-        return [int(r["destination_msg_id"]) for r in rows]
+    async def set_language(self, user_id: int, language: str) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE users SET preferred_language = $1, language_selected = TRUE WHERE telegram_user_id = $2", language, user_id)
 
-    async def get_expiring_users(self, days_ahead: int) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            """
-            SELECT telegram_user_id, preferred_language, plan, plan_expiry
-            FROM users
-            WHERE plan != 'free' AND is_blocked = FALSE AND plan_expiry IS NOT NULL
-              AND plan_expiry::date = (CURRENT_DATE + $1::int)
-            """,
-            days_ahead,
-        )
+    async def set_membership(self, user_id: int, is_member: bool) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE users SET updates_channel_member = $1 WHERE telegram_user_id = $2", is_member, user_id)
 
-    async def downgrade_expired_users(self) -> list[asyncpg.Record]:
-        rows = await self._pool().fetch(
-            """
-            UPDATE users
-            SET plan = 'free', plan_expiry = NULL, updated_at = NOW()
-            WHERE plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry <= NOW()
-            RETURNING telegram_user_id, preferred_language
-            """
-        )
-        return rows
-
-    async def mark_referral_paid(self, referred_user_id: int) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            """
-            UPDATE referrals
-            SET is_paid = TRUE, paid_at = NOW()
-            WHERE referred_user_id = $1 AND is_paid = FALSE
-            RETURNING referrer_id, commission_amount_paise
-            """,
-            referred_user_id,
-        )
-
-    async def task_can_forward(self, task_id: int) -> bool:
-        row = await self._pool().fetchrow(
-            """
-            SELECT t.is_paused, u.is_blocked, u.is_active,
-                   u.updates_channel_member, u.plan, u.plan_expiry
-            FROM tasks t
-            JOIN users u ON u.telegram_user_id = t.user_id
-            WHERE t.id = $1
-            """,
-            task_id,
-        )
-        if row is None or row["is_paused"] or row["is_blocked"] or not row["is_active"]:
-            return False
-        if not row["updates_channel_member"]:
-            return False
-        if row["plan"] != "free" and row["plan_expiry"] is not None:
-            if row["plan_expiry"] <= await self._pool().fetchval("SELECT NOW()"):
-                return False
-        return True
-
-    async def record_forwarded_message(self, task_id: int) -> bool:
-        row = await self._pool().fetchrow(
-            """
-            SELECT t.user_id, u.plan
-            FROM tasks t JOIN users u ON u.telegram_user_id = t.user_id
-            WHERE t.id = $1 AND t.is_paused = FALSE AND u.is_blocked = FALSE
-              AND u.is_active = TRUE AND u.updates_channel_member = TRUE
-              AND (u.plan = 'free' OR u.plan_expiry IS NULL OR u.plan_expiry > NOW())
-            """,
-            task_id,
-        )
-        if row is None:
-            return False
-        limits = {"free": 50, "silver": 200, "gold": 500, "platinum": None}
-        limit = limits.get(str(row["plan"]), 50)
-        if limit is None:
-            await self._pool().execute(
-                """
-                INSERT INTO usage_daily (user_id, usage_date, forwarded_messages)
-                VALUES ($1, CURRENT_DATE, 1)
-                ON CONFLICT (user_id, usage_date) DO UPDATE
-                SET forwarded_messages = usage_daily.forwarded_messages + 1
-                """,
-                row["user_id"],
-            )
-            return True
-        result = await self._pool().fetchrow(
-            """
-            INSERT INTO usage_daily (user_id, usage_date, forwarded_messages)
-            VALUES ($1, CURRENT_DATE, 1)
-            ON CONFLICT (user_id, usage_date) DO UPDATE
-            SET forwarded_messages = usage_daily.forwarded_messages + 1
-            WHERE usage_daily.forwarded_messages < $2
-            RETURNING forwarded_messages
-            """,
-            row["user_id"],
-            limit,
-        )
-        return result is not None
-
-    async def daily_usage(self, user_id: int) -> int:
-        value = await self._pool().fetchval(
-            """
-            SELECT forwarded_messages FROM usage_daily
-            WHERE user_id = $1 AND usage_date = CURRENT_DATE
-            """,
-            user_id,
-        )
-        return int(value or 0)
-
-    async def set_task_paused(
-        self, user_id: int, task_id: int, paused: bool, reason: str | None = None
-    ) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE tasks
-            SET is_paused = $3, pause_reason = $4, updated_at = NOW()
-            WHERE user_id = $1 AND id = $2
-            """,
-            user_id,
-            task_id,
-            paused,
-            reason,
-        )
-        return result.endswith("1")
-
-    async def delete_task(self, user_id: int, task_id: int) -> bool:
-        result = await self._pool().execute(
-            "DELETE FROM tasks WHERE user_id = $1 AND id = $2", user_id, task_id
-        )
-        return result.endswith("1")
-
-    async def count_tasks(self, user_id: int) -> int:
-        value = await self._pool().fetchval(
-            "SELECT COUNT(*) FROM tasks WHERE user_id = $1 AND is_paused = FALSE",
-            user_id,
-        )
-        return int(value or 0)
-
-    async def save_payment(
-        self,
-        user_id: int,
-        order_id: str,
-        plan: str,
-        cycle: str,
-        original: int,
-        discount: int,
-        payable: int,
-    ) -> None:
-        await self._pool().execute(
-            """
-            INSERT INTO payments
-                (user_id, razorpay_order_id, plan, cycle, original_amount_paise,
-                 discount_amount_paise, payable_amount_paise)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (razorpay_order_id) DO NOTHING
-            """,
-            user_id,
-            order_id,
-            plan,
-            cycle,
-            original,
-            discount,
-            payable,
-        )
-
-    async def has_paid_order(self, user_id: int) -> bool:
-        value = await self._pool().fetchval(
-            "SELECT EXISTS (SELECT 1 FROM payments WHERE user_id = $1 AND status = 'captured')",
-            user_id,
-        )
-        return bool(value)
-
-    async def get_payment_for_order(self, order_id: str) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            "SELECT * FROM payments WHERE razorpay_order_id = $1", order_id
-        )
-
-    async def activate_payment(
-        self,
-        order_id: str,
-        payment_id: str,
-        captured_amount: int,
-        duration_days: int,
-        plan: str,
-        cycle: str,
-    ) -> int | None:
-        async with self._pool().acquire() as connection:
-            async with connection.transaction():
-                payment = await connection.fetchrow(
-                    "SELECT * FROM payments WHERE razorpay_order_id = $1 FOR UPDATE",
-                    order_id,
-                )
-                if payment is None:
-                    raise ValueError("Razorpay order was not created by this service")
-                if payment["status"] == "captured":
-                    return None
-                if int(payment["payable_amount_paise"]) != captured_amount:
-                    raise ValueError("Captured payment amount does not match the stored order")
-                if payment["plan"] != plan:
-                    raise ValueError("Captured payment plan does not match the stored order")
-                if payment["cycle"] != cycle:
-                    raise ValueError("Captured payment cycle does not match the stored order")
-                user_id = int(payment["user_id"])
-                await connection.execute(
-                    """
-                    UPDATE payments
-                    SET razorpay_payment_id = $2, captured_amount_paise = $3,
-                        status = 'captured', captured_at = NOW()
-                    WHERE razorpay_order_id = $1
-                    """,
-                    order_id,
-                    payment_id,
-                    captured_amount,
-                )
-                await connection.execute(
-                    """
-                    UPDATE users
-                    SET plan = $2,
-                        plan_expiry = GREATEST(COALESCE(plan_expiry, NOW()), NOW())
-                                     + make_interval(days => $3),
-                        first_paid_order_at = COALESCE(first_paid_order_at, NOW()),
-                        updated_at = NOW()
-                    WHERE telegram_user_id = $1
-                    """,
-                    user_id,
-                    plan,
-                    duration_days,
-                )
-                return user_id
-
-    async def mark_channel_gate_paused_tasks(self, user_id: int) -> None:
-        await self._pool().execute(
-            """
-            UPDATE tasks
-            SET is_paused = TRUE, pause_reason = 'updates_channel_gate', updated_at = NOW()
-            WHERE user_id = $1 AND is_paused = FALSE
-            """,
-            user_id,
-        )
-
-    async def resume_channel_gate_tasks(self, user_id: int) -> None:
-        await self._pool().execute(
-            """
-            UPDATE tasks
-            SET is_paused = FALSE, pause_reason = NULL, updated_at = NOW()
-            WHERE user_id = $1 AND pause_reason = 'updates_channel_gate'
-            """,
-            user_id,
-        )
-
-    async def stats(self) -> dict[str, int]:
-        row = await self._pool().fetchrow(
-            """
-            SELECT
-                (SELECT COUNT(*) FROM users) AS users,
-                (SELECT COUNT(*) FROM users WHERE plan <> 'free'
-                    AND (plan_expiry IS NULL OR plan_expiry > NOW())) AS paid_users,
-                (SELECT COUNT(*) FROM tasks WHERE is_paused = FALSE) AS active_tasks,
-                (SELECT COUNT(*) FROM payments WHERE status = 'captured') AS captured_payments,
-                (SELECT COUNT(*) FROM users
-                    WHERE created_at >= CURRENT_DATE) AS new_users_today
-            """
-        )
-        assert row is not None
-        return {key: int(row[key] or 0) for key in row.keys()}
-
-    async def list_broadcast_users(
-        self, audience: str, plan: str | None = None
-    ) -> list[asyncpg.Record]:
-        conditions = ["is_blocked = FALSE", "is_active = TRUE"]
-        args: list[Any] = []
-        if audience == "active":
-            conditions.append(
-                "(last_seen_at >= NOW() - INTERVAL '30 days' OR plan_expiry > NOW())"
-            )
-        elif audience == "paid":
-            conditions.append("plan <> 'free' AND (plan_expiry IS NULL OR plan_expiry > NOW())")
-        elif audience == "plan" and plan:
-            args.append(plan)
-            conditions.append(f"plan = ${len(args)}")
-        elif audience == "english":
-            conditions.append("preferred_language = 'en'")
-        elif audience == "hinglish":
-            conditions.append("preferred_language = 'hinglish'")
-        return await self._pool().fetch(
-            f"""
-            SELECT telegram_user_id FROM users
-            WHERE {' AND '.join(conditions)}
-            ORDER BY telegram_user_id
-            """,
-            *args,
-        )
+    async def set_blocked(self, user_id: int, is_blocked: bool) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("UPDATE users SET is_blocked = $1 WHERE telegram_user_id = $2", is_blocked, user_id)
+            return res == "UPDATE 1"
 
     async def mark_user_inactive(self, user_id: int) -> None:
-        await self._pool().execute(
-            "UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE telegram_user_id = $1",
-            user_id,
-        )
+        await self.set_blocked(user_id, True)
 
-    async def set_blocked(self, user_id: int, blocked: bool) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE users SET is_blocked = $2, is_active = NOT $2, updated_at = NOW()
-            WHERE telegram_user_id = $1
-            """,
-            user_id,
-            blocked,
-        )
-        return result.endswith("1")
+    async def get_users_for_membership_check(self) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT telegram_user_id, updates_channel_member, preferred_language, plan FROM users WHERE is_blocked = FALSE")
+
+
+    # --- SESSIONS ---
+
+    async def has_active_session(self, user_id: int) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT 1 FROM sessions WHERE user_id = $1", user_id)
+            return bool(val)
+
+
+    # --- TASKS ---
+
+    async def count_tasks(self, user_id: int) -> int:
+        if self.pool is None: return 0
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval("SELECT COUNT(*) FROM tasks WHERE user_id = $1", user_id)
+
+    async def list_tasks(self, user_id: int) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT * FROM tasks WHERE user_id = $1 ORDER BY id ASC", user_id)
+
+    async def get_task(self, task_id: int) -> asyncpg.Record | None:
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+
+    async def create_task_multi(self, user_id: int, name: str, sources: list[dict], dests: list[dict]) -> int:
+        if self.pool is None: raise RuntimeError("DB Error")
+        async with self.pool.acquire() as conn:
+            task_id = await conn.fetchval(
+                "INSERT INTO tasks (user_id, task_name, sources, destinations) VALUES ($1, $2, $3, $4) RETURNING id",
+                user_id, name, json.dumps(sources), json.dumps(dests)
+            )
+            return task_id
+
+    async def delete_task(self, user_id: int, task_id: int) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("DELETE FROM tasks WHERE id = $1 AND user_id = $2", task_id, user_id)
+            return res == "DELETE 1"
+
+    async def set_task_paused(self, user_id: int, task_id: int, paused: bool, reason: str | None) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("UPDATE tasks SET is_paused = $1, pause_reason = $2 WHERE id = $3 AND user_id = $4", paused, reason, task_id, user_id)
+            return res == "UPDATE 1"
+
+    async def rename_task(self, user_id: int, task_id: int, new_name: str) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("UPDATE tasks SET task_name = $1 WHERE id = $2 AND user_id = $3", new_name, task_id, user_id)
+            return res == "UPDATE 1"
+
+    async def update_task_sources(self, user_id: int, task_id: int, sources: list[dict]) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("UPDATE tasks SET sources = $1 WHERE id = $2 AND user_id = $3", json.dumps(sources), task_id, user_id)
+            return res == "UPDATE 1"
+
+    async def update_task_destinations(self, user_id: int, task_id: int, dests: list[dict]) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("UPDATE tasks SET destinations = $1 WHERE id = $2 AND user_id = $3", json.dumps(dests), task_id, user_id)
+            return res == "UPDATE 1"
+
+    async def update_task_settings(self, user_id: int, task_id: int, settings_update: dict[str, Any]) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT settings FROM tasks WHERE id = $1 AND user_id = $2", task_id, user_id)
+            if not row: return False
+            current = json.loads(row["settings"] or "{}")
+            current.update(settings_update)
+            await conn.execute("UPDATE tasks SET settings = $1 WHERE id = $2", json.dumps(current), task_id)
+            return True
+
+    async def mark_channel_gate_paused_tasks(self, user_id: int) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE tasks SET is_paused = TRUE, pause_reason = 'gate' WHERE user_id = $1 AND is_paused = FALSE", user_id)
+
+    async def resume_channel_gate_tasks(self, user_id: int) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE tasks SET is_paused = FALSE, pause_reason = NULL WHERE user_id = $1 AND pause_reason = 'gate'", user_id)
+
+
+    # --- USAGE STATS ---
+
+    async def daily_usage(self, user_id: int) -> int:
+        if self.pool is None: return 0
+        today = datetime.now(timezone.utc).date()
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT message_count FROM usage_daily WHERE user_id = $1 AND usage_date = $2", user_id, today)
+            return val or 0
+
+    async def increment_usage(self, user_id: int) -> None:
+        if self.pool is None: return
+        today = datetime.now(timezone.utc).date()
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO usage_daily (user_id, usage_date, message_count) 
+                VALUES ($1, $2, 1) 
+                ON CONFLICT (user_id, usage_date) DO UPDATE SET message_count = usage_daily.message_count + 1
+            """, user_id, today)
+
+
+    # --- PAYMENTS & SUBSCRIPTION LIFECYCLE (MASTER PROMPT REQUIREMENTS) ---
+
+    async def has_paid_order(self, user_id: int) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT 1 FROM payments WHERE user_id = $1 AND status = 'captured' LIMIT 1", user_id)
+            return bool(val)
+
+    async def save_payment(self, user_id: int, order_id: str, plan: str, cycle: str, original: int, discount: int, payable: int) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO payments (user_id, order_id, plan, cycle, amount_paise, original_amount_paise, discount_amount_paise) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                user_id, order_id, plan, cycle, payable, original, discount
+            )
+
+    async def get_payment_for_order(self, order_id: str) -> asyncpg.Record | None:
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM payments WHERE order_id = $1 AND status != 'captured'", order_id)
+
+    async def activate_payment(self, order_id: str, payment_id: str, amount_paise: int, purchased_days: int, purchased_plan: str, cycle: str) -> int | None:
+        """
+        Handles Upgrade Math, Same-plan Extension, and Downgrade Scheduling safely inside a transaction.
+        """
+        if self.pool is None: return None
+        now = datetime.now(timezone.utc)
+        
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # Verify payment exists and not already captured
+                payment = await conn.fetchrow("SELECT user_id, status FROM payments WHERE order_id = $1 FOR UPDATE", order_id)
+                if not payment or payment["status"] == "captured":
+                    return None
+                
+                user_id = payment["user_id"]
+                await conn.execute("UPDATE payments SET payment_id = $1, status = 'captured' WHERE order_id = $2", payment_id, order_id)
+
+                user = await conn.fetchrow("SELECT plan, plan_expiry FROM users WHERE telegram_user_id = $1 FOR UPDATE", user_id)
+                if not user: return None
+
+                current_plan = user["plan"] or "free"
+                current_expiry = user["plan_expiry"] or now
+                if current_expiry < now: current_expiry = now
+
+                current_rank = PLAN_RANKS.get(current_plan, 0)
+                purchased_rank = PLAN_RANKS.get(purchased_plan, 0)
+
+                # Same-plan Renewal
+                if current_rank == purchased_rank:
+                    new_expiry = current_expiry + timedelta(days=purchased_days)
+                    await conn.execute("UPDATE users SET plan_expiry = $1, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $2", new_expiry, user_id)
+
+                # Downgrade (Schedule for future)
+                elif purchased_rank < current_rank:
+                    if current_expiry == now:
+                        # Higher plan already expired, activate lower immediately
+                        new_expiry = now + timedelta(days=purchased_days)
+                        await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", purchased_plan, new_expiry, user_id)
+                    else:
+                        # Queue it
+                        await conn.execute("UPDATE users SET scheduled_plan = $1, scheduled_days = $2 WHERE telegram_user_id = $3", purchased_plan, purchased_days, user_id)
+
+                # Upgrade (Pro-rata credit math)
+                else:
+                    target_plan_obj = PLANS.get(purchased_plan)
+                    current_plan_obj = PLANS.get(current_plan)
+                    
+                    target_daily_price = (target_plan_obj.monthly_rupees / 30) if target_plan_obj else 1
+                    current_daily_price = (current_plan_obj.monthly_rupees / 30) if current_plan_obj else 0
+                    
+                    remaining_days = (current_expiry - now).total_seconds() / 86400.0
+                    
+                    # Converted Higher-Plan Time = Remaining Plan Value / Higher Plan Daily Price
+                    remaining_value = current_daily_price * remaining_days
+                    converted_days = remaining_value / target_daily_price
+                    
+                    total_new_days = purchased_days + converted_days
+                    new_expiry = now + timedelta(days=total_new_days)
+                    
+                    await conn.execute(
+                        "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", 
+                        purchased_plan, new_expiry, user_id
+                    )
+
+                return user_id
+
+    async def get_expiring_users(self, days: int) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        now = datetime.now(timezone.utc)
+        target = now + timedelta(days=days)
+        start = target - timedelta(hours=1)
+        end = target + timedelta(hours=1)
+        async with self.pool.acquire() as conn:
+            return await conn.fetch("SELECT telegram_user_id, plan, preferred_language FROM users WHERE plan != 'free' AND plan_expiry BETWEEN $1 AND $2", start, end)
+
+    async def downgrade_expired_users(self) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        now = datetime.now(timezone.utc)
+        downgraded = []
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                expired = await conn.fetch("SELECT telegram_user_id, scheduled_plan, scheduled_days, preferred_language FROM users WHERE plan != 'free' AND plan_expiry < $1 FOR UPDATE", now)
+                for row in expired:
+                    uid = row["telegram_user_id"]
+                    if row["scheduled_plan"] and row["scheduled_days"]:
+                        new_plan = row["scheduled_plan"]
+                        new_expiry = now + timedelta(days=row["scheduled_days"])
+                        await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", new_plan, new_expiry, uid)
+                    else:
+                        await conn.execute("UPDATE users SET plan = 'free', plan_expiry = NULL, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $1", uid)
+                    downgraded.append(row)
+        return downgraded
 
     async def set_plan(self, user_id: int, plan: str, days: int) -> bool:
-        result = await self._pool().execute(
-            """
-            UPDATE users
-            SET plan = $2,
-                plan_expiry = CASE
-                    WHEN $2 = 'free' THEN NULL
-                    ELSE GREATEST(COALESCE(plan_expiry, NOW()), NOW())
-                         + make_interval(days => $3)
-                END,
-                updated_at = NOW()
-            WHERE telegram_user_id = $1
-            """,
-            user_id,
-            plan,
-            days,
-        )
-        return result.endswith("1")
+        if self.pool is None: return False
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT plan_expiry FROM users WHERE telegram_user_id = $1", user_id)
+            if not user: return False
+            base_time = user["plan_expiry"] if user["plan_expiry"] and user["plan_expiry"] > now else now
+            new_expiry = base_time + timedelta(days=days)
+            res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
+            return res == "UPDATE 1"
 
-    async def list_users(self, limit: int = 50) -> list[asyncpg.Record]:
-        return await self._pool().fetch(
-            """
-            SELECT telegram_user_id, username, first_name, plan, plan_expiry,
-                   is_blocked, last_seen_at
-            FROM users ORDER BY last_seen_at DESC LIMIT $1
-            """,
-            limit,
-        )
 
-    async def create_broadcast(
-        self, admin_user_id: int, audience: str, message_text: str, total: int
-    ) -> int:
-        row = await self._pool().fetchrow(
-            """
-            INSERT INTO broadcast_history
-                (admin_user_id, audience, message_text, total_recipients)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            """,
-            admin_user_id,
-            audience,
-            message_text,
-            total,
-        )
-        assert row is not None
-        return int(row["id"])
+    # --- ADMIN STATS & BROADCASTS ---
 
-    async def finish_broadcast(
-        self,
-        broadcast_id: int,
-        sent: int,
-        failed: int,
-        blocked: int,
-    ) -> None:
-        await self._pool().execute(
-            """
-            UPDATE broadcast_history
-            SET sent_count = $2, failed_count = $3, blocked_count = $4,
-                completed_at = NOW()
-            WHERE id = $1
-            """,
-            broadcast_id,
-            sent,
-            failed,
-            blocked,
-        )
+    async def stats(self) -> dict[str, Any]:
+        if self.pool is None: return {}
+        today = datetime.now(timezone.utc).date()
+        async with self.pool.acquire() as conn:
+            users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE DATE(created_at) = $1", today)
+            paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE plan != 'free'")
+            active_tasks = await conn.fetchval("SELECT COUNT(*) FROM tasks WHERE is_paused = FALSE")
+            captured = await conn.fetchval("SELECT COUNT(*) FROM payments WHERE status = 'captured'")
+            return {
+                "users": users or 0,
+                "new_users_today": new_users or 0,
+                "paid_users": paid or 0,
+                "active_tasks": active_tasks or 0,
+                "captured_payments": captured or 0
+            }
+
+    async def list_broadcast_users(self, audience: str) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            if audience == "all": return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE")
+            elif audience == "active": return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE AND last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'")
+            elif audience == "paid": return await conn.fetch("SELECT telegram_user_id FROM users WHERE plan != 'free' AND is_blocked = FALSE")
+            elif audience in ("english", "hinglish"):
+                lang = "en" if audience == "english" else "hinglish"
+                return await conn.fetch("SELECT telegram_user_id FROM users WHERE preferred_language = $1 AND is_blocked = FALSE", lang)
+            return []
+
+    async def create_broadcast(self, admin_id: int, audience: str, message: str, total_users: int) -> int:
+        if self.pool is None: raise RuntimeError("DB Error")
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO broadcasts (admin_id, audience, message, total_users) VALUES ($1, $2, $3, $4) RETURNING id",
+                admin_id, audience, message, total_users
+            )
+
+    async def finish_broadcast(self, broadcast_id: int, sent: int, failed: int, blocked: int) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE broadcasts SET sent = $1, failed = $2, blocked = $3 WHERE id = $4", sent, failed, blocked, broadcast_id)
+
+    async def mark_referral_paid(self, user_id: int) -> asyncpg.Record | None:
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT id, referrer_id, commission_amount_paise FROM referrals WHERE referred_id = $1 AND is_paid = FALSE LIMIT 1 FOR UPDATE", user_id)
+            if row:
+                await conn.execute("UPDATE referrals SET is_paid = TRUE WHERE id = $1", row["id"])
+                return row
+            return None
