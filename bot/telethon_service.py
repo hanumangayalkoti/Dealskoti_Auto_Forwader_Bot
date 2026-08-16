@@ -18,6 +18,7 @@ from telethon.sessions import StringSession
 
 from .config import Settings
 from .db import Database
+from .security import SessionCrypto
 
 logger = logging.getLogger("dealskoti.telethon")
 
@@ -26,6 +27,7 @@ class TelethonService:
         self.api_id = settings.telegram_api_id
         self.api_hash = settings.telegram_api_hash
         self.db = db
+        self.crypto = SessionCrypto(settings.session_encryption_key)
         
         # Active connected clients for forwarding
         self._clients: dict[int, TelegramClient] = {}
@@ -52,7 +54,20 @@ class TelethonService:
         if not row:
             return None
 
-        session_string = row["session_string"]
+        stored_value = row["session_string"]
+        try:
+            session_string = self.crypto.decrypt(stored_value)
+        except ValueError:
+            # Backward-compat: some rows may still be plaintext from before
+            # encryption was wired up. Use as-is, then re-encrypt on write.
+            logger.warning("Session for user %s was stored unencrypted; re-encrypting now.", user_id)
+            session_string = stored_value
+            async with self.db.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE sessions SET session_string = $1 WHERE user_id = $2",
+                    self.crypto.encrypt(session_string),
+                    user_id,
+                )
         client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
         await client.connect()
         
@@ -139,7 +154,8 @@ class TelethonService:
     async def _finalize_login(self, user_id: int, client: TelegramClient) -> None:
         """Saves the secure session string to the database and promotes client to active."""
         session_string = client.session.save()
-        
+        encrypted_session_string = self.crypto.encrypt(session_string)
+
         async with self.db.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -148,7 +164,7 @@ class TelethonService:
                 ON CONFLICT (user_id) DO UPDATE 
                 SET session_string = EXCLUDED.session_string, updated_at = CURRENT_TIMESTAMP
                 """,
-                user_id, session_string
+                user_id, encrypted_session_string
             )
             
         # Clean up existing active client if any
@@ -195,6 +211,17 @@ class TelethonService:
         if self.db.pool:
             async with self.db.pool.acquire() as conn:
                 await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
+
+    async def release_client(self, user_id: int) -> None:
+        """Disconnects a user's Telethon client WITHOUT deleting their saved
+        session — used when they have zero active forwarding tasks, so idle
+        connections don't sit open indefinitely and exhaust Railway/Telegram
+        connection limits as the user base grows. get_client() will silently
+        reconnect from the saved (encrypted) session next time it's needed."""
+        client = self._clients.pop(user_id, None)
+        if client:
+            with suppress(Exception):
+                await client.disconnect()
 
     async def validate_for_user(self, user_id: int, entity_str: str) -> dict:
         """
