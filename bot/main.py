@@ -889,7 +889,7 @@ async def task_action(message: Message, db: Database, forwarding: ForwardingEngi
     parts = (message.text or "").split()
     cmd = parts[0].lstrip("/").lower() if parts else ""
     if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer(f"Usage: /{cmd} <task_id>\nOr use /tasks buttons.")
+        return await message.answer(f"Usage: /{cmd} &lt;task_id&gt;\nOr use /tasks buttons.")
     task_id = int(parts[1])
     if cmd == "deletetask":
         changed = await db.delete_task(message.from_user.id, task_id)
@@ -1245,7 +1245,7 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext, db: Databas
 async def block_user_command(message: Message, db: Database, settings: Settings, forwarding: ForwardingEngine) -> None:
     if not _is_admin(settings, message.from_user.id): return
     parts = (message.text or "").split()
-    if len(parts) != 2: return await message.answer("Usage: /block <telegram_user_id or @username>")
+    if len(parts) != 2: return await message.answer("Usage: /block &lt;telegram_user_id or @username&gt;")
     user_id = await _resolve_target_user(db, parts[1])
     if user_id is None: return await message.answer("⚠️ User not found.")
     blocked = parts[0].lower() == "/block"
@@ -1259,7 +1259,7 @@ async def block_user_command(message: Message, db: Database, settings: Settings,
 async def grant_days_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
     parts = (message.text or "").split()
-    if len(parts) not in (3, 4) or not parts[2].isdigit(): return await message.answer("Usage: /grantdays <user> <days> [plan]")
+    if len(parts) not in (3, 4) or not parts[2].isdigit(): return await message.answer("Usage: /grantdays &lt;user&gt; &lt;days&gt; [plan]")
     user_id = await _resolve_target_user(db, parts[1])
     if user_id is None: return await message.answer("⚠️ User not found.")
     if len(parts) == 4:
@@ -1276,7 +1276,7 @@ async def grant_days_command(message: Message, db: Database, settings: Settings)
 async def set_plan_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
     parts = (message.text or "").split()
-    if len(parts) != 4 or parts[2].lower() not in PLANS or not parts[3].isdigit(): return await message.answer("Usage: /setplan <user> <plan> <days>")
+    if len(parts) != 4 or parts[2].lower() not in PLANS or not parts[3].isdigit(): return await message.answer("Usage: /setplan &lt;user&gt; &lt;plan&gt; &lt;days&gt;")
     user_id = await _resolve_target_user(db, parts[1])
     if user_id is None: return await message.answer("⚠️ Not found.")
     changed = await db.set_plan(user_id, parts[2].lower(), int(parts[3]))
@@ -1347,7 +1347,7 @@ async def admin_block_toggle(callback: CallbackQuery, db: Database, forwarding: 
 async def referral_payout_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
     parts = (message.text or "").split()
-    if len(parts) != 2: return await message.answer("Usage: /referralpayout <user>")
+    if len(parts) != 2: return await message.answer("Usage: /referralpayout &lt;user&gt;")
     user_id = await _resolve_target_user(db, parts[1])
     result = await db.mark_referral_paid(user_id) if user_id else None
     if not result: return await message.answer("⚠️ No unpaid commission.")
@@ -1358,7 +1358,7 @@ async def referral_payout_command(message: Message, db: Database, settings: Sett
 async def user_info_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
     parts = (message.text or "").split()
-    if len(parts) != 2: return await message.answer("Usage: /userinfo <user>")
+    if len(parts) != 2: return await message.answer("Usage: /userinfo &lt;user&gt;")
     user_id = await _resolve_target_user(db, parts[1])
     user = await db.get_user(user_id) if user_id else None
     if not user: return await message.answer("⚠️ Not found.")
