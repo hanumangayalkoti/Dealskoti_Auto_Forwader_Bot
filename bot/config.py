@@ -3,103 +3,110 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# Try to load from .env file if dotenv is installed (useful for local testing)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-class ConfigurationError(RuntimeError):
-    """Raised when a required runtime setting is missing or invalid."""
+class ConfigurationError(Exception):
+    """Raised when a required environment variable is missing or invalid."""
+    pass
 
-
-def _required(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise ConfigurationError(f"Required environment variable is missing: {name}")
-    return value
-
-
-def _positive_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ConfigurationError(f"{name} must be an integer") from exc
-    if value < 1:
-        raise ConfigurationError(f"{name} must be greater than zero")
-    return value
-
-
-@dataclass(frozen=True)
+@dataclass
 class Settings:
     telegram_bot_token: str
     telegram_api_id: int
     telegram_api_hash: str
     database_url: str
-    session_encryption_key: str
-    admin_telegram_ids: frozenset[int]
+    admin_telegram_ids: list[int]
     update_channel_username: str
-    update_channel_id: int
-    support_bot_link: str
-    default_timezone: str
-    log_level: str
-    max_image_size_mb: int
-    max_concurrent_forward_tasks: int
-    razorpay_key_id: str | None
-    razorpay_key_secret: str | None
-    razorpay_webhook_secret: str | None
+    
+    razorpay_key_id: str
+    razorpay_key_secret: str
+    razorpay_webhook_secret: str
     razorpay_webhook_path: str
-    public_base_url: str | None
+    
+    support_bot_link: str | None = None
+    log_level: str = "INFO"
+    default_timezone: str = "Asia/Kolkata"
+    max_concurrent_forward_tasks: int = 100
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        raw_admin_ids = os.getenv("ADMIN_TELEGRAM_IDS", "").strip()
-        admin_ids: set[int] = set()
-        if raw_admin_ids:
-            for raw_id in raw_admin_ids.split(","):
-                try:
-                    admin_ids.add(int(raw_id.strip()))
-                except ValueError as exc:
-                    raise ConfigurationError(
-                        "ADMIN_TELEGRAM_IDS must contain comma-separated numeric IDs"
-                    ) from exc
+    def from_env(cls) -> Settings:
+        """
+        Loads and validates all required configuration from environment variables.
+        """
+        def get_env(key: str, default: str | None = None, required: bool = True) -> str:
+            val = os.getenv(key, default)
+            if required and not val:
+                raise ConfigurationError(f"Missing required environment variable: {key}")
+            return val.strip() if val else ""
 
+        # --- TELEGRAM BOT & API ---
+        telegram_bot_token = get_env("TELEGRAM_BOT_TOKEN")
+        
         try:
-            api_id = int(_required("TELEGRAM_API_ID"))
-            channel_id = int(_required("UPDATE_CHANNEL_ID"))
-        except ValueError as exc:
-            raise ConfigurationError(
-                "TELEGRAM_API_ID and UPDATE_CHANNEL_ID must be numeric"
-            ) from exc
+            telegram_api_id = int(get_env("TELEGRAM_API_ID"))
+        except ValueError:
+            raise ConfigurationError("TELEGRAM_API_ID must be a valid integer.")
+            
+        telegram_api_hash = get_env("TELEGRAM_API_HASH")
+        
+        # --- DATABASE ---
+        database_url = get_env("DATABASE_URL")
+        
+        # --- ADMINS ---
+        admin_ids_raw = get_env("ADMIN_TELEGRAM_IDS")
+        try:
+            admin_telegram_ids = [int(x.strip()) for x in admin_ids_raw.split(",") if x.strip()]
+        except ValueError:
+            raise ConfigurationError("ADMIN_TELEGRAM_IDS must be a comma-separated list of integers.")
+        
+        if not admin_telegram_ids:
+            raise ConfigurationError("At least one admin ID must be provided in ADMIN_TELEGRAM_IDS.")
 
-        channel_username = _required("UPDATE_CHANNEL_USERNAME")
-        if not channel_username.startswith("@"):
-            raise ConfigurationError("UPDATE_CHANNEL_USERNAME must start with @")
+        # --- CHANNELS & LINKS ---
+        update_channel_username = get_env("UPDATE_CHANNEL_USERNAME")
+        if not update_channel_username.startswith("@"):
+            update_channel_username = f"@{update_channel_username}"
+            
+        support_bot_link = get_env("SUPPORT_BOT_LINK", required=False) or None
+
+        # --- RAZORPAY BILLING ---
+        razorpay_key_id = get_env("RAZORPAY_KEY_ID")
+        razorpay_key_secret = get_env("RAZORPAY_KEY_SECRET")
+        razorpay_webhook_secret = get_env("RAZORPAY_WEBHOOK_SECRET")
+        razorpay_webhook_path = get_env("RAZORPAY_WEBHOOK_PATH", default="/webhook/razorpay", required=False)
+        if not razorpay_webhook_path.startswith("/"):
+            razorpay_webhook_path = f"/{razorpay_webhook_path}"
+
+        # --- MISC & OPTIONAL ---
+        log_level = get_env("LOG_LEVEL", default="INFO", required=False).upper()
+        if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            log_level = "INFO"
+            
+        default_timezone = get_env("DEFAULT_TIMEZONE", default="Asia/Kolkata", required=False)
+        
+        try:
+            max_tasks = int(get_env("MAX_CONCURRENT_FORWARD_TASKS", default="100", required=False))
+        except ValueError:
+            max_tasks = 100
 
         return cls(
-            telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
-            telegram_api_id=api_id,
-            telegram_api_hash=_required("TELEGRAM_API_HASH"),
-            database_url=_required("DATABASE_URL"),
-            session_encryption_key=_required("SESSION_ENCRYPTION_KEY"),
-            admin_telegram_ids=frozenset(admin_ids),
-            update_channel_username=channel_username,
-            update_channel_id=channel_id,
-            support_bot_link=os.getenv("SUPPORT_BOT_LINK", "").strip(),
-            default_timezone=os.getenv("DEFAULT_TIMEZONE", "Asia/Kolkata"),
-            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            max_image_size_mb=_positive_int("MAX_IMAGE_SIZE_MB", 20),
-            max_concurrent_forward_tasks=_positive_int(
-                "MAX_CONCURRENT_FORWARD_TASKS", 10
-            ),
-            razorpay_key_id=os.getenv("RAZORPAY_KEY_ID", "").strip() or None,
-            razorpay_key_secret=os.getenv("RAZORPAY_KEY_SECRET", "").strip() or None,
-            razorpay_webhook_secret=os.getenv(
-                "RAZORPAY_WEBHOOK_SECRET", ""
-            ).strip()
-            or None,
-            razorpay_webhook_path=os.getenv(
-                "RAZORPAY_WEBHOOK_PATH", "/webhooks/razorpay"
-            ).strip()
-            or "/webhooks/razorpay",
-            public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-            or None,
+            telegram_bot_token=telegram_bot_token,
+            telegram_api_id=telegram_api_id,
+            telegram_api_hash=telegram_api_hash,
+            database_url=database_url,
+            admin_telegram_ids=admin_telegram_ids,
+            update_channel_username=update_channel_username,
+            razorpay_key_id=razorpay_key_id,
+            razorpay_key_secret=razorpay_key_secret,
+            razorpay_webhook_secret=razorpay_webhook_secret,
+            razorpay_webhook_path=razorpay_webhook_path,
+            support_bot_link=support_bot_link,
+            log_level=log_level,
+            default_timezone=default_timezone,
+            max_concurrent_forward_tasks=max_tasks,
         )
