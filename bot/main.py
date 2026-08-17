@@ -1454,8 +1454,12 @@ async def _run(settings: Settings) -> None:
     scheduler.start()
     
     try:
-        await forwarding.start()
-        forwarding_task = asyncio.create_task(forwarding.run_until_stopped())
+        # FIX: Run the forwarding engine startup in a background task so it doesn't block Uvicorn healthchecks
+        async def run_forwarding_engine():
+            await forwarding.start()
+            await forwarding.run_until_stopped()
+            
+        forwarding_task = asyncio.create_task(run_forwarding_engine())
         await asyncio.gather(dispatcher_task, server_task, forwarding_task)
     finally:
         server.should_exit = True
