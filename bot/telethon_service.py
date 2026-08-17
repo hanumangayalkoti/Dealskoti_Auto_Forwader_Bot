@@ -1,24 +1,11 @@
-from __future__ import annotations
-
-import asyncio
 import logging
-import re
 from contextlib import suppress
 
-from telethon import TelegramClient
-from telethon.errors import (
-    FloodWaitError,
-    PasswordHashInvalidError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
-)
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
 from .config import Settings
 from .db import Database
-from .security import SessionCrypto
 
 logger = logging.getLogger("dealskoti.telethon")
 
@@ -27,135 +14,14 @@ class TelethonService:
         self.api_id = settings.telegram_api_id
         self.api_hash = settings.telegram_api_hash
         self.db = db
-        self.crypto = SessionCrypto(settings.session_encryption_key)
-        
-        # Active connected clients for forwarding
-        self._clients: dict[int, TelegramClient] = {}
-        
-        # Temporary clients for users currently in the login flow
-        self._login_clients: dict[int, TelegramClient] = {}
-        self._phone_hashes: dict[int, str] = {}
-        self._phones: dict[int, str] = {}
+        # Stores temporary login states: {user_id: {"client": TelegramClient, "phone": str, "phone_code_hash": str}}
+        self.login_clients: dict[int, dict] = {}
 
-    async def get_client(self, user_id: int) -> TelegramClient | None:
-        """Returns an active, connected client for the user, or creates one from DB."""
-        if user_id in self._clients:
-            client = self._clients[user_id]
-            if not client.is_connected():
-                await client.connect()
-            return client
+    # --- DATABASE SESSION HELPERS ---
 
+    async def _save_session(self, user_id: int, session_string: str) -> None:
         if self.db.pool is None:
-            return None
-
-        async with self.db.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
-            
-        if not row:
-            return None
-
-        stored_value = row["session_string"]
-        try:
-            session_string = self.crypto.decrypt(stored_value)
-        except ValueError:
-            # Backward-compat: some rows may still be plaintext from before
-            # encryption was wired up. Use as-is, then re-encrypt on write.
-            logger.warning("Session for user %s was stored unencrypted; re-encrypting now.", user_id)
-            session_string = stored_value
-            async with self.db.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET session_string = $1 WHERE user_id = $2",
-                    self.crypto.encrypt(session_string),
-                    user_id,
-                )
-        client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
-        await client.connect()
-        
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            async with self.db.pool.acquire() as conn:
-                await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
-            return None
-            
-        self._clients[user_id] = client
-        return client
-
-    async def start_phone_login(self, user_id: int, phone: str) -> None:
-        """Initiates the Telegram login process using a phone number."""
-        await self.cancel_login(user_id)
-        
-        client = TelegramClient(StringSession(), self.api_id, self.api_hash)
-        await client.connect()
-        
-        try:
-            sent_code = await client.send_code_request(phone)
-            self._login_clients[user_id] = client
-            self._phone_hashes[user_id] = sent_code.phone_code_hash
-            self._phones[user_id] = phone
-        except FloodWaitError as e:
-            await client.disconnect()
-            raise ValueError(f"Telegram rate limit. Try again in {e.seconds} seconds.") from e
-        except PhoneNumberInvalidError as e:
-            await client.disconnect()
-            raise ValueError("Invalid phone number format. Please include country code.") from e
-        except Exception as e:
-            await client.disconnect()
-            logger.exception(f"Error starting phone login for {user_id}")
-            raise ValueError("Could not send login code. Ensure number is correct and active.") from e
-
-    async def submit_pin(self, user_id: int, wrapped_code: str) -> str:
-        """Submits the Telegram PIN. Code must be wrapped (e.g., 'PIN12345')."""
-        if user_id not in self._login_clients:
-            raise ValueError("Login session expired. Please start over with /connect.")
-            
-        client = self._login_clients[user_id]
-        phone = self._phones[user_id]
-        phone_hash = self._phone_hashes[user_id]
-        
-        # Clean the wrapped PIN securely (e.g., "PIN12345" -> "12345")
-        clean_code = re.sub(r"\D", "", wrapped_code)
-        if not clean_code:
-            raise ValueError("Invalid PIN format. Send it exactly like PIN12345.")
-
-        try:
-            await client.sign_in(phone=phone, code=clean_code, phone_code_hash=phone_hash)
-        except SessionPasswordNeededError:
-            return "2fa_required"
-        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-            raise ValueError("Incorrect or expired code. Please try again.") from e
-        except FloodWaitError as e:
-            raise ValueError(f"Too many attempts. Wait {e.seconds} seconds.") from e
-        except Exception as e:
-            logger.exception(f"Error submitting PIN for {user_id}")
-            raise ValueError("Failed to sign in. Please try /connect again.") from e
-
-        await self._finalize_login(user_id, client)
-        return "success"
-
-    async def submit_2fa(self, user_id: int, password: str) -> None:
-        """Submits the 2FA password to complete login."""
-        if user_id not in self._login_clients:
-            raise ValueError("Login session expired. Please start over with /connect.")
-            
-        client = self._login_clients[user_id]
-        
-        try:
-            await client.sign_in(password=password)
-        except PasswordHashInvalidError as e:
-            raise ValueError("Incorrect 2FA password. Please try again.") from e
-        except FloodWaitError as e:
-            raise ValueError(f"Too many attempts. Wait {e.seconds} seconds.") from e
-        except Exception as e:
-            logger.exception(f"Error submitting 2FA for {user_id}")
-            raise ValueError("Failed to sign in. Please try /connect again.") from e
-
-        await self._finalize_login(user_id, client)
-
-    async def _finalize_login(self, user_id: int, client: TelegramClient) -> None:
-        """Saves the secure session string to the database and promotes client to active."""
-        session_string = client.session.save()
-        encrypted_session_string = self.crypto.encrypt(session_string)
-
+            raise RuntimeError("Database not connected")
         async with self.db.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -164,121 +30,150 @@ class TelethonService:
                 ON CONFLICT (user_id) DO UPDATE 
                 SET session_string = EXCLUDED.session_string, updated_at = CURRENT_TIMESTAMP
                 """,
-                user_id, encrypted_session_string
+                user_id, session_string
             )
-            
-        # Clean up existing active client if any
-        if user_id in self._clients:
-            old_client = self._clients.pop(user_id)
-            await old_client.disconnect()
-            
-        self._clients[user_id] = client
+
+    async def _delete_session(self, user_id: int) -> None:
+        if self.db.pool is None:
+            return
+        async with self.db.pool.acquire() as conn:
+            await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
+
+    async def _get_session_string(self, user_id: int) -> str | None:
+        if self.db.pool is None:
+            return None
+        async with self.db.pool.acquire() as conn:
+            return await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
+
+    # --- LOGIN FLOW ---
+
+    async def start_phone_login(self, user_id: int, phone: str) -> None:
+        await self.cancel_login(user_id)
         
-        # Remove from temp dicts
-        self._login_clients.pop(user_id, None)
-        self._phone_hashes.pop(user_id, None)
-        self._phones.pop(user_id, None)
+        client = TelegramClient(StringSession(), self.api_id, self.api_hash)
+        await client.connect()
+        
+        try:
+            sent_code = await client.send_code_request(phone)
+            self.login_clients[user_id] = {
+                "client": client,
+                "phone": phone,
+                "phone_code_hash": sent_code.phone_code_hash
+            }
+        except errors.PhoneNumberInvalidError:
+            await client.disconnect()
+            raise ValueError("The phone number is invalid. Please include the country code (e.g. +91...)")
+        except errors.FloodWaitError as e:
+            await client.disconnect()
+            raise ValueError(f"Telegram blocked requests for {e.seconds} seconds. Try again later.")
+        except Exception as e:
+            await client.disconnect()
+            logger.error(f"Error starting phone login for {user_id}: {e}")
+            raise ValueError("Failed to request OTP. Please try again.")
+
+    async def submit_pin(self, user_id: int, pin: str) -> str:
+        login_data = self.login_clients.get(user_id)
+        if not login_data:
+            raise ValueError("Login session expired or not found. Please start over.")
+            
+        client: TelegramClient = login_data["client"]
+        phone = login_data["phone"]
+        phone_code_hash = login_data["phone_code_hash"]
+        
+        try:
+            await client.sign_in(phone=phone, code=pin, phone_code_hash=phone_code_hash)
+            session_string = client.session.save()
+            await self._save_session(user_id, session_string)
+            await self.cancel_login(user_id)  # Clean up temp client memory
+            return "success"
+        except errors.SessionPasswordNeededError:
+            return "2fa_required"
+        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):
+            raise ValueError("Invalid or expired PIN. Please try again or restart login.")
+        except Exception as e:
+            logger.error(f"Error submitting PIN for {user_id}: {e}")
+            raise ValueError("An unexpected error occurred. Please try again.")
+
+    async def submit_2fa(self, user_id: int, password: str) -> str:
+        login_data = self.login_clients.get(user_id)
+        if not login_data:
+            raise ValueError("Login session expired or not found. Please start over.")
+            
+        client: TelegramClient = login_data["client"]
+        
+        try:
+            await client.sign_in(password=password)
+            session_string = client.session.save()
+            await self._save_session(user_id, session_string)
+            await self.cancel_login(user_id)  # Clean up memory
+            return "success"
+        except errors.PasswordHashInvalidError:
+            raise ValueError("Incorrect 2FA password. Please try again.")
+        except errors.FloodWaitError as e:
+            raise ValueError(f"Too many attempts. Try again in {e.seconds} seconds.")
+        except Exception as e:
+            logger.error(f"Error submitting 2FA for {user_id}: {e}")
+            raise ValueError("An unexpected error occurred. Please try again.")
 
     async def cancel_login(self, user_id: int) -> None:
-        """Cancels a pending login and disconnects the temporary client securely."""
-        client = self._login_clients.pop(user_id, None)
-        self._phone_hashes.pop(user_id, None)
-        self._phones.pop(user_id, None)
-        
-        if client:
-            with suppress(Exception):
+        login_data = self.login_clients.pop(user_id, None)
+        if login_data:
+            client: TelegramClient = login_data["client"]
+            if client.is_connected():
                 await client.disconnect()
 
     async def cancel_all_logins(self) -> None:
-        """Cleans up all temporary and active clients on application shutdown."""
-        for client in self._login_clients.values():
-            with suppress(Exception):
-                await client.disconnect()
-        self._login_clients.clear()
-        
-        for client in self._clients.values():
-            with suppress(Exception):
-                await client.disconnect()
-        self._clients.clear()
+        for uid in list(self.login_clients.keys()):
+            await self.cancel_login(uid)
 
     async def disconnect(self, user_id: int) -> None:
-        """Logs out the user and removes the session from the database."""
-        client = self._clients.pop(user_id, None)
-        if client:
-            with suppress(Exception):
-                await client.log_out()
-                
-        if self.db.pool:
-            async with self.db.pool.acquire() as conn:
-                await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
+        await self._delete_session(user_id)
 
-    async def release_client(self, user_id: int) -> None:
-        """Disconnects a user's Telethon client WITHOUT deleting their saved
-        session — used when they have zero active forwarding tasks, so idle
-        connections don't sit open indefinitely and exhaust Railway/Telegram
-        connection limits as the user base grows. get_client() will silently
-        reconnect from the saved (encrypted) session next time it's needed."""
-        client = self._clients.pop(user_id, None)
-        if client:
-            with suppress(Exception):
-                await client.disconnect()
+    # --- ENTITY VALIDATION (FOR SOURCES / DESTINATIONS) ---
 
-    async def validate_for_user(self, user_id: int, entity_str: str) -> dict:
+    async def validate_for_user(self, user_id: int, target: str) -> dict:
         """
-        Resolves a string/ID into a valid Telegram entity using the user's account.
-        Returns a safe dictionary with entity details.
+        Validates if the user's account can access the given target (username or ID).
+        Returns a dictionary suitable for storing in JSONB.
         """
-        client = await self.get_client(user_id)
-        if not client:
-            raise ValueError("You must connect your Telegram account first.")
+        session_string = await self._get_session_string(user_id)
+        if not session_string:
+            raise ValueError("Your Telegram account is not connected. Please use /connect first.")
             
+        client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+        
         try:
-            # Handle numeric IDs formatted as strings (e.g., "-100123456789")
-            if entity_str.lstrip('-').isdigit():
-                entity_str_or_int = int(entity_str)
-            else:
-                entity_str_or_int = entity_str
-
-            entity = await client.get_entity(entity_str_or_int)
-            
-            title = getattr(entity, "title", None)
-            if not title:
-                title = getattr(entity, "username", None)
-            if not title:
-                title = getattr(entity, "first_name", str(entity.id))
+            await client.connect()
+            if not await client.is_user_authorized():
+                await self.disconnect(user_id)
+                raise ValueError("Session expired. Please use /connect to login again.")
                 
+            # If target looks like a negative or positive ID, treat it as int
+            target_clean = target.strip()
+            if target_clean.lstrip("-").isdigit():
+                target_obj = int(target_clean)
+            else:
+                target_obj = target_clean
+
+            entity = await client.get_entity(target_obj)
+            
+            # Extract safe title
+            title = getattr(entity, 'title', getattr(entity, 'username', getattr(entity, 'first_name', str(entity.id))))
+            
             return {
                 "id": entity.id,
                 "title": title,
-                "access_hash": getattr(entity, "access_hash", 0)
+                "access_hash": getattr(entity, 'access_hash', None),
+                "type": type(entity).__name__
             }
             
+        except ValueError:
+            raise ValueError("Could not find this chat. Make sure you are a member of it, or use a valid public username.")
+        except errors.FloodWaitError as e:
+            raise ValueError(f"Telegram is limiting requests. Try again in {e.seconds} seconds.")
         except Exception as e:
-            logger.debug(f"Entity validation failed for {entity_str} (User: {user_id}): {e}")
-            raise ValueError("Entity not found. Ensure the username is correct or your connected account is a member of the chat.")
-
-    async def get_recent_chats(self, user_id: int, limit: int = 20) -> list[dict]:
-        """
-        Fetches up to 20 recent groups/channels to display as numbered inline buttons.
-        (Supports the Guided Task Flow UX requirement).
-        """
-        client = await self.get_client(user_id)
-        if not client:
-            raise ValueError("You must connect your Telegram account first.")
-            
-        chats = []
-        try:
-            dialogs = await client.get_dialogs(limit=limit * 2)  # Fetch more to filter down
-            for dialog in dialogs:
-                if dialog.is_channel or dialog.is_group:
-                    chats.append({
-                        "id": dialog.id,
-                        "title": dialog.title,
-                        "access_hash": getattr(dialog.entity, "access_hash", 0)
-                    })
-                if len(chats) >= limit:
-                    break
-        except Exception as e:
-            logger.debug(f"Failed to fetch recent chats for User {user_id}: {e}")
-            
-        return chats
+            logger.error(f"Error validating entity '{target}' for user {user_id}: {e}")
+            raise ValueError("Failed to validate chat. Please try forwarding a message from it instead.")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
