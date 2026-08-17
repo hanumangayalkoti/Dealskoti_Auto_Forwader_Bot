@@ -54,10 +54,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE TABLE IF NOT EXISTS sessions (
     user_id BIGINT PRIMARY KEY REFERENCES users(telegram_user_id) ON DELETE CASCADE,
-    session_string TEXT NOT NULL,
+    session_string TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- FIX: Safely add session_string if the old database had a different column name
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT;
 
 CREATE TABLE IF NOT EXISTS payments (
     id SERIAL PRIMARY KEY,
@@ -80,7 +83,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     UNIQUE (user_id, usage_date)
 );
 
--- Safely adding message_count for old databases
+-- FIX: Safely adding message_count for old databases
 ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS message_count INTEGER DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS broadcasts (
@@ -193,15 +196,13 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT telegram_user_id, updates_channel_member, preferred_language, plan FROM users WHERE is_blocked = FALSE")
 
-
     # --- SESSIONS ---
 
     async def has_active_session(self, user_id: int) -> bool:
         if self.pool is None: return False
         async with self.pool.acquire() as conn:
-            val = await conn.fetchval("SELECT 1 FROM sessions WHERE user_id = $1", user_id)
+            val = await conn.fetchval("SELECT 1 FROM sessions WHERE user_id = $1 AND session_string IS NOT NULL", user_id)
             return bool(val)
-
 
     # --- TASKS ---
 
@@ -279,7 +280,6 @@ class Database:
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE tasks SET is_paused = FALSE, pause_reason = NULL WHERE user_id = $1 AND pause_reason = 'gate'", user_id)
 
-
     # --- USAGE STATS ---
 
     async def daily_usage(self, user_id: int) -> int:
@@ -299,8 +299,7 @@ class Database:
                 ON CONFLICT (user_id, usage_date) DO UPDATE SET message_count = usage_daily.message_count + 1
             """, user_id, today)
 
-
-    # --- PAYMENTS & SUBSCRIPTION LIFECYCLE (MASTER PROMPT REQUIREMENTS) ---
+    # --- PAYMENTS & SUBSCRIPTION LIFECYCLE ---
 
     async def has_paid_order(self, user_id: int) -> bool:
         if self.pool is None: return False
@@ -419,7 +418,6 @@ class Database:
             res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
             return res == "UPDATE 1"
 
-
     # --- ADMIN STATS & BROADCASTS ---
 
     async def stats(self) -> dict[str, Any]:
@@ -466,7 +464,7 @@ class Database:
     async def mark_referral_paid(self, user_id: int) -> asyncpg.Record | None:
         if self.pool is None: return None
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id, referrer_id, commission_amount_paise FROM referrals WHERE referred_id = $1 AND is_paid = FALSE LIMIT 1 FOR UPDATE", row["id"])
+            row = await conn.fetchrow("SELECT id, referrer_id, commission_amount_paise FROM referrals WHERE referred_id = $1 AND is_paid = FALSE LIMIT 1 FOR UPDATE", user_id)
             if row:
                 await conn.execute("UPDATE referrals SET is_paid = TRUE WHERE id = $1", row["id"])
                 return row
