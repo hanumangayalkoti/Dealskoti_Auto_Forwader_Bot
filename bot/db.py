@@ -17,7 +17,7 @@ PLAN_RANKS = {
 }
 
 # ---------------------------------------------------------
-# SAFE MIGRATIONS: Adds new columns without dropping old ones
+# SAFE MIGRATIONS: Adds new columns and drops old NOT NULL constraints
 # ---------------------------------------------------------
 MIGRATIONS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -35,7 +35,6 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Upgrading schema safely for scheduled plans (Downgrade queues)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_plan VARCHAR(50);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_days INTEGER;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_notified BOOLEAN DEFAULT FALSE;
@@ -59,13 +58,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- FIX: Safely add session_string if the old database had a different column name
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT;
 
 CREATE TABLE IF NOT EXISTS payments (
     id SERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES users(telegram_user_id),
-    order_id VARCHAR(255) UNIQUE NOT NULL,
+    order_id VARCHAR(255) UNIQUE,
     payment_id VARCHAR(255),
     plan VARCHAR(50) NOT NULL,
     cycle VARCHAR(50) NOT NULL,
@@ -76,7 +74,7 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- FIX: Safely patch old payments table missing columns for Razorpay webhook fix
+-- FIX: Safely patch old payments table and drop NOT NULL constraints on legacy columns
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id VARCHAR(255);
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255);
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan VARCHAR(50);
@@ -86,6 +84,19 @@ ALTER TABLE payments ADD COLUMN IF NOT EXISTS original_amount_paise INTEGER DEFA
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS discount_amount_paise INTEGER DEFAULT 0;
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'created';
 
+-- Drop NOT NULL constraints from old conflicting columns if they exist
+DO $$ 
+BEGIN
+    BEGIN
+        ALTER TABLE payments ALTER COLUMN razorpay_order_id DROP NOT NULL;
+    EXCEPTION WHEN undefined_column THEN 
+    END;
+    BEGIN
+        ALTER TABLE payments ALTER COLUMN order_id DROP NOT NULL;
+    EXCEPTION WHEN undefined_column THEN 
+    END;
+END $$;
+
 CREATE TABLE IF NOT EXISTS usage_daily (
     id SERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES users(telegram_user_id) ON DELETE CASCADE,
@@ -93,7 +104,6 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     UNIQUE (user_id, usage_date)
 );
 
--- FIX: Safely adding message_count for old databases
 ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS message_count INTEGER DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS broadcasts (
@@ -134,8 +144,6 @@ class Database:
     async def close(self) -> None:
         if self.pool is not None:
             await self.pool.close()
-
-    # --- USER MANAGEMENT ---
 
     async def ensure_user(self, user_id: int, username: str | None, first_name: str | None) -> asyncpg.Record:
         user, _ = await self.ensure_user_with_status(user_id, username, first_name)
@@ -206,15 +214,11 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT telegram_user_id, updates_channel_member, preferred_language, plan FROM users WHERE is_blocked = FALSE")
 
-    # --- SESSIONS ---
-
     async def has_active_session(self, user_id: int) -> bool:
         if self.pool is None: return False
         async with self.pool.acquire() as conn:
             val = await conn.fetchval("SELECT 1 FROM sessions WHERE user_id = $1 AND session_string IS NOT NULL", user_id)
             return bool(val)
-
-    # --- TASKS ---
 
     async def count_tasks(self, user_id: int) -> int:
         if self.pool is None: return 0
@@ -290,8 +294,6 @@ class Database:
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE tasks SET is_paused = FALSE, pause_reason = NULL WHERE user_id = $1 AND pause_reason = 'gate'", user_id)
 
-    # --- USAGE STATS ---
-
     async def daily_usage(self, user_id: int) -> int:
         if self.pool is None: return 0
         today = datetime.now(timezone.utc).date()
@@ -309,8 +311,6 @@ class Database:
                 ON CONFLICT (user_id, usage_date) DO UPDATE SET message_count = usage_daily.message_count + 1
             """, user_id, today)
 
-    # --- PAYMENTS & SUBSCRIPTION LIFECYCLE ---
-
     async def has_paid_order(self, user_id: int) -> bool:
         if self.pool is None: return False
         async with self.pool.acquire() as conn:
@@ -320,7 +320,6 @@ class Database:
     async def save_payment(self, user_id: int, order_id: str, plan: str, cycle: str, original: int, discount: int, payable: int) -> None:
         if self.pool is None: return
         async with self.pool.acquire() as conn:
-            # Table me purane columns na hone ke error se bachne ke liye naya try catch laga hua hai schema update me
             await conn.execute(
                 "INSERT INTO payments (user_id, order_id, plan, cycle, amount_paise, original_amount_paise, discount_amount_paise) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 user_id, order_id, plan, cycle, payable, original, discount
@@ -354,41 +353,30 @@ class Database:
                 current_rank = PLAN_RANKS.get(current_plan, 0)
                 purchased_rank = PLAN_RANKS.get(purchased_plan, 0)
 
-                # Same-plan renewal
                 if current_rank == purchased_rank:
                     new_expiry = current_expiry + timedelta(days=purchased_days)
                     await conn.execute("UPDATE users SET plan_expiry = $1, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $2", new_expiry, user_id)
-
-                # Downgrade (Schedule for future)
                 elif purchased_rank < current_rank:
                     if current_expiry == now:
                         new_expiry = now + timedelta(days=purchased_days)
                         await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", purchased_plan, new_expiry, user_id)
                     else:
                         await conn.execute("UPDATE users SET scheduled_plan = $1, scheduled_days = $2 WHERE telegram_user_id = $3", purchased_plan, purchased_days, user_id)
-
-                # Upgrade (Pro-rata calculation)
                 else:
                     target_plan_obj = PLANS.get(purchased_plan)
                     current_plan_obj = PLANS.get(current_plan)
-                    
                     target_daily_price = (target_plan_obj.monthly_rupees / 30.0) if target_plan_obj else 1.0
                     current_daily_price = (current_plan_obj.monthly_rupees / 30.0) if current_plan_obj else 0.0
-                    
                     remaining_days = (current_expiry - now).total_seconds() / 86400.0
                     if remaining_days < 0: remaining_days = 0
-                    
                     remaining_value = current_daily_price * remaining_days
                     converted_days = remaining_value / target_daily_price
-                    
                     total_new_days = purchased_days + converted_days
                     new_expiry = now + timedelta(days=total_new_days)
-                    
                     await conn.execute(
                         "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", 
                         purchased_plan, new_expiry, user_id
                     )
-
                 return user_id
 
     async def get_expiring_users(self, days: int) -> list[asyncpg.Record]:
@@ -428,8 +416,6 @@ class Database:
             new_expiry = base_time + timedelta(days=days)
             res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
             return res == "UPDATE 1"
-
-    # --- ADMIN STATS & BROADCASTS ---
 
     async def stats(self) -> dict[str, Any]:
         if self.pool is None: return {}
