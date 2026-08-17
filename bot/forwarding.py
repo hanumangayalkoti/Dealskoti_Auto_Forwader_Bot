@@ -1,16 +1,12 @@
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
-import re
-from collections import defaultdict
 from contextlib import suppress
-from typing import Any
+from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
-from telethon.tl.custom import Message
+from telethon.sessions import StringSession
+from telethon.tl.types import Message
 
 from .db import Database
 from .plans import PLANS
@@ -19,314 +15,281 @@ from .telethon_service import TelethonService
 logger = logging.getLogger("dealskoti.forwarding")
 
 class ForwardingEngine:
-    def __init__(self, db: Database, telethon_service: TelethonService, max_concurrent_tasks: int = 100):
+    def __init__(self, db: Database, telethon: TelethonService, max_concurrent_tasks: int = 100):
         self.db = db
-        self.telethon = telethon_service
-        self.max_tasks = max_concurrent_tasks
+        self.telethon = telethon
+        self.max_concurrent = max_concurrent_tasks
         
-        # In-memory maps for dynamic runtime
-        self._active_tasks: dict[int, dict[str, Any]] = {}
-        self._user_plans: dict[int, str] = {}
-        
-        # Message Mapping for Edit Sync: {task_id: {source_msg_id: {dest_id: dest_msg_id}}}
-        self._edit_map: dict[int, dict[int, dict[int, int]]] = defaultdict(lambda: defaultdict(dict))
-        
+        # In-memory stores
+        self.clients: dict[int, TelegramClient] = {}  # user_id -> TelegramClient
         self._running = False
-        self._task_queue: asyncio.Queue = asyncio.Queue()
-        self._workers: list[asyncio.Task] = []
+        self.edit_map: dict[str, list[tuple[int, int]]] = {}  # "user_id:source_chat:msg_id" -> [(dest_chat, dest_msg_id)]
 
     async def start(self) -> None:
+        """Starts the forwarding engine and connects all valid users."""
         self._running = True
-        for _ in range(self.max_tasks):
-            worker = asyncio.create_task(self._worker_loop())
-            self._workers.append(worker)
-            
-        await self.reload_all_tasks()
-        logger.info("ForwardingEngine started with %d workers.", self.max_tasks)
+        users = await self.db.list_users(limit=10000)
+        for user in users:
+            user_id = int(user["telegram_user_id"])
+            if not user["is_blocked"]:
+                await self.refresh_user(user_id)
+        logger.info(f"Forwarding Engine started. Active clients: {len(self.clients)}")
 
     async def stop(self) -> None:
+        """Stops the engine and safely disconnects all clients."""
         self._running = False
-        for worker in self._workers:
-            worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await asyncio.gather(*self._workers, return_exceptions=True)
-        logger.info("ForwardingEngine stopped.")
+        for user_id in list(self.clients.keys()):
+            await self.remove_user(user_id)
+        logger.info("Forwarding Engine stopped.")
 
     async def run_until_stopped(self) -> None:
         while self._running:
             await asyncio.sleep(1)
 
-    # --- TASK MANAGEMENT ---
-
-    async def reload_all_tasks(self) -> None:
-        self._active_tasks.clear()
-        if self.db.pool is None: return
-        
-        async with self.db.pool.acquire() as conn:
-            tasks = await conn.fetch("SELECT * FROM tasks WHERE is_paused = FALSE")
-            for task in tasks:
-                task_id = task["id"]
-                user_id = task["user_id"]
-                self._active_tasks[task_id] = dict(task)
-                
-                # Pre-fetch user plan
-                user = await self.db.get_user(user_id)
-                self._user_plans[user_id] = str(user["plan"]) if user else "free"
-                
-                await self._attach_handlers(user_id)
-
-    async def refresh_task(self, task_id: int) -> None:
-        task = await self.db.get_task(task_id)
-        if not task:
-            self._active_tasks.pop(task_id, None)
-            return
-            
-        user_id = task["user_id"]
-        if task["is_paused"]:
-            self._active_tasks.pop(task_id, None)
-            await self._release_if_idle(user_id)
-        else:
-            self._active_tasks[task_id] = dict(task)
-            user = await self.db.get_user(user_id)
-            self._user_plans[user_id] = str(user["plan"]) if user else "free"
-            await self._attach_handlers(user_id)
-
-    async def remove_task(self, task_id: int) -> None:
-        task = self._active_tasks.pop(task_id, None)
-        self._edit_map.pop(task_id, None)
-        if task is not None:
-            await self._release_if_idle(task["user_id"])
+    # --- CLIENT MANAGEMENT ---
 
     async def refresh_user(self, user_id: int) -> None:
-        # Reload all tasks for this user
-        tasks = await self.db.list_tasks(user_id)
-        for task in tasks:
-            await self.refresh_task(task["id"])
+        """Starts or restarts the TelegramClient for a user to apply new settings/tasks."""
+        if not self._running:
+            return
+
+        # Ensure we don't have stale clients
+        await self.remove_user(user_id)
+
+        user = await self.db.get_user(user_id)
+        if not user or user["is_blocked"]:
+            return
+
+        session_string = await self.telethon._get_session_string(user_id)
+        if not session_string:
+            return
+
+        client = TelegramClient(StringSession(session_string), self.telethon.api_id, self.telethon.api_hash)
+        
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await self.telethon.disconnect(user_id)
+                return
+                
+            # Register Event Handlers
+            client.add_event_handler(
+                lambda event: self._on_new_message(event, user_id),
+                events.NewMessage()
+            )
+            client.add_event_handler(
+                lambda event: self._on_message_edited(event, user_id),
+                events.MessageEdited()
+            )
+            
+            self.clients[user_id] = client
+            
+        except Exception as e:
+            logger.error(f"Failed to start forwarding client for user {user_id}: {e}")
+            if client.is_connected():
+                await client.disconnect()
 
     async def remove_user(self, user_id: int) -> None:
-        # Remove all tasks for this user from active memory
-        to_remove = [tid for tid, t in self._active_tasks.items() if t["user_id"] == user_id]
-        for tid in to_remove:
-            self._active_tasks.pop(tid, None)
-            self._edit_map.pop(tid, None)
-        self._user_plans.pop(user_id, None)
-        await self.telethon.release_client(user_id)
+        """Stops and removes the user's forwarding client."""
+        client = self.clients.pop(user_id, None)
+        if client:
+            client.remove_event_handlers()
+            if client.is_connected():
+                await client.disconnect()
 
-    async def _release_if_idle(self, user_id: int) -> None:
-        """If a user has no more active (unpaused) tasks, drop their live
-        Telethon connection so it doesn't sit open indefinitely."""
-        still_active = any(t["user_id"] == user_id for t in self._active_tasks.values())
-        if not still_active:
-            await self.telethon.release_client(user_id)
+    async def refresh_task(self, task_id: int) -> None:
+        """Hot-reloads a user's client if a specific task was updated."""
+        task = await self.db.get_task(task_id)
+        if task:
+            await self.refresh_user(int(task["user_id"]))
 
-    # --- TELETHON EVENT HANDLERS ---
+    async def remove_task(self, task_id: int) -> None:
+        """Handled gracefully by refresh_user/refresh_task dynamically checking DB."""
+        pass
 
-    async def _attach_handlers(self, user_id: int) -> None:
-        client = await self.telethon.get_client(user_id)
-        if not client: return
-        
-        # Remove old handlers to prevent duplicates
-        client.remove_event_handler(self._on_new_message, events.NewMessage)
-        client.remove_event_handler(self._on_message_edited, events.MessageEdited)
-        
-        # Add new handlers
-        client.add_event_handler(self._on_new_message, events.NewMessage)
-        client.add_event_handler(self._on_message_edited, events.MessageEdited)
+    # --- MESSAGE PROCESSING ENGINE ---
 
-    async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        await self._task_queue.put(("new", event))
-
-    async def _on_message_edited(self, event: events.MessageEdited.Event) -> None:
-        await self._task_queue.put(("edit", event))
-
-    # --- WORKER LOOP ---
-
-    async def _worker_loop(self) -> None:
-        while self._running:
-            try:
-                action, event = await self._task_queue.get()
-                if action == "new":
-                    await self._process_new_message(event)
-                elif action == "edit":
-                    await self._process_edited_message(event)
-                self._task_queue.task_done()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in forwarding worker: {e}", exc_info=True)
-
-    # --- CORE LOGIC ---
-
-    async def _process_new_message(self, event: events.NewMessage.Event) -> None:
-        client: TelegramClient = event.client
-        # Telethon client session filename typically contains user_id or we can fetch it
-        # For safety, we match the client instance from our TelethonService
-        user_id = None
-        for uid, c in self.telethon._clients.items():
-            if c == client:
-                user_id = uid
-                break
-        if not user_id: return
-
-        chat_id = event.chat_id
-        
-        # Find tasks that have this chat_id as a source
-        for task_id, task in self._active_tasks.items():
-            if task["user_id"] != user_id: continue
+    def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
+        """Applies Blacklist, Replace, Header, and Footer based on user plan."""
+        if not text:
+            return text
             
-            sources = json.loads(task["sources"] or "[]")
-            source_ids = [self._extract_id(s) for s in sources]
-            
-            if chat_id in source_ids:
-                await self._execute_forward(user_id, task, event.message, client)
-
-    async def _execute_forward(self, user_id: int, task: dict, message: Message, client: TelegramClient) -> None:
-        plan_name = self._user_plans.get(user_id, "free")
-        plan = PLANS.get(plan_name, PLANS["free"])
-        settings = json.loads(task["settings"] or "{}")
-        task_id = task["id"]
-
-        # 1. Quota Check
-        if plan.daily_messages:
-            usage = await self.db.daily_usage(user_id)
-            if usage >= plan.daily_messages:
-                return  # Quota exceeded
-
-        # 2. User Filter (Sender Filter - Platinum Only)
-        if plan_name == "platinum" and "user_filter" in settings and settings["user_filter"]:
-            sender_id = message.sender_id
-            if sender_id not in settings["user_filter"]:
-                return
-
-        # 3. Text Processing (Replace, Header, Footer)
-        text = message.text or ""
+        # Blacklist/Whitelist is checked before this function.
+        # This function only does replacements and append/prepend.
         
-        # Blacklist/Whitelist Check
-        if plan_name in ("gold", "platinum"):
-            blacklist = settings.get("blacklist", [])
-            whitelist = settings.get("whitelist", [])
-            
-            if blacklist and any(b.lower() in text.lower() for b in blacklist):
-                return
-            if whitelist and not any(w.lower() in text.lower() for w in whitelist):
-                return
-                
-            # Replace rules
-            replace_rules = settings.get("replace", {})
-            for old_word, new_word in replace_rules.items():
-                # Case-insensitive replace mapping
-                text = re.sub(re.escape(old_word), new_word, text, flags=re.IGNORECASE)
+        if plan_name in ["gold", "platinum"]:
+            replacements = settings.get("replace", {})
+            if isinstance(replacements, dict):
+                for old_word, new_word in replacements.items():
+                    # Simple case-sensitive replace (could be upgraded to regex if needed)
+                    text = text.replace(old_word, new_word)
 
-        # Apply Header & Footer (Silver, Gold, Platinum)
-        if plan_name in ("silver", "gold", "platinum"):
+        if plan_name in ["silver", "gold", "platinum"]:
             header = settings.get("header", "")
             footer = settings.get("footer", "")
-            if header: text = f"{header}\n\n{text}"
-            if footer: text = f"{text}\n\n{footer}"
-
-        # Platinum Watermark
-        if plan_name == "platinum" and settings.get("watermark"):
-            text = f"{text}\n\n<i>@DealsKoti</i>"
-
-        # 4. Dispatch to Destinations
-        destinations = json.loads(task["destinations"] or "[]")
-        dest_ids = [self._extract_id(d) for d in destinations]
-        
-        success_count = 0
-
-        for dest_id in dest_ids:
-            try:
-                sent_msg = None
+            
+            parts = []
+            if header:
+                parts.append(header)
+            parts.append(text)
+            if footer:
+                parts.append(footer)
                 
-                # --- FORWARDING BEHAVIOR RULE ---
-                if plan_name == "free":
-                    # Free tier: Keep native "Forwarded from" tag
-                    sent_msg = await client.forward_messages(entity=dest_id, messages=message)
-                else:
-                    # Silver/Gold/Platinum: Clean copy (No forwarded tag)
-                    if message.media:
-                        sent_msg = await client.send_message(entity=dest_id, message=text, file=message.media)
-                    else:
-                        sent_msg = await client.send_message(entity=dest_id, message=text)
-                
-                if sent_msg:
-                    success_count += 1
-                    # Save Edit Sync Mapping
-                    if plan_name == "platinum" and settings.get("edit_sync"):
-                        self._edit_map[task_id][message.id][dest_id] = sent_msg.id
-                        
-                    # Auto Delete (Platinum)
-                    auto_delete_secs = settings.get("auto_delete_seconds", 0)
-                    if plan_name == "platinum" and auto_delete_secs > 0:
-                        asyncio.create_task(self._auto_delete_message(client, dest_id, sent_msg.id, auto_delete_secs))
+            text = "\n\n".join(parts)
+            
+        return text
 
-            except FloodWaitError as e:
-                logger.warning(f"FloodWait in task {task_id} for user {user_id}. Sleeping {e.seconds}s.")
-                await asyncio.sleep(e.seconds)
-            except Exception as e:
-                logger.debug(f"Failed to forward message to {dest_id} in task {task_id}: {e}")
-
-        # 5. Deduct Quota ONLY on Success
-        if success_count > 0 and plan.daily_messages:
-            await self.db.increment_usage(user_id)
-
-    # --- EDIT SYNC ---
-    
-    async def _process_edited_message(self, event: events.MessageEdited.Event) -> None:
-        client: TelegramClient = event.client
-        user_id = None
-        for uid, c in self.telethon._clients.items():
-            if c == client:
-                user_id = uid
-                break
-        if not user_id: return
-
+    async def _on_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
+        """Triggered when the user's account receives a new message in any chat."""
+        message: Message = event.message
         chat_id = event.chat_id
-        source_msg_id = event.message.id
         
-        for task_id, task in self._active_tasks.items():
-            if task["user_id"] != user_id: continue
+        user = await self.db.get_user(user_id)
+        if not user or user["is_blocked"]:
+            return
             
-            plan_name = self._user_plans.get(user_id, "free")
-            settings = json.loads(task["settings"] or "{}")
-            
-            # Edit sync is Platinum only
-            if plan_name != "platinum" or not settings.get("edit_sync"):
+        tasks = await self.db.list_tasks(user_id)
+        if not tasks:
+            return
+
+        plan_name = str(user["plan"] or "free")
+        plan = PLANS.get(plan_name, PLANS["free"])
+
+        for task in tasks:
+            if task["is_paused"]:
                 continue
                 
-            # Multi-Destination Fix: Only edit if mapping exists
-            if task_id in self._edit_map and source_msg_id in self._edit_map[task_id]:
-                dest_map = self._edit_map[task_id][source_msg_id]
+            # Check if this chat is a source for this task
+            sources = json.loads(task["sources"] or "[]")
+            source_ids = [s.get("id") for s in sources if isinstance(s, dict)]
+            if chat_id not in source_ids:
+                continue
+
+            settings = json.loads(task["settings"] or "{}")
+            
+            # --- FILTERS ---
+            
+            # Sender Filter (Platinum)
+            if plan_name == "platinum":
+                allowed_senders = settings.get("user_filter", [])
+                if allowed_senders and message.sender_id not in allowed_senders:
+                    continue
+            
+            # Blacklist & Whitelist (Gold, Platinum)
+            raw_text = (message.raw_text or "").lower()
+            if plan_name in ["gold", "platinum"]:
+                whitelist = settings.get("whitelist", [])
+                blacklist = settings.get("blacklist", [])
                 
-                # Apply text processing again for the edited text
-                text = event.message.text or ""
-                replace_rules = settings.get("replace", {})
-                for old_word, new_word in replace_rules.items():
-                    text = re.sub(re.escape(old_word), new_word, text, flags=re.IGNORECASE)
-                    
-                header = settings.get("header", "")
-                footer = settings.get("footer", "")
-                if header: text = f"{header}\n\n{text}"
-                if footer: text = f"{text}\n\n{footer}"
-                if settings.get("watermark"): text = f"{text}\n\n<i>@DealsKoti</i>"
+                if whitelist and not any(w.lower() in raw_text for w in whitelist):
+                    continue
+                if blacklist and any(b.lower() in raw_text for b in blacklist):
+                    continue
 
-                for dest_id, dest_msg_id in dest_map.items():
-                    try:
-                        await client.edit_message(entity=dest_id, message=dest_msg_id, text=text)
-                    except MessageNotModifiedError:
-                        pass # Ignore if content didn't actually change after rules
-                    except Exception as e:
-                        logger.debug(f"Failed to edit synced message {dest_msg_id} in {dest_id}: {e}")
+            # --- LIMITS ---
+            usage = await self.db.daily_usage(user_id)
+            if plan.daily_messages and usage >= plan.daily_messages:
+                # Quota exceeded, ignore silently to prevent spam
+                continue
 
-    # --- UTILS ---
+            # --- FORWARDING ACTIONS ---
+            destinations = json.loads(task["destinations"] or "[]")
+            if not destinations:
+                continue
 
-    async def _auto_delete_message(self, client: TelegramClient, chat_id: int, message_id: int, delay: int) -> None:
-        await asyncio.sleep(delay)
-        try:
-            await client.delete_messages(entity=chat_id, message_ids=[message_id])
-        except Exception as e:
-            logger.debug(f"Auto-delete failed for {message_id} in {chat_id}: {e}")
+            client = self.clients.get(user_id)
+            if not client:
+                return
 
-    def _extract_id(self, entity_data: dict) -> int:
-        # Handles extracting pure integer IDs from Telethon entity dicts
-        return int(entity_data.get("id", 0))
+            sent_tracking = []
+            
+            for dest in destinations:
+                dest_id = dest.get("id")
+                if not dest_id: continue
+
+                try:
+                    # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
+                    if plan_name == "free":
+                        sent_msg = await client.forward_messages(dest_id, message)
+                        if sent_msg:
+                            sent_tracking.append((dest_id, sent_msg.id))
+                            await self.db.increment_usage(user_id)
+                            
+                    # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
+                    else:
+                        new_text = self._clean_text(message.text or "", settings, plan_name)
+                        
+                        # Watermark logic placeholder (Platinum)
+                        # NOTE: Real image watermarking requires Pillow and downloading media.
+                        # As per prompt, if it's too heavy, we pass clean media.
+                        
+                        sent_msg = await client.send_message(
+                            dest_id, 
+                            message=new_text, 
+                            file=message.media, 
+                            link_preview=bool(message.web_preview)
+                        )
+                        
+                        if sent_msg:
+                            sent_tracking.append((dest_id, sent_msg.id))
+                            await self.db.increment_usage(user_id)
+
+                            # Auto-Delete (Platinum)
+                            auto_delete_secs = settings.get("auto_delete_seconds", 0)
+                            if plan_name == "platinum" and auto_delete_secs > 0:
+                                asyncio.create_task(self._auto_delete(client, dest_id, sent_msg.id, auto_delete_secs))
+
+                except Exception as e:
+                    logger.warning(f"Task {task['id']} failed to send to {dest_id} for user {user_id}: {e}")
+
+            # Save to Edit Sync Map (Platinum)
+            if plan_name == "platinum" and settings.get("edit_sync", False) and sent_tracking:
+                map_key = f"{user_id}:{chat_id}:{message.id}"
+                self.edit_map[map_key] = sent_tracking
+
+    async def _on_message_edited(self, event: events.MessageEdited.Event, user_id: int) -> None:
+        """Triggered when a source message is edited, applies live Edit Sync."""
+        message: Message = event.message
+        chat_id = event.chat_id
+        
+        map_key = f"{user_id}:{chat_id}:{message.id}"
+        mapped_dests = self.edit_map.get(map_key)
+        
+        if not mapped_dests:
+            return
+            
+        user = await self.db.get_user(user_id)
+        if not user or user["plan"] != "platinum":
+            return
+            
+        client = self.clients.get(user_id)
+        if not client:
+            return
+
+        # Need to re-apply the user's text replacement settings for this task
+        # Since we map dynamically, we fetch tasks that contain this source.
+        tasks = await self.db.list_tasks(user_id)
+        matched_settings = {}
+        for t in tasks:
+            srcs = json.loads(t["sources"] or "[]")
+            if chat_id in [s.get("id") for s in srcs if isinstance(s, dict)]:
+                matched_settings = json.loads(t["settings"] or "{}")
+                break
+                
+        if not matched_settings.get("edit_sync", False):
+            return
+
+        new_text = self._clean_text(message.text or "", matched_settings, "platinum")
+        
+        for dest_id, dest_msg_id in mapped_dests:
+            try:
+                await client.edit_message(dest_id, dest_msg_id, text=new_text)
+            except Exception as e:
+                logger.debug(f"Failed to edit synced message {dest_msg_id} in {dest_id}: {e}")
+
+    async def _auto_delete(self, client: TelegramClient, chat_id: int, message_id: int, delay_seconds: int) -> None:
+        """Background task to delete a message after X seconds."""
+        await asyncio.sleep(delay_seconds)
+        if client.is_connected():
+            with suppress(Exception):
+                await client.delete_messages(chat_id, message_id)
