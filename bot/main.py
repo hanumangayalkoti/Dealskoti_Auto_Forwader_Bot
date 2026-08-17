@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import json
 import logging
 import os
 import traceback
@@ -52,37 +51,35 @@ from .telethon_service import TelethonService
 logger = logging.getLogger("dealskoti")
 router = Router(name="dealskoti")
 
+# ==========================================
+# FSM STATES
+# ==========================================
 
 class LoginStates(StatesGroup):
     waiting_phone = State()
     waiting_pin = State()
     waiting_2fa = State()
 
-
 class TaskStates(StatesGroup):
     waiting_name = State()
     waiting_source = State()
     waiting_destination = State()
-    waiting_rename = State()
-
 
 class SettingsFlow(StatesGroup):
     waiting_value = State()
 
-
 class AdminBroadcastStates(StatesGroup):
     waiting_message = State()
-
 
 class AdminStates(StatesGroup):
     waiting_grant_days = State()
 
-
-# --- HELPER FUNCTIONS ---
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 
 def _is_admin(settings: Settings, user_id: int) -> bool:
     return user_id in settings.admin_telegram_ids
-
 
 async def _ensure_user(db: Database, message: Message):
     if message.from_user is None:
@@ -93,11 +90,9 @@ async def _ensure_user(db: Database, message: Message):
         message.from_user.first_name,
     )
 
-
 async def _language_for_message(db: Database, message: Message):
     user = await _ensure_user(db, message)
     return language_for(user["preferred_language"])
-
 
 async def _language_for_callback(db: Database, callback: CallbackQuery):
     user = await db.ensure_user(
@@ -107,7 +102,6 @@ async def _language_for_callback(db: Database, callback: CallbackQuery):
     )
     return language_for(user["preferred_language"])
 
-
 async def _notify_admins(bot: Bot, settings: Settings, text: str) -> None:
     for admin_id in settings.admin_telegram_ids:
         try:
@@ -115,34 +109,30 @@ async def _notify_admins(bot: Bot, settings: Settings, text: str) -> None:
         except (TelegramForbiddenError, TelegramBadRequest):
             logger.warning("Could not notify admin %s", admin_id)
 
-
 def safe_html(text: str) -> str:
     """Safely escape text for HTML parsing to prevent UI breaks."""
     return html.escape(str(text))
 
-
-# Fallback translator to prevent KeyError during phased updates
 def safe_t(lang: str, key: str, **kwargs) -> str:
     try:
         return t(lang, key, **kwargs)
     except KeyError:
         return f"[{key}]"
 
-
-# --- ERROR HANDLER ---
+# ==========================================
+# GLOBAL ERROR HANDLER
+# ==========================================
 
 @router.errors()
 async def global_error_handler(event: ErrorEvent, settings: Settings) -> bool:
     logger.exception("Unhandled error while processing update", exc_info=event.exception)
     update = event.update
     chat_bot: Bot | None = None
+    
     if update.callback_query is not None:
         chat_bot = update.callback_query.bot
         with suppress(Exception):
             await update.callback_query.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
-        with suppress(Exception):
-            if update.callback_query.message is not None:
-                await update.callback_query.message.answer("⚠️ Something went wrong processing that. Please try again, or contact support.")
     elif update.message is not None:
         chat_bot = update.message.bot
         with suppress(Exception):
@@ -154,8 +144,9 @@ async def global_error_handler(event: ErrorEvent, settings: Settings) -> bool:
             await _notify_admins(chat_bot, settings, f"🚨 Bot error:\n<pre>{safe_html(tb)}</pre>")
     return True
 
-
-# --- KEYBOARDS ---
+# ==========================================
+# KEYBOARDS
+# ==========================================
 
 def _nav_keyboard(*, back: str = "menu:home", include_cancel: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="◀️ Back", callback_data=back)]]
@@ -163,7 +154,6 @@ def _nav_keyboard(*, back: str = "menu:home", include_cancel: bool = False) -> I
         rows.append([InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")])
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def plans_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -180,7 +170,6 @@ def plans_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def cycles_keyboard(plan: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -194,7 +183,6 @@ def cycles_keyboard(plan: str) -> InlineKeyboardMarkup:
         ]
     )
 
-
 def language_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -205,30 +193,30 @@ def language_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def main_menu_keyboard(settings: Settings) -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect"),
+            InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ New Task", callback_data="task:create"),
+            InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings"),
+        ],
+        [
+            InlineKeyboardButton(text="👤 My Account", callback_data="menu:account"),
             InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
         ],
         [
-            InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks"),
-            InlineKeyboardButton(text="👤 My Account", callback_data="menu:account"),
-        ],
-        [
-            InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings"),
             InlineKeyboardButton(text="❓ Help / FAQ", callback_data="faq:page:1"),
+            InlineKeyboardButton(text="🌐 Language", callback_data="language:choose"),
         ],
         [
-            InlineKeyboardButton(text="🌐 Language", callback_data="language:choose"),
+            InlineKeyboardButton(text="📞 Support", url=settings.support_bot_link or "https://t.me/support"),
             InlineKeyboardButton(text="📢 Updates", url=f"https://t.me/{settings.update_channel_username.lstrip('@')}"),
         ]
     ]
-    if settings.support_bot_link:
-        buttons.append([InlineKeyboardButton(text="📞 Contact Support", url=settings.support_bot_link)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 def faq_accordion_keyboard(language: str, page: int, expanded_index: int = -1) -> InlineKeyboardMarkup:
     faqs = FAQS[language_for(language)]
@@ -255,7 +243,6 @@ def faq_accordion_keyboard(language: str, page: int, expanded_index: int = -1) -
     rows.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def _plan_features(plan_name: str) -> str:
     plan = PLANS[plan_name]
     daily = f"{plan.daily_messages}/day" if plan.daily_messages else "No normal daily cap"
@@ -267,12 +254,10 @@ def _plan_features(plan_name: str) -> str:
         f"Messages: {daily}"
     )
 
-
 def _format_name(user) -> str:
     return safe_html(user["first_name"] or user["username"] or user["telegram_user_id"])
 
-
-async def _render_tasks(message: Message, db: Database, user_id: int, *, edit: bool = True) -> None:
+async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
     user = await db.get_user(user_id)
     language = language_for(user["preferred_language"]) if user else "en"
     tasks = await db.list_tasks(user_id)
@@ -300,19 +285,17 @@ async def _render_tasks(message: Message, db: Database, user_id: int, *, edit: b
         
     rows.append([InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create")])
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
-    # `edit=True` is only safe when `message` is a message the bot itself sent
-    # (i.e. we're reacting to a callback on our own message). A message the
-    # user just typed (e.g. bare /tasks) can never be edited by the bot, so
-    # we must send a fresh reply instead — trying to edit it raises
-    # TelegramBadRequest and crashes the handler.
-    if edit:
+    # Smart edit to avoid Message can't be edited error
+    if message.from_user and message.from_user.is_bot:
         await message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     else:
         await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
-
-# --- GLOBAL / CORE COMMANDS ---
+# ==========================================
+# GLOBAL / CORE COMMANDS
+# ==========================================
 
 @router.message(Command("start"))
 async def start(message: Message, db: Database, settings: Settings) -> None:
@@ -330,13 +313,11 @@ async def start(message: Message, db: Database, settings: Settings) -> None:
         return
     await message.answer(safe_t(language, "main_menu"), reply_markup=main_menu_keyboard(settings))
 
-
 @router.message(Command("menu"))
 async def menu_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
     if await enforce_gate(message.bot, db, settings, message.from_user.id, language):
         await message.answer(safe_t(language, "main_menu"), reply_markup=main_menu_keyboard(settings))
-
 
 @router.message(Command("help"))
 async def help_command(message: Message, db: Database, settings: Settings) -> None:
@@ -346,7 +327,6 @@ async def help_command(message: Message, db: Database, settings: Settings) -> No
         text += "\n\n" + safe_t(language, "admin_help_title", commands=admin_help())
     await message.answer(text, reply_markup=_nav_keyboard())
 
-
 @router.message(Command("adminhelp"))
 async def admin_help_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
@@ -355,12 +335,10 @@ async def admin_help_command(message: Message, db: Database, settings: Settings)
         return
     await message.answer(safe_t(language, "admin_help_title", commands=admin_help()))
 
-
 @router.message(Command("support", "contact"))
 async def support_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
     await message.answer(safe_t(language, "support", link=settings.support_bot_link or "support"), reply_markup=_nav_keyboard())
-
 
 @router.message(Command("updates", "channel"))
 async def updates_command(message: Message, settings: Settings) -> None:
@@ -372,14 +350,14 @@ async def updates_command(message: Message, settings: Settings) -> None:
         ])
     )
 
-
-# --- LANGUAGE FLOW ---
+# ==========================================
+# LANGUAGE FLOW
+# ==========================================
 
 @router.message(Command("language"))
 async def language_command(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
     await message.answer(safe_t(language, "choose_language"), reply_markup=language_keyboard())
-
 
 @router.callback_query(F.data.startswith("language:"))
 async def choose_language(callback: CallbackQuery, db: Database, settings: Settings) -> None:
@@ -401,62 +379,54 @@ async def choose_language(callback: CallbackQuery, db: Database, settings: Setti
         await callback.message.answer(safe_t(language, "main_menu"), reply_markup=main_menu_keyboard(settings))
     await callback.answer()
 
-
-# --- FAQ FLOW (ACCORDION) ---
+# ==========================================
+# FAQ FLOW (ACCORDION)
+# ==========================================
 
 @router.message(Command("faq"))
 async def faq_command(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
     await message.answer(safe_t(language, "faq_title", page=1, pages=3), reply_markup=faq_accordion_keyboard(language, 1, -1))
 
-
 @router.callback_query(F.data.startswith("faq:page:"))
 async def faq_page(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None:
-        return
+    if callback.message is None: return
     language = await _language_for_callback(db, callback)
     page = int(callback.data.split(":")[2])
     await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=3), reply_markup=faq_accordion_keyboard(language, page, -1))
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("faq:expand:"))
 async def faq_expand(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None:
-        return
+    if callback.message is None: return
     language = await _language_for_callback(db, callback)
     _, _, page_str, index_str = callback.data.split(":")
     page, index = int(page_str), int(index_str)
-    
     faq = FAQS[language][index]
     text = safe_t(language, "faq_answer", question=safe_html(faq.question), answer=safe_html(faq.answer))
-    
     await callback.message.edit_text(text, reply_markup=faq_accordion_keyboard(language, page, index))
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("faq:collapse:"))
 async def faq_collapse(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None:
-        return
+    if callback.message is None: return
     language = await _language_for_callback(db, callback)
     page = int(callback.data.split(":")[2])
     await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=3), reply_markup=faq_accordion_keyboard(language, page, -1))
     await callback.answer()
 
-
-# --- MAIN MENU NAVIGATION ---
+# ==========================================
+# MAIN MENU NAVIGATION
+# ==========================================
 
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, db: Database, settings: Settings, state: FSMContext) -> None:
     await state.clear()
-    if callback.message is None:
-        return
+    if callback.message is None: return
     language = await _language_for_callback(db, callback)
     if await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
         await callback.message.edit_text(safe_t(language, "main_menu"), reply_markup=main_menu_keyboard(settings))
     await callback.answer()
-
 
 @router.callback_query(F.data == "flow:cancel")
 async def cancel_flow(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
@@ -466,8 +436,9 @@ async def cancel_flow(callback: CallbackQuery, state: FSMContext, db: Database, 
         await callback.message.edit_text(safe_t(language, "main_menu"), reply_markup=main_menu_keyboard(settings))
     await callback.answer("Cancelled", show_alert=False)
 
-
-# --- ACCOUNT & LOGIN ---
+# ==========================================
+# ACCOUNT & LOGIN
+# ==========================================
 
 @router.message(Command("account", "myaccount"))
 async def account_command(message: Message, db: Database) -> None:
@@ -499,8 +470,7 @@ async def account_command(message: Message, db: Database) -> None:
 
 @router.callback_query(F.data == "menu:account")
 async def menu_account(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None:
-        return
+    if callback.message is None: return
     user = await db.ensure_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     language = language_for(user["preferred_language"])
     session = "connected" if await db.has_active_session(callback.from_user.id) else "not connected"
@@ -528,7 +498,6 @@ async def menu_account(callback: CallbackQuery, db: Database) -> None:
     )
     await callback.answer()
 
-
 @router.message(Command("disconnect"))
 async def disconnect_command(message: Message, db: Database, telethon: TelethonService, forwarding: ForwardingEngine, settings: Settings) -> None:
     language = await _language_for_message(db, message)
@@ -553,12 +522,10 @@ async def auth_disconnect_callback(callback: CallbackQuery, db: Database, teleth
         )
     await callback.answer()
 
-
 @router.message(Command("connect", "login"))
 async def connect_command(message: Message, state: FSMContext, db: Database, settings: Settings, telethon: TelethonService) -> None:
     language = await _language_for_message(db, message)
-    if not await enforce_gate(message.bot, db, settings, message.from_user.id, language):
-        return
+    if not await enforce_gate(message.bot, db, settings, message.from_user.id, language): return
     if await db.has_active_session(message.from_user.id):
         await message.answer(
             "ℹ️ You're already connected. Reconnecting replaces existing session." if language == "en" else "ℹ️ Aap already connect ho. Dobara connect karne se purana replace hoga.",
@@ -662,8 +629,9 @@ async def login_2fa(message: Message, state: FSMContext, telethon: TelethonServi
     await _notify_admins(message.bot, settings, f"🔌 Connected\nID: <code>{message.from_user.id}</code>")
     await message.answer(safe_t(language, "login_success"), reply_markup=_nav_keyboard())
 
-
-# --- PLANS & SUBSCRIPTION ---
+# ==========================================
+# PLANS & SUBSCRIPTION
+# ==========================================
 
 def _render_plans_prefix(user: dict, language: str) -> str:
     if user and user["plan"] != "free":
@@ -738,12 +706,13 @@ async def confirm_payment(callback: CallbackQuery, db: Database, billing: Razorp
     )
     await callback.answer()
 
-
-# --- TASKS ---
+# ==========================================
+# TASKS
+# ==========================================
 
 @router.message(Command("tasks", "viewtasks"))
 async def view_tasks(message: Message, db: Database) -> None:
-    await _render_tasks(message, db, message.from_user.id, edit=False)
+    await _render_tasks(message, db, message.from_user.id)
 
 @router.callback_query(F.data == "menu:tasks")
 async def menu_tasks(callback: CallbackQuery, db: Database, settings: Settings) -> None:
@@ -849,7 +818,6 @@ async def task_source(message: Message, state: FSMContext, db: Database, teletho
         await state.set_state(TaskStates.waiting_destination)
         await message.answer(safe_t(language, "task_destination"), reply_markup=_nav_keyboard(include_cancel=True))
 
-
 @router.message(TaskStates.waiting_destination)
 async def task_destination(message: Message, state: FSMContext, db: Database, telethon: TelethonService, forwarding: ForwardingEngine, settings: Settings) -> None:
     text = _text_or_forwarded_chat_id(message)
@@ -892,7 +860,6 @@ async def task_destination(message: Message, state: FSMContext, db: Database, te
     await forwarding.refresh_task(task_id)
     await _notify_admins(message.bot, settings, f"➕ New task\nID: {task_id}")
     await message.answer(safe_t(language, "task_created", task_id=task_id), reply_markup=_nav_keyboard())
-
 
 @router.message(Command("pause", "resume", "deletetask"))
 async def task_action(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
@@ -939,8 +906,9 @@ async def task_delete_confirm_cb(callback: CallbackQuery, db: Database, forwardi
     if callback.message: await _render_tasks(callback.message, db, callback.from_user.id)
     await callback.answer("Deleted" if changed else "Not found")
 
-
-# --- DYNAMIC PLAN SETTINGS (/setting) ---
+# ==========================================
+# DYNAMIC PLAN SETTINGS (/setting)
+# ==========================================
 
 TIER_FEATURES: dict[str, set[str]] = {
     "free": set(),
@@ -969,7 +937,6 @@ async def menu_settings(callback: CallbackQuery, db: Database) -> None:
     await callback.message.edit_text("⚙️ <b>Select a task to configure:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("set:task:"))
 async def setting_task_menu(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None: return
@@ -985,7 +952,6 @@ async def setting_task_menu(callback: CallbackQuery, db: Database) -> None:
     ]
     await callback.message.edit_text(f"⚙️ <b>Settings for:</b> {safe_html(task['task_name'])}\nChoose a category:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await callback.answer()
-
 
 def _get_setting_btn(label: str, feature: str, task_id: int, plan_name: str) -> InlineKeyboardButton:
     allowed = feature in TIER_FEATURES.get(plan_name, set())
@@ -1008,6 +974,7 @@ async def setting_category(callback: CallbackQuery, db: Database) -> None:
     if not task or int(task["user_id"]) != callback.from_user.id: return await callback.answer("Not found", show_alert=True)
     user = await db.get_user(callback.from_user.id)
     plan_name = str(user["plan"]) if user else "free"
+    import json
     st = task["settings"] if isinstance(task["settings"], dict) else json.loads(task["settings"] or "{}")
 
     rows = []
@@ -1037,7 +1004,6 @@ async def setting_category(callback: CallbackQuery, db: Database) -> None:
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("set:lock:"))
 async def setting_locked(callback: CallbackQuery) -> None:
     if callback.message is None: return
@@ -1051,7 +1017,6 @@ async def setting_locked(callback: CallbackQuery) -> None:
     )
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("set:tog:"))
 async def setting_toggle(callback: CallbackQuery, db: Database) -> None:
     _, _, task_id_str, feature, val_str = callback.data.split(":")
@@ -1061,14 +1026,11 @@ async def setting_toggle(callback: CallbackQuery, db: Database) -> None:
     if feature not in TIER_FEATURES.get(plan_name, set()): return await callback.answer("Locked feature", show_alert=True)
     val = val_str == "on"
     await db.update_task_settings(callback.from_user.id, task_id, {feature: val})
-    
-    # Reload category menu (mapping feature to cat manually for simple back nav)
     cat = "med" if feature == "watermark" else "fwd"
     if callback.message:
         callback.data = f"set:cat:{task_id}:{cat}"
         await setting_category(callback, db)
     await callback.answer("✅ Updated")
-
 
 @router.callback_query(F.data.startswith("set:edit:"))
 async def setting_edit_input(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
@@ -1096,7 +1058,6 @@ async def setting_edit_input(callback: CallbackQuery, state: FSMContext, db: Dat
     }
     await callback.message.edit_text(f"✏️ <b>{feature.title()}</b>\n\n{prompts.get(feature, 'Enter value:')}", reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"), parse_mode="HTML")
     await callback.answer()
-
 
 @router.message(SettingsFlow.waiting_value)
 async def setting_save_value(message: Message, state: FSMContext, db: Database, forwarding: ForwardingEngine) -> None:
@@ -1139,8 +1100,9 @@ async def setting_save_value(message: Message, state: FSMContext, db: Database, 
     await state.clear()
     await message.answer("✅ Setting saved.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Back to Category", callback_data=f"set:cat:{task_id}:{cat}")]]))
 
-
-# --- ADMIN COMMANDS ---
+# ==========================================
+# ADMIN COMMANDS
+# ==========================================
 
 @router.message(Command("stats"))
 async def stats_command(message: Message, db: Database, settings: Settings) -> None:
@@ -1250,7 +1212,6 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext, db: Databas
     await callback.message.edit_text(f"✅ Complete\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}", reply_markup=admin_keyboard())
     await callback.answer()
 
-
 @router.message(Command("block", "unblock"))
 async def block_user_command(message: Message, db: Database, settings: Settings, forwarding: ForwardingEngine) -> None:
     if not _is_admin(settings, message.from_user.id): return
@@ -1263,7 +1224,6 @@ async def block_user_command(message: Message, db: Database, settings: Settings,
     if blocked: await forwarding.remove_user(user_id)
     else: await forwarding.refresh_user(user_id)
     await message.answer("✅ Updated." if changed else "⚠️ Not found.")
-
 
 @router.message(Command("grantdays"))
 async def grant_days_command(message: Message, db: Database, settings: Settings) -> None:
@@ -1281,7 +1241,6 @@ async def grant_days_command(message: Message, db: Database, settings: Settings)
     changed = await db.set_plan(user_id, plan_key, int(parts[2]))
     await message.answer(f"✅ {plan_key} granted." if changed else "⚠️ Not found.")
 
-
 @router.message(Command("setplan"))
 async def set_plan_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
@@ -1291,7 +1250,6 @@ async def set_plan_command(message: Message, db: Database, settings: Settings) -
     if user_id is None: return await message.answer("⚠️ Not found.")
     changed = await db.set_plan(user_id, parts[2].lower(), int(parts[3]))
     await message.answer("✅ Updated." if changed else "⚠️ Not found.")
-
 
 @router.message(Command("listusers"))
 async def list_users_command(message: Message, db: Database, settings: Settings) -> None:
@@ -1310,7 +1268,6 @@ async def list_users_command(message: Message, db: Database, settings: Settings)
             ]]), parse_mode="HTML"
         )
 
-
 @router.callback_query(F.data.startswith("admin:grant:"))
 async def admin_grant_pick_plan(callback: CallbackQuery, settings: Settings) -> None:
     if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
@@ -1321,7 +1278,6 @@ async def admin_grant_pick_plan(callback: CallbackQuery, settings: Settings) -> 
     ]))
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("admin:grantplan:"))
 async def admin_grant_pick_days(callback: CallbackQuery, settings: Settings, state: FSMContext) -> None:
     if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
@@ -1331,7 +1287,6 @@ async def admin_grant_pick_days(callback: CallbackQuery, settings: Settings, sta
     await callback.message.edit_text("📅 How many days? (Send a number)")
     await callback.answer()
 
-
 @router.message(AdminStates.waiting_grant_days)
 async def admin_grant_days_finish(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
@@ -1340,7 +1295,6 @@ async def admin_grant_days_finish(message: Message, state: FSMContext, db: Datab
     changed = await db.set_plan(int(data["target_user_id"]), str(data["plan"]), int(message.text.strip()))
     await state.clear()
     await message.answer(f"✅ Granted." if changed else "⚠️ Not found.", reply_markup=admin_keyboard())
-
 
 @router.callback_query(F.data.startswith("admin:block:") | F.data.startswith("admin:unblock:"))
 async def admin_block_toggle(callback: CallbackQuery, db: Database, forwarding: ForwardingEngine, settings: Settings) -> None:
@@ -1352,7 +1306,6 @@ async def admin_block_toggle(callback: CallbackQuery, db: Database, forwarding: 
     else: await forwarding.refresh_user(target_user_id)
     await callback.answer("Updated" if changed else "Not found", show_alert=True)
 
-
 @router.message(Command("referralpayout"))
 async def referral_payout_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
@@ -1362,7 +1315,6 @@ async def referral_payout_command(message: Message, db: Database, settings: Sett
     result = await db.mark_referral_paid(user_id) if user_id else None
     if not result: return await message.answer("⚠️ No unpaid commission.")
     await message.answer(f"✅ Marked paid. Referrer: {result['referrer_id']}, Amount: {format_paise(int(result['commission_amount_paise']))}")
-
 
 @router.message(Command("userinfo"))
 async def user_info_command(message: Message, db: Database, settings: Settings) -> None:
@@ -1374,22 +1326,20 @@ async def user_info_command(message: Message, db: Database, settings: Settings) 
     if not user: return await message.answer("⚠️ Not found.")
     await message.answer(f"👤 {user['telegram_user_id']}\nPlan: {user['plan']}\nExpiry: {user['plan_expiry']}\nBlocked: {user['is_blocked']}")
 
-
 @router.message()
 async def fallback(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
     await message.answer(safe_t(language, "unknown_command"))
 
-
 def _bot_commands() -> list[BotCommand]:
     return [BotCommand(command=cmd.removeprefix("/"), description=desc[:256]) for cmd, desc, _ in USER_COMMANDS]
-
 
 def _admin_bot_commands() -> list[BotCommand]:
     return [BotCommand(command=cmd.removeprefix("/"), description=desc[:256]) for cmd, desc in ADMIN_COMMANDS]
 
-
-# --- FASTAPI & WEBHOOKS ---
+# ==========================================
+# FASTAPI & WEBHOOKS
+# ==========================================
 
 def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilling) -> FastAPI:
     app = FastAPI(title="Dealskoti Forwarder", version="0.1.0", docs_url=None, redoc_url=None)
@@ -1412,12 +1362,11 @@ def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilli
             
             stored_payment = await db.get_payment_for_order(captured.order_id)
             if stored_payment is None:
-                return JSONResponse({"status": "ignored"})  # Silently ignore to stop spam
+                return JSONResponse({"status": "ignored"})
                 
             stored_plan = str(stored_payment["plan"])
             stored_cycle = str(stored_payment["cycle"])
             
-            # activation math is inside activate_payment
             user_id = await db.activate_payment(
                 captured.order_id, captured.payment_id, captured.amount_paise,
                 duration_days(stored_cycle), stored_plan, stored_cycle
@@ -1439,8 +1388,9 @@ def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilli
 
     return app
 
-
-# --- MONITORS & ENTRYPOINT ---
+# ==========================================
+# MONITORS & ENTRYPOINT
+# ==========================================
 
 async def _membership_monitor(bot: Bot, db: Database, settings: Settings, forwarding: ForwardingEngine) -> None:
     while True:
@@ -1460,7 +1410,6 @@ async def _membership_monitor(bot: Bot, db: Database, settings: Settings, forwar
         except asyncio.CancelledError: raise
         except Exception: logger.exception("Membership monitor iteration failed")
         await asyncio.sleep(300)
-
 
 async def _run(settings: Settings) -> None:
     logging.basicConfig(level=getattr(logging, settings.log_level, logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -1522,7 +1471,6 @@ async def _run(settings: Settings) -> None:
             with suppress(asyncio.CancelledError): await forwarding_task
         await db.close()
         await bot.session.close()
-
 
 def run() -> None:
     try: settings = Settings.from_env()
