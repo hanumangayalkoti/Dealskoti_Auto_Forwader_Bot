@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import traceback
@@ -271,7 +272,7 @@ def _format_name(user) -> str:
     return safe_html(user["first_name"] or user["username"] or user["telegram_user_id"])
 
 
-async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
+async def _render_tasks(message: Message, db: Database, user_id: int, *, edit: bool = True) -> None:
     user = await db.get_user(user_id)
     language = language_for(user["preferred_language"]) if user else "en"
     tasks = await db.list_tasks(user_id)
@@ -299,7 +300,16 @@ async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
         
     rows.append([InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create")])
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
-    await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    # `edit=True` is only safe when `message` is a message the bot itself sent
+    # (i.e. we're reacting to a callback on our own message). A message the
+    # user just typed (e.g. bare /tasks) can never be edited by the bot, so
+    # we must send a fresh reply instead — trying to edit it raises
+    # TelegramBadRequest and crashes the handler.
+    if edit:
+        await message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
 # --- GLOBAL / CORE COMMANDS ---
@@ -733,7 +743,7 @@ async def confirm_payment(callback: CallbackQuery, db: Database, billing: Razorp
 
 @router.message(Command("tasks", "viewtasks"))
 async def view_tasks(message: Message, db: Database) -> None:
-    await _render_tasks(message, db, message.from_user.id)
+    await _render_tasks(message, db, message.from_user.id, edit=False)
 
 @router.callback_query(F.data == "menu:tasks")
 async def menu_tasks(callback: CallbackQuery, db: Database, settings: Settings) -> None:
