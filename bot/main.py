@@ -287,7 +287,6 @@ async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
     
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
-    # Smart edit to avoid Message can't be edited error
     if message.from_user and message.from_user.is_bot:
         await message.edit_text(text, reply_markup=markup, parse_mode="HTML")
     else:
@@ -380,20 +379,24 @@ async def choose_language(callback: CallbackQuery, db: Database, settings: Setti
     await callback.answer()
 
 # ==========================================
-# FAQ FLOW (ACCORDION)
+# FAQ FLOW (ACCORDION) - FIXED PAGINATION
 # ==========================================
 
 @router.message(Command("faq"))
 async def faq_command(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
-    await message.answer(safe_t(language, "faq_title", page=1, pages=3), reply_markup=faq_accordion_keyboard(language, 1, -1))
+    faqs = FAQS[language_for(language)]
+    total_pages = (len(faqs) + 4) // 5
+    await message.answer(safe_t(language, "faq_title", page=1, pages=total_pages), reply_markup=faq_accordion_keyboard(language, 1, -1))
 
 @router.callback_query(F.data.startswith("faq:page:"))
 async def faq_page(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
     page = int(callback.data.split(":")[2])
-    await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=3), reply_markup=faq_accordion_keyboard(language, page, -1))
+    faqs = FAQS[language_for(language)]
+    total_pages = (len(faqs) + 4) // 5
+    await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=total_pages), reply_markup=faq_accordion_keyboard(language, page, -1))
     await callback.answer()
 
 @router.callback_query(F.data.startswith("faq:expand:"))
@@ -412,7 +415,9 @@ async def faq_collapse(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
     page = int(callback.data.split(":")[2])
-    await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=3), reply_markup=faq_accordion_keyboard(language, page, -1))
+    faqs = FAQS[language_for(language)]
+    total_pages = (len(faqs) + 4) // 5
+    await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=total_pages), reply_markup=faq_accordion_keyboard(language, page, -1))
     await callback.answer()
 
 # ==========================================
@@ -905,6 +910,26 @@ async def task_delete_confirm_cb(callback: CallbackQuery, db: Database, forwardi
     if changed: await forwarding.remove_task(task_id)
     if callback.message: await _render_tasks(callback.message, db, callback.from_user.id)
     await callback.answer("Deleted" if changed else "Not found")
+
+@router.callback_query(F.data.startswith("task:edit-source:"))
+async def edit_source_cb(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    if callback.message is None: return
+    task_id = int(callback.data.split(":")[2])
+    await state.set_state(TaskStates.waiting_source)
+    await state.update_data(edit_task_id=task_id, edit_field="sources", sources=[])
+    language = await _language_for_callback(db, callback)
+    await callback.message.edit_text(safe_t(language, "task_source"), reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:fwd", include_cancel=False))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("task:edit-dest:"))
+async def edit_dest_cb(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    if callback.message is None: return
+    task_id = int(callback.data.split(":")[2])
+    await state.set_state(TaskStates.waiting_destination)
+    await state.update_data(edit_task_id=task_id, edit_field="destinations", destinations=[])
+    language = await _language_for_callback(db, callback)
+    await callback.message.edit_text(safe_t(language, "task_destination"), reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:fwd", include_cancel=False))
+    await callback.answer()
 
 # ==========================================
 # DYNAMIC PLAN SETTINGS (/setting)
@@ -1454,7 +1479,6 @@ async def _run(settings: Settings) -> None:
     scheduler.start()
     
     try:
-        # FIX: Run the forwarding engine startup in a background task so it doesn't block Uvicorn healthchecks
         async def run_forwarding_engine():
             await forwarding.start()
             await forwarding.run_until_stopped()
