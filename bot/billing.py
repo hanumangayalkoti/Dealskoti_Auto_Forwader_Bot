@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import base64
 import hashlib
 import hmac
 import json
@@ -13,17 +12,17 @@ from .config import Settings
 logger = logging.getLogger("dealskoti.billing")
 
 class BillingError(Exception):
-    """Custom exception for billing and Razorpay API errors."""
+    """Raised when payment gateway operations fail."""
     pass
 
 @dataclass
-class PaymentLinkObject:
+class PaymentLinkResult:
     link_id: str
     short_url: str
 
 @dataclass
 class CapturedPayment:
-    order_id: str
+    order_id: str  # In our case, this will be the payment_link ID (plink_...)
     payment_id: str
     amount_paise: int
 
@@ -33,24 +32,26 @@ class RazorpayBilling:
         self.key_secret = settings.razorpay_key_secret
         self.webhook_secret = settings.razorpay_webhook_secret
 
-    async def create_payment_link(
-        self, amount_paise: int, receipt: str, plan: str, cycle: str, user_id: int
-    ) -> PaymentLinkObject:
-        """
-        Creates a payment link securely using Razorpay's API.
-        Runs asynchronously to prevent blocking the Telegram bot.
-        """
+    async def create_payment_link(self, amount_paise: int, receipt: str, plan: str, cycle: str, user_id: int) -> PaymentLinkResult:
         url = "https://api.razorpay.com/v1/payment_links"
-        auth = aiohttp.BasicAuth(self.key_id, self.key_secret)
+        
+        auth_string = f"{self.key_id}:{self.key_secret}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        headers = {
+            "Authorization": f"Basic {encoded_auth}",
+            "Content-Type": "application/json"
+        }
         
         payload = {
             "amount": amount_paise,
             "currency": "INR",
             "accept_partial": False,
             "reference_id": receipt,
-            "description": f"DealsKoti {plan.title()} Plan ({cycle})",
+            "description": f"DealsKoti {plan.title()} Plan - {cycle.title()}",
             "customer": {
-                "name": str(user_id)
+                "name": f"User {user_id}",
+                "contact": ""
             },
             "notify": {
                 "sms": False,
@@ -58,34 +59,33 @@ class RazorpayBilling:
             },
             "reminder_enable": False,
             "notes": {
+                "user_id": str(user_id),
                 "plan": plan,
-                "cycle": cycle,
-                "user_id": str(user_id)
+                "cycle": cycle
             }
         }
         
         try:
-            async with aiohttp.ClientSession(auth=auth) as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status >= 400:
-                        error_text = await resp.text()
-                        logger.error(f"Razorpay API Error ({resp.status}): {error_text}")
-                        raise BillingError("Failed to create payment link.")
-                        
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=15) as resp:
                     data = await resp.json()
-                    return PaymentLinkObject(
-                        link_id=data["id"], 
+                    
+                    if resp.status >= 400:
+                        error_msg = data.get("error", {}).get("description", "Unknown error")
+                        logger.error(f"Razorpay API Error: {error_msg}")
+                        raise BillingError(f"Failed to create payment link: {error_msg}")
+                        
+                    return PaymentLinkResult(
+                        link_id=data["id"],  # Looks like 'plink_xxx...'
                         short_url=data["short_url"]
                     )
-        except aiohttp.ClientError as e:
-            logger.exception("Network error while communicating with Razorpay.")
-            raise BillingError("Network error while creating payment link.") from e
+        except Exception as e:
+            logger.error(f"Razorpay request failed: {e}")
+            raise BillingError("Could not connect to the payment gateway. Please try again later.")
 
     def verify_webhook_signature(self, raw_body: bytes, signature: str) -> bool:
-        """
-        Verifies the authenticity of the Razorpay webhook to prevent fake payment triggers.
-        """
-        if not self.webhook_secret or not signature:
+        """Verifies that the webhook genuinely came from Razorpay."""
+        if not signature or not raw_body:
             return False
             
         expected_signature = hmac.new(
@@ -97,51 +97,56 @@ class RazorpayBilling:
         return hmac.compare_digest(expected_signature, signature)
 
     def parse_json(self, raw_body: bytes) -> dict:
-        """Safely parses the JSON payload from the webhook body."""
         try:
             return json.loads(raw_body.decode('utf-8'))
-        except json.JSONDecodeError as e:
-            raise BillingError("Invalid JSON in webhook payload") from e
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON body in webhook")
 
     def parse_captured_payment(self, payload: dict) -> CapturedPayment | None:
         """
-        Smartly parses both 'payment_link.paid' and 'payment.captured' events.
-        Extracts the correct 'plink_xxx' or 'order_xxx' ID required by the database.
+        Safely extracts order ID, payment ID, and amount from Razorpay webhook events.
+        It prioritizes 'payment_link.paid' because our DB uses link_id as order_id.
         """
         event = payload.get("event")
         
-        # 1. Primary Priority: Payment Link Paid Event
+        # Primary method: Webhook triggered directly by a Payment Link
         if event == "payment_link.paid":
-            pl_entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
-            pay_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+            link_entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+            plink_id = link_entity.get("id")  # This matches the link.link_id saved in our DB
+            amount = link_entity.get("amount")
             
-            link_id = pl_entity.get("id")  # This is the plink_xxx saved in the DB
-            payment_id = pay_entity.get("id", "")
-            amount = pay_entity.get("amount") or pl_entity.get("amount_paid", 0)
+            # Attempt to extract the actual payment ID as well, if available
+            payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+            payment_id = payment_entity.get("id", "unknown_txn")
             
-            if link_id:
+            if plink_id and amount:
                 return CapturedPayment(
-                    order_id=link_id, 
+                    order_id=plink_id, 
                     payment_id=payment_id, 
                     amount_paise=amount
                 )
-                
-        # 2. Secondary Fallback: Standard Payment Captured Event
+
+        # Fallback method: Generic payment capture event
+        # (This is processed in case 'payment_link.paid' webhook fails but 'payment.captured' succeeds)
         elif event == "payment.captured":
-            pay_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+            payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
             
-            payment_id = pay_entity.get("id", "")
-            amount = pay_entity.get("amount", 0)
-            order_id = pay_entity.get("order_id")
+            # The actual payment might have been generated by a payment link. 
+            # If so, Razorpay puts the payment link ID in the notes or order_id field sometimes.
+            # We first try to check if the notes contain the payment link ID.
+            notes = payment_entity.get("notes", {})
             
-            # Note: For payment links, the standard 'payment.captured' event doesn't always 
-            # put the plink_xxx in the order_id. But if someone uses standard orders, this handles it.
-            if order_id:
+            order_id = payment_entity.get("order_id")
+            payment_id = payment_entity.get("id")
+            amount = payment_entity.get("amount")
+            
+            # If there's no order_id natively, it was likely an invoice or pure link.
+            # We skip generic captures if they don't map to our DB to avoid spamming ignored webhooks.
+            if order_id and payment_id and amount:
                 return CapturedPayment(
                     order_id=order_id, 
                     payment_id=payment_id, 
                     amount_paise=amount
                 )
-        
-        # If it's an unhandled event or missing IDs, safely ignore
+                
         return None
