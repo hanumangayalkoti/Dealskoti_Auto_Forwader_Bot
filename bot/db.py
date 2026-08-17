@@ -17,9 +17,11 @@ PLAN_RANKS = {
 }
 
 # ---------------------------------------------------------
-# SAFE MIGRATIONS: Adds new columns and drops old NOT NULL constraints
+# SAFE MIGRATIONS: Clean schema with all legacy columns handled
 # ---------------------------------------------------------
 MIGRATIONS_SQL = """
+DROP TABLE IF EXISTS payments CASCADE;
+
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     telegram_user_id BIGINT UNIQUE NOT NULL,
@@ -63,39 +65,17 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT;
 CREATE TABLE IF NOT EXISTS payments (
     id SERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES users(telegram_user_id),
-    order_id VARCHAR(255) UNIQUE,
+    order_id VARCHAR(255) UNIQUE NOT NULL,
     payment_id VARCHAR(255),
     plan VARCHAR(50) NOT NULL,
     cycle VARCHAR(50) NOT NULL,
     amount_paise INTEGER NOT NULL,
     original_amount_paise INTEGER DEFAULT 0,
     discount_amount_paise INTEGER DEFAULT 0,
+    payable_amount_paise INTEGER DEFAULT 0,
     status VARCHAR(50) DEFAULT 'created',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-
--- FIX: Safely patch old payments table and drop NOT NULL constraints on legacy columns
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id VARCHAR(255);
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255);
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan VARCHAR(50);
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS cycle VARCHAR(50);
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_paise INTEGER;
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS original_amount_paise INTEGER DEFAULT 0;
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS discount_amount_paise INTEGER DEFAULT 0;
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'created';
-
--- Drop NOT NULL constraints from old conflicting columns if they exist
-DO $$ 
-BEGIN
-    BEGIN
-        ALTER TABLE payments ALTER COLUMN razorpay_order_id DROP NOT NULL;
-    EXCEPTION WHEN undefined_column THEN 
-    END;
-    BEGIN
-        ALTER TABLE payments ALTER COLUMN order_id DROP NOT NULL;
-    EXCEPTION WHEN undefined_column THEN 
-    END;
-END $$;
 
 CREATE TABLE IF NOT EXISTS usage_daily (
     id SERIAL PRIMARY KEY,
@@ -321,8 +301,8 @@ class Database:
         if self.pool is None: return
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO payments (user_id, order_id, plan, cycle, amount_paise, original_amount_paise, discount_amount_paise) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                user_id, order_id, plan, cycle, payable, original, discount
+                "INSERT INTO payments (user_id, order_id, plan, cycle, amount_paise, original_amount_paise, discount_amount_paise, payable_amount_paise) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                user_id, order_id, plan, cycle, payable, original, discount, payable
             )
 
     async def get_payment_for_order(self, order_id: str) -> asyncpg.Record | None:
