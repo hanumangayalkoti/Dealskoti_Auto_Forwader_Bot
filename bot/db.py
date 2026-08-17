@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any
 
 import asyncpg
 
@@ -77,9 +77,11 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     id SERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES users(telegram_user_id) ON DELETE CASCADE,
     usage_date DATE NOT NULL,
-    message_count INTEGER DEFAULT 0,
     UNIQUE (user_id, usage_date)
 );
+
+-- Safely adding message_count for old databases
+ALTER TABLE usage_daily ADD COLUMN IF NOT EXISTS message_count INTEGER DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS broadcasts (
     id SERIAL PRIMARY KEY,
@@ -320,15 +322,11 @@ class Database:
             return await conn.fetchrow("SELECT * FROM payments WHERE order_id = $1 AND status != 'captured'", order_id)
 
     async def activate_payment(self, order_id: str, payment_id: str, amount_paise: int, purchased_days: int, purchased_plan: str, cycle: str) -> int | None:
-        """
-        Handles Upgrade Math, Same-plan Extension, and Downgrade Scheduling safely inside a transaction.
-        """
         if self.pool is None: return None
         now = datetime.now(timezone.utc)
         
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # Verify payment exists and not already captured
                 payment = await conn.fetchrow("SELECT user_id, status FROM payments WHERE order_id = $1 FOR UPDATE", order_id)
                 if not payment or payment["status"] == "captured":
                     return None
@@ -346,7 +344,7 @@ class Database:
                 current_rank = PLAN_RANKS.get(current_plan, 0)
                 purchased_rank = PLAN_RANKS.get(purchased_plan, 0)
 
-                # Same-plan Renewal
+                # Same-plan renewal
                 if current_rank == purchased_rank:
                     new_expiry = current_expiry + timedelta(days=purchased_days)
                     await conn.execute("UPDATE users SET plan_expiry = $1, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $2", new_expiry, user_id)
@@ -354,24 +352,22 @@ class Database:
                 # Downgrade (Schedule for future)
                 elif purchased_rank < current_rank:
                     if current_expiry == now:
-                        # Higher plan already expired, activate lower immediately
                         new_expiry = now + timedelta(days=purchased_days)
                         await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", purchased_plan, new_expiry, user_id)
                     else:
-                        # Queue it
                         await conn.execute("UPDATE users SET scheduled_plan = $1, scheduled_days = $2 WHERE telegram_user_id = $3", purchased_plan, purchased_days, user_id)
 
-                # Upgrade (Pro-rata credit math)
+                # Upgrade (Pro-rata calculation)
                 else:
                     target_plan_obj = PLANS.get(purchased_plan)
                     current_plan_obj = PLANS.get(current_plan)
                     
-                    target_daily_price = (target_plan_obj.monthly_rupees / 30) if target_plan_obj else 1
-                    current_daily_price = (current_plan_obj.monthly_rupees / 30) if current_plan_obj else 0
+                    target_daily_price = (target_plan_obj.monthly_rupees / 30.0) if target_plan_obj else 1.0
+                    current_daily_price = (current_plan_obj.monthly_rupees / 30.0) if current_plan_obj else 0.0
                     
                     remaining_days = (current_expiry - now).total_seconds() / 86400.0
+                    if remaining_days < 0: remaining_days = 0
                     
-                    # Converted Higher-Plan Time = Remaining Plan Value / Higher Plan Daily Price
                     remaining_value = current_daily_price * remaining_days
                     converted_days = remaining_value / target_daily_price
                     
@@ -387,19 +383,12 @@ class Database:
 
     async def get_expiring_users(self, days: int) -> list[asyncpg.Record]:
         if self.pool is None: return []
+        now = datetime.now(timezone.utc)
+        target = now + timedelta(days=days)
+        start = target - timedelta(hours=1)
+        end = target + timedelta(hours=1)
         async with self.pool.acquire() as conn:
-            # Match on calendar date, not a narrow time-of-day window — a
-            # user's plan_expiry timestamp is whatever time they originally
-            # paid, which rarely lines up with the scheduler's run time, so
-            # a tight +/-1hr window silently misses almost everyone.
-            return await conn.fetch(
-                """
-                SELECT telegram_user_id, plan, preferred_language FROM users
-                WHERE plan != 'free' AND plan_expiry IS NOT NULL
-                  AND plan_expiry::date = (CURRENT_DATE + $1::int)
-                """,
-                days,
-            )
+            return await conn.fetch("SELECT telegram_user_id, plan, preferred_language FROM users WHERE plan != 'free' AND plan_expiry BETWEEN $1 AND $2", start, end)
 
     async def downgrade_expired_users(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
@@ -477,7 +466,7 @@ class Database:
     async def mark_referral_paid(self, user_id: int) -> asyncpg.Record | None:
         if self.pool is None: return None
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id, referrer_id, commission_amount_paise FROM referrals WHERE referred_id = $1 AND is_paid = FALSE LIMIT 1 FOR UPDATE", user_id)
+            row = await conn.fetchrow("SELECT id, referrer_id, commission_amount_paise FROM referrals WHERE referred_id = $1 AND is_paid = FALSE LIMIT 1 FOR UPDATE", row["id"])
             if row:
                 await conn.execute("UPDATE referrals SET is_paid = TRUE WHERE id = $1", row["id"])
                 return row
