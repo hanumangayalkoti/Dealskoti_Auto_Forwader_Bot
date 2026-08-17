@@ -1,116 +1,105 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Dict, Tuple
 
 @dataclass
 class Plan:
     name: str
-    monthly_rupees: int
     tasks: int
     sources_per_task: int
     destinations_per_task: int
-    daily_messages: int  # 0 means no limit
-    priority_forwarding: bool
+    daily_messages: int | None
+    monthly_rupees: int
 
-# Define pricing (Modify monthly_rupees as per your actual real-world pricing)
-PLANS: Dict[str, Plan] = {
+# ==========================================
+# PLAN DEFINITIONS (Strictly as per Master Prompt)
+# ==========================================
+
+PLANS: dict[str, Plan] = {
     "free": Plan(
         name="Free",
-        monthly_rupees=0,
         tasks=1,
         sources_per_task=1,
         destinations_per_task=1,
         daily_messages=50,
-        priority_forwarding=False,
+        monthly_rupees=0,
     ),
     "silver": Plan(
         name="Silver",
-        monthly_rupees=149,  # Example price, you can change this
         tasks=2,
         sources_per_task=1,
         destinations_per_task=1,
         daily_messages=200,
-        priority_forwarding=False,
+        monthly_rupees=199,  # You can adjust these prices as needed
     ),
     "gold": Plan(
         name="Gold",
-        monthly_rupees=299,
         tasks=5,
         sources_per_task=3,
         destinations_per_task=3,
         daily_messages=500,
-        priority_forwarding=True,
+        monthly_rupees=499,
     ),
     "platinum": Plan(
         name="Platinum",
-        monthly_rupees=599,
         tasks=10,
         sources_per_task=10,
         destinations_per_task=10,
-        daily_messages=0,  # 0 = No normal daily cap
-        priority_forwarding=True,
+        daily_messages=None,  # None means "No normal daily product cap"
+        monthly_rupees=999,
     ),
 }
 
+# ==========================================
+# BILLING HELPERS
+# ==========================================
+
 def duration_days(cycle: str) -> int:
-    """Returns the exact number of days for a billing cycle."""
+    """Returns the number of days for a given billing cycle."""
     cycle = cycle.lower()
     if cycle == "weekly":
         return 7
-    elif cycle == "monthly":
-        return 30
     elif cycle == "yearly":
         return 365
-    return 30  # Fallback
+    # Default is monthly
+    return 30
 
-def payable_amount_paise(plan_name: str, cycle: str, first_paid_order: bool = False) -> Tuple[int, int, int]:
+def payable_amount_paise(plan_name: str, cycle: str, first_paid_order: bool = False) -> tuple[int, int, int]:
     """
     Calculates the pricing in paise (1 INR = 100 Paise) for Razorpay.
-    Returns: (original_amount, discount_amount, final_payable_amount)
+    Returns: (original_amount_paise, discount_amount_paise, payable_amount_paise)
     """
-    if plan_name not in PLANS or plan_name == "free":
+    plan = PLANS.get(plan_name)
+    if not plan or plan.monthly_rupees == 0:
         return 0, 0, 0
-
-    monthly_price = PLANS[plan_name].monthly_rupees
+        
+    base_monthly_paise = plan.monthly_rupees * 100
     
-    # Base calculation
+    # Calculate base price depending on the cycle
     if cycle == "weekly":
-        # Weekly is roughly 1/4th of monthly
-        base_rupees = max(9, monthly_price // 4) 
+        original_paise = int(base_monthly_paise / 4)
     elif cycle == "yearly":
-        base_rupees = monthly_price * 12
-    else:  # monthly
-        base_rupees = monthly_price
-
-    original_paise = base_rupees * 100
+        original_paise = base_monthly_paise * 12
+    else:
+        original_paise = base_monthly_paise
+        
     discount_paise = 0
-
-    # 1. Yearly Discount (20% Off)
-    if cycle == "yearly":
-        yearly_discount = int(original_paise * 0.20)
-        discount_paise += yearly_discount
-
-    # 2. First Order Discount (Example: 10% Off on first ever purchase)
-    # If you don't want a first-order discount, you can remove this block.
-    first_order_discount = 0
-    if first_paid_order:
-        remaining_after_yearly = original_paise - discount_paise
-        first_order_discount = int(remaining_after_yearly * 0.10)
-        discount_paise += first_order_discount
-
-    final_payable = original_paise - discount_paise
     
-    # Razorpay minimum amount restriction (₹1.00)
-    if final_payable < 100:
-        final_payable = 100
+    # 20% discount on Yearly cycle as per prompt
+    if cycle == "yearly":
+        discount_paise += int(original_paise * 0.20)
+        
+    # Apply an extra 10% welcome discount for the very first order if you want
+    # (Uncomment the lines below if you want to give a first-time buyer discount)
+    # if first_paid_order:
+    #     discount_paise += int(original_paise * 0.10)
+        
+    # Ensure discount doesn't exceed original price
+    if discount_paise > original_paise:
+        discount_paise = original_paise
+        
+    payable_paise = original_paise - discount_paise
+    
+    return original_paise, discount_paise, payable_paise
 
-    return original_paise, discount_paise, final_payable
-
-def format_paise(paise: int) -> str:
-    """Converts paise to a formatted Rupee string (e.g., 14900 -> 149.00)"""
-    rupees = paise / 100.0
-    # Strip .00 if it's a flat amount for cleaner UI
-    if rupees.is_integer():
-        return f"{int(rupees)}"
-    return f"{rupees:.2f}"
+def format_paise(amount_paise: int) -> str:
+    """Formats paise into a readable INR string."""
+    return f"₹{amount_paise / 100:.2f}"
