@@ -6,6 +6,7 @@ from telethon.sessions import StringSession
 
 from .config import Settings
 from .db import Database
+from .security import SessionCrypto
 
 logger = logging.getLogger("dealskoti.telethon")
 
@@ -14,6 +15,7 @@ class TelethonService:
         self.api_id = settings.telegram_api_id
         self.api_hash = settings.telegram_api_hash
         self.db = db
+        self.crypto = SessionCrypto(settings.session_encryption_key)
         # Stores temporary login states: {user_id: {"client": TelegramClient, "phone": str, "phone_code_hash": str}}
         self.login_clients: dict[int, dict] = {}
 
@@ -22,6 +24,7 @@ class TelethonService:
     async def _save_session(self, user_id: int, session_string: str) -> None:
         if self.db.pool is None:
             raise RuntimeError("Database not connected")
+        encrypted = self.crypto.encrypt(session_string)
         async with self.db.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -30,7 +33,7 @@ class TelethonService:
                 ON CONFLICT (user_id) DO UPDATE 
                 SET session_string = EXCLUDED.session_string, updated_at = CURRENT_TIMESTAMP
                 """,
-                user_id, session_string
+                user_id, encrypted
             )
 
     async def _delete_session(self, user_id: int) -> None:
@@ -43,7 +46,17 @@ class TelethonService:
         if self.db.pool is None:
             return None
         async with self.db.pool.acquire() as conn:
-            return await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
+            stored = await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
+        if not stored:
+            return None
+        try:
+            return self.crypto.decrypt(stored)
+        except ValueError:
+            # Backward-compat: a row saved before encryption was wired up.
+            # Use it as-is this once, then re-encrypt it immediately.
+            logger.warning("Session for user %s was stored unencrypted; re-encrypting now.", user_id)
+            await self._save_session(user_id, stored)
+            return stored
 
     # --- LOGIN FLOW ---
 
