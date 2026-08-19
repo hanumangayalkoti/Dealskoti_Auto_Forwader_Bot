@@ -78,7 +78,7 @@ class Settings:
         razorpay_key_id = get_env("RAZORPAY_KEY_ID")
         razorpay_key_secret = get_env("RAZORPAY_KEY_SECRET")
         razorpay_webhook_secret = get_env("RAZORPAY_WEBHOOK_SECRET")
-        razorpay_webhook_path = get_env("RAZORPAY_WEBHOOK_PATH", default="/webhook/razorpay", required=False)
+        razorpay_webhook_path = get_env("RAZORPAY_WEBHOOK_PATH", default="/webhooks/razorpay", required=False)
         if not razorpay_webhook_path.startswith("/"):
             razorpay_webhook_path = f"/{razorpay_webhook_path}"
 
