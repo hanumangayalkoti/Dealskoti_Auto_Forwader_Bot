@@ -20,7 +20,8 @@ PLAN_RANKS = {
 # SAFE MIGRATIONS: Clean schema with all legacy columns handled
 # ---------------------------------------------------------
 MIGRATIONS_SQL = """
-DROP TABLE IF EXISTS payments CASCADE;
+-- SAFETY: Never drop existing tables on restart. Existing data must survive redeploys.
+-- Removed DROP TABLE payments CASCADE which was wiping all payment history every restart.
 
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
@@ -313,13 +314,13 @@ class Database:
     async def activate_payment(self, order_id: str, payment_id: str, amount_paise: int, purchased_days: int, purchased_plan: str, cycle: str) -> int | None:
         if self.pool is None: return None
         now = datetime.now(timezone.utc)
-        
+
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 payment = await conn.fetchrow("SELECT user_id, status FROM payments WHERE order_id = $1 FOR UPDATE", order_id)
                 if not payment or payment["status"] == "captured":
-                    return None
-                
+                    return None  # idempotent: already activated
+
                 user_id = payment["user_id"]
                 await conn.execute("UPDATE payments SET payment_id = $1, status = 'captured' WHERE order_id = $2", payment_id, order_id)
 
@@ -334,28 +335,40 @@ class Database:
                 purchased_rank = PLAN_RANKS.get(purchased_plan, 0)
 
                 if current_rank == purchased_rank:
+                    # SAME-PLAN RENEWAL: extend from current expiry (do not lose remaining time)
                     new_expiry = current_expiry + timedelta(days=purchased_days)
-                    await conn.execute("UPDATE users SET plan_expiry = $1, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $2", new_expiry, user_id)
+                    await conn.execute(
+                        "UPDATE users SET plan_expiry = $1, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $2",
+                        new_expiry, user_id,
+                    )
                 elif purchased_rank < current_rank:
-                    if current_expiry == now:
+                    # DOWNGRADE: keep higher plan active until expiry, schedule lower plan
+                    if current_expiry <= now:
+                        # already expired (edge case) - apply immediately
                         new_expiry = now + timedelta(days=purchased_days)
-                        await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", purchased_plan, new_expiry, user_id)
+                        await conn.execute(
+                            "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3",
+                            purchased_plan, new_expiry, user_id,
+                        )
                     else:
-                        await conn.execute("UPDATE users SET scheduled_plan = $1, scheduled_days = $2 WHERE telegram_user_id = $3", purchased_plan, purchased_days, user_id)
+                        await conn.execute(
+                            "UPDATE users SET scheduled_plan = $1, scheduled_days = $2 WHERE telegram_user_id = $3",
+                            purchased_plan, purchased_days, user_id,
+                        )
                 else:
+                    # UPGRADE: credit unused value as converted higher-plan time
                     target_plan_obj = PLANS.get(purchased_plan)
                     current_plan_obj = PLANS.get(current_plan)
-                    target_daily_price = (target_plan_obj.monthly_rupees / 30.0) if target_plan_obj else 1.0
-                    current_daily_price = (current_plan_obj.monthly_rupees / 30.0) if current_plan_obj else 0.0
-                    remaining_days = (current_expiry - now).total_seconds() / 86400.0
-                    if remaining_days < 0: remaining_days = 0
+                    target_daily_price = (target_plan_obj.monthly_rupees / 30.0) if target_plan_obj and target_plan_obj.monthly_rupees else 1.0
+                    current_daily_price = (current_plan_obj.monthly_rupees / 30.0) if current_plan_obj and current_plan_obj.monthly_rupees else 0.0
+                    remaining_days = max(0.0, (current_expiry - now).total_seconds() / 86400.0)
                     remaining_value = current_daily_price * remaining_days
-                    converted_days = remaining_value / target_daily_price
+                    converted_days = (remaining_value / target_daily_price) if target_daily_price else 0.0
                     total_new_days = purchased_days + converted_days
                     new_expiry = now + timedelta(days=total_new_days)
                     await conn.execute(
-                        "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", 
-                        purchased_plan, new_expiry, user_id
+                        "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3",
+                        purchased_plan, new_expiry, user_id,
                     )
                 return user_id
 
@@ -378,16 +391,26 @@ class Database:
                 for row in expired:
                     uid = row["telegram_user_id"]
                     if row["scheduled_plan"] and row["scheduled_days"]:
+                        # Activate scheduled plan (downgrade takes effect at expiry)
                         new_plan = row["scheduled_plan"]
                         new_expiry = now + timedelta(days=row["scheduled_days"])
-                        await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3", new_plan, new_expiry, uid)
+                        await conn.execute(
+                            "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3",
+                            new_plan, new_expiry, uid,
+                        )
                     else:
-                        await conn.execute("UPDATE users SET plan = 'free', plan_expiry = NULL, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $1", uid)
+                        # No scheduled plan -> downgrade to free
+                        await conn.execute(
+                            "UPDATE users SET plan = 'free', plan_expiry = NULL, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $1",
+                            uid,
+                        )
                     downgraded.append(row)
         return downgraded
 
     async def set_plan(self, user_id: int, plan: str, days: int) -> bool:
         if self.pool is None: return False
+        if days <= 0:
+            return False  # SAFETY: refuse zero/negative days to prevent crash/reset
         now = datetime.now(timezone.utc)
         async with self.pool.acquire() as conn:
             user = await conn.fetchrow("SELECT plan_expiry FROM users WHERE telegram_user_id = $1", user_id)
