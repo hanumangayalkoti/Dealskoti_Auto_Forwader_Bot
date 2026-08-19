@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 from contextlib import suppress
@@ -6,7 +7,7 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Message
+from telethon.tl.types import Message, MessageMediaPhoto
 
 from .db import Database
 from .plans import PLANS
@@ -53,7 +54,7 @@ class ForwardingEngine:
         if not self._running:
             return
 
-        # Ensure we don't have stale clients
+        # Ensure we don't have stale clients (prevents duplicate event handlers)
         await self.remove_user(user_id)
 
         user = await self.db.get_user(user_id)
@@ -65,14 +66,14 @@ class ForwardingEngine:
             return
 
         client = TelegramClient(StringSession(session_string), self.telethon.api_id, self.telethon.api_hash)
-        
+
         try:
             await client.connect()
             if not await client.is_user_authorized():
                 await self.telethon.disconnect(user_id)
                 return
-                
-            # Register Event Handlers
+
+            # Register Event Handlers with weak refs so duplicates from refresh never stack
             client.add_event_handler(
                 lambda event: self._on_new_message(event, user_id),
                 events.NewMessage()
@@ -81,9 +82,9 @@ class ForwardingEngine:
                 lambda event: self._on_message_edited(event, user_id),
                 events.MessageEdited()
             )
-            
+
             self.clients[user_id] = client
-            
+
         except Exception as e:
             logger.error(f"Failed to start forwarding client for user {user_id}: {e}")
             if client.is_connected():
@@ -169,12 +170,14 @@ class ForwardingEngine:
             
             # --- FILTERS ---
             
-            # Sender Filter (Platinum)
+            # Sender Filter (Platinum) — apply safely; None sender cannot match
             if plan_name == "platinum":
                 allowed_senders = settings.get("user_filter", [])
-                if allowed_senders and message.sender_id not in allowed_senders:
-                    continue
-            
+                if allowed_senders:
+                    sender = message.sender_id
+                    if sender is None or sender not in allowed_senders:
+                        continue
+
             # Blacklist & Whitelist (Gold, Platinum)
             raw_text = (message.raw_text or "").lower()
             if plan_name in ["gold", "platinum"]:
@@ -207,40 +210,32 @@ class ForwardingEngine:
                 dest_id = dest.get("id")
                 if not dest_id: continue
 
+                sent_msg = None
                 try:
                     # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
                     if plan_name == "free":
                         sent_msg = await client.forward_messages(dest_id, message)
-                        if sent_msg:
-                            sent_tracking.append((dest_id, sent_msg.id))
-                            await self.db.increment_usage(user_id)
-                            
-                    # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
                     else:
-                        new_text = self._clean_text(message.text or "", settings, plan_name)
-                        
-                        # Watermark logic placeholder (Platinum)
-                        # NOTE: Real image watermarking requires Pillow and downloading media.
-                        # As per prompt, if it's too heavy, we pass clean media.
-                        
+                        # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
+                        new_text = self._clean_text(message.message or "", settings, plan_name)
                         sent_msg = await client.send_message(
-                            dest_id, 
-                            message=new_text, 
-                            file=message.media, 
-                            link_preview=bool(message.web_preview)
+                            dest_id,
+                            message=new_text,
+                            file=message.media,
+                            link_preview=bool(message.web_preview),
                         )
-                        
-                        if sent_msg:
-                            sent_tracking.append((dest_id, sent_msg.id))
-                            await self.db.increment_usage(user_id)
-
-                            # Auto-Delete (Platinum)
-                            auto_delete_secs = settings.get("auto_delete_seconds", 0)
-                            if plan_name == "platinum" and auto_delete_secs > 0:
-                                asyncio.create_task(self._auto_delete(client, dest_id, sent_msg.id, auto_delete_secs))
-
                 except Exception as e:
                     logger.warning(f"Task {task['id']} failed to send to {dest_id} for user {user_id}: {e}")
+                    continue
+
+                if sent_msg:
+                    sent_tracking.append((dest_id, sent_msg.id))
+                    # Only count usage on SUCCESS — failed sends do not consume quota
+                    await self.db.increment_usage(user_id)
+                    # Auto-Delete (Platinum)
+                    auto_delete_secs = settings.get("auto_delete_seconds", 0)
+                    if plan_name == "platinum" and auto_delete_secs > 0:
+                        asyncio.create_task(self._auto_delete(client, dest_id, sent_msg.id, auto_delete_secs))
 
             # Save to Edit Sync Map (Platinum)
             if plan_name == "platinum" and settings.get("edit_sync", False) and sent_tracking:
@@ -293,3 +288,96 @@ class ForwardingEngine:
         if client.is_connected():
             with suppress(Exception):
                 await client.delete_messages(chat_id, message_id)
+
+    # --- WATERMARK ENGINE (Platinum only) ---
+
+    def _apply_text_watermark(self, text: str, watermark_text: str) -> str:
+        """Append a subtle watermark line to text content. Platinum-only feature."""
+        if not text:
+            return watermark_text
+        return f"{text}\n\n— {watermark_text}"
+
+    async def _apply_image_watermark(
+        self,
+        client: TelegramClient,
+        message: Message,
+        watermark_text: str,
+        max_image_bytes: int,
+    ) -> bytes | None:
+        """Download a photo, draw watermark on bottom-right, return PNG bytes.
+        Returns None if the message has no downloadable photo or processing fails."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            logger.warning("Pillow not available; skipping image watermark")
+            return None
+
+        # Try to get the largest available photo
+        try:
+            photo_bytes = await client.download_media(
+                message.media,
+                file=bytes,
+                thumb=0,
+            )
+        except Exception as e:
+            logger.debug(f"Could not download source photo for watermark: {e}")
+            return None
+
+        if not photo_bytes or len(photo_bytes) > max_image_bytes:
+            return None
+
+        try:
+            img = Image.open(io.BytesIO(photo_bytes)).convert("RGBA")
+        except Exception as e:
+            logger.debug(f"Could not decode source image: {e}")
+            return None
+
+        # Create a transparent overlay for the watermark
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        # Choose font size proportional to image height (capped)
+        font_size = max(14, min(48, img.size[1] // 20))
+        font = None
+        for font_path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "C:\\Windows\\Fonts\\arialbd.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+        ):
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        # Measure text and place a semi-transparent black pill behind it for legibility
+        bbox = draw.textbbox((0, 0), watermark_text, font=font)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        padding = 8
+        margin = 12
+        pill_w = text_w + padding * 2
+        pill_h = text_h + padding * 2
+        pill_x = img.size[0] - pill_w - margin
+        pill_y = img.size[1] - pill_h - margin
+
+        # Draw rounded background pill
+        draw.rounded_rectangle(
+            [(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)],
+            radius=8,
+            fill=(0, 0, 0, 140),
+        )
+        # Draw white text on top
+        draw.text(
+            (pill_x + padding, pill_y + padding - bbox[1]),
+            watermark_text,
+            font=font,
+            fill=(255, 255, 255, 255),
+        )
+
+        out = Image.alpha_composite(img, overlay).convert("RGB")
+        buf = io.BytesIO()
+        out.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
