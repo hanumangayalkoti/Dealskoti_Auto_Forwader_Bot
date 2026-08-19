@@ -27,12 +27,15 @@ class ForwardingEngine:
         self.edit_map: dict[str, list[tuple[int, int]]] = {}  # "user_id:source_chat:msg_id" -> [(dest_chat, dest_msg_id)]
 
     async def start(self) -> None:
-        """Starts the forwarding engine and connects all valid users."""
+        """Starts the forwarding engine and connects only users who
+        actually have at least one active task — connecting a session for
+        every logged-in user regardless of task status wastes connections
+        and was contributing to hitting Telegram's session limits."""
         self._running = True
-        users = await self.db.list_users(limit=10000)
-        for user in users:
-            user_id = int(user["telegram_user_id"])
-            if not user["is_blocked"]:
+        user_ids = await self.db.get_user_ids_with_active_tasks()
+        for user_id in user_ids:
+            user = await self.db.get_user(user_id)
+            if user and not user["is_blocked"]:
                 await self.refresh_user(user_id)
         logger.info(f"Forwarding Engine started. Active clients: {len(self.clients)}")
 
