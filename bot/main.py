@@ -1294,7 +1294,12 @@ async def setting_save_value(message: Message, state: FSMContext, db: Database, 
             update_val = mapping
 
     await db.update_task_settings(message.from_user.id, task_id, {feature: update_val})
-    await forwarding.refresh_task(task_id)
+    # No forwarding.refresh_task() here on purpose: _on_new_message() already
+    # re-reads each task's settings fresh from the DB on every incoming
+    # message, so a full client disconnect/reconnect isn't needed for a pure
+    # settings change (header/footer/filters/watermark/etc). Reconnecting
+    # here for every single settings tweak was previously causing repeated
+    # session churn and contributing to "session limit" errors.
     await state.clear()
     feature_label = FEATURE_DISPLAY.get(feature, feature)
     success_key = "setting_cleared" if cleared else "setting_saved"
