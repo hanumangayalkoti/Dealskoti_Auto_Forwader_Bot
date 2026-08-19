@@ -211,6 +211,17 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM tasks WHERE user_id = $1 ORDER BY id ASC", user_id)
 
+    async def get_user_ids_with_active_tasks(self) -> list[int]:
+        """Distinct users who have at least one unpaused task — used at
+        startup so we only connect Telethon sessions that are actually
+        needed, instead of every user who has ever logged in."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT user_id FROM tasks WHERE is_paused = FALSE"
+            )
+            return [int(r["user_id"]) for r in rows]
+
     async def get_task(self, task_id: int) -> asyncpg.Record | None:
         if self.pool is None: return None
         async with self.pool.acquire() as conn:
@@ -374,12 +385,19 @@ class Database:
 
     async def get_expiring_users(self, days: int) -> list[asyncpg.Record]:
         if self.pool is None: return []
-        now = datetime.now(timezone.utc)
-        target = now + timedelta(days=days)
-        start = target - timedelta(hours=1)
-        end = target + timedelta(hours=1)
         async with self.pool.acquire() as conn:
-            return await conn.fetch("SELECT telegram_user_id, plan, preferred_language FROM users WHERE plan != 'free' AND plan_expiry BETWEEN $1 AND $2", start, end)
+            # Match on calendar date, not a narrow time-of-day window — a
+            # user's plan_expiry timestamp is whatever time they originally
+            # paid, which rarely lines up with the scheduler's run time, so
+            # a tight +/-1hr window silently misses almost everyone.
+            return await conn.fetch(
+                """
+                SELECT telegram_user_id, plan, preferred_language FROM users
+                WHERE plan != 'free' AND plan_expiry IS NOT NULL
+                  AND plan_expiry::date = (CURRENT_DATE + $1::int)
+                """,
+                days,
+            )
 
     async def downgrade_expired_users(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
