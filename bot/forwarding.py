@@ -97,7 +97,12 @@ class ForwardingEngine:
         """Stops and removes the user's forwarding client."""
         client = self.clients.pop(user_id, None)
         if client:
-            client.remove_event_handlers()
+            # Telethon has no `remove_event_handlers()` (plural) method — only
+            # `remove_event_handler()` for one at a time. We don't need either
+            # here: disconnecting stops all event delivery for this client
+            # immediately, and a brand new TelegramClient object is created
+            # on the next refresh_user() call anyway, so there's nothing to
+            # leak by skipping explicit handler removal.
             if client.is_connected():
                 await client.disconnect()
 
