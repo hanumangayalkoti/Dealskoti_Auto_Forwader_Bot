@@ -220,18 +220,27 @@ def main_menu_keyboard(settings: Settings) -> InlineKeyboardMarkup:
 
 def faq_accordion_keyboard(language: str, page: int, expanded_index: int = -1) -> InlineKeyboardMarkup:
     faqs = FAQS[language_for(language)]
-    total_pages = (len(faqs) + 4) // 5
+    total_pages = max(1, (len(faqs) + 4) // 5)
     page = max(1, min(page, total_pages))
     start = (page - 1) * 5
-    
-    rows = []
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # When something is expanded, show the answer inline above the question list
+    if 0 <= expanded_index < len(faqs):
+        exp = faqs[expanded_index]
+        rows.append([
+            InlineKeyboardButton(text=f"🔼 {exp.question}", callback_data=f"faq:collapse:{page}")
+        ])
+        # Render the answer as a non-clickable marker so user sees it above the rest of the list
+        rows.append([InlineKeyboardButton(text=f"💡 {exp.answer[:60]}{'…' if len(exp.answer) > 60 else ''}", callback_data="faq:noop")])
+
     for index, faq in enumerate(faqs[start : start + 5]):
         actual_index = start + index
         if actual_index == expanded_index:
-            rows.append([InlineKeyboardButton(text=f"🔽 {faq.question}", callback_data=f"faq:collapse:{page}")])
-        else:
-            rows.append([InlineKeyboardButton(text=f"▶️ {faq.question}", callback_data=f"faq:expand:{page}:{actual_index}")])
-            
+            # already shown above
+            continue
+        rows.append([InlineKeyboardButton(text=f"▶️ {faq.question}", callback_data=f"faq:item:{page}:{actual_index}")])
+
     nav_buttons = []
     if page > 1:
         nav_buttons.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"faq:page:{page - 1}"))
@@ -239,7 +248,7 @@ def faq_accordion_keyboard(language: str, page: int, expanded_index: int = -1) -
         nav_buttons.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"faq:page:{page + 1}"))
     if nav_buttons:
         rows.append(nav_buttons)
-        
+
     rows.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -262,14 +271,20 @@ async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
     language = language_for(user["preferred_language"]) if user else "en"
     tasks = await db.list_tasks(user_id)
     
+    plan_name = str((user or {}).get("plan") or "free")
+    plan = PLANS.get(plan_name, PLANS["free"])
+    created = len(tasks)
+    remaining = max(0, plan.tasks - created)
+    summary_line = safe_t(language, "tasks_summary", plan=plan.name, created=created, remaining=remaining, total=plan.tasks)
+
     rows: list[list[InlineKeyboardButton]] = []
     if tasks:
-        lines = [safe_t(language, "tasks_title")]
+        lines = [summary_line, ""]
         for task in tasks:
             status = "⏸️ Paused" if task["is_paused"] else "▶️ Active"
             safe_task_name = safe_html(task['task_name'])
-            lines.append(f"#{task['id']} — {safe_task_name} — {status}")
-            
+            lines.append(f"• {safe_task_name} — {status}")
+
             action_btn = InlineKeyboardButton(
                 text=f"▶️ Resume" if task["is_paused"] else f"⏸️ Pause",
                 callback_data=f"task:{'resume' if task['is_paused'] else 'pause'}:{task['id']}"
@@ -281,7 +296,7 @@ async def _render_tasks(message: Message, db: Database, user_id: int) -> None:
             ])
         text = "\n".join(lines)
     else:
-        text = safe_t(language, "no_tasks_short")
+        text = f"{summary_line}\n\n{safe_t(language, 'no_tasks_short')}"
         
     rows.append([InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create")])
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
@@ -322,6 +337,7 @@ async def menu_command(message: Message, db: Database, settings: Settings) -> No
 async def help_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
     text = safe_t(language, "help_title", commands=command_help(language))
+    # Admin commands are only shown to authorized admins
     if _is_admin(settings, message.from_user.id):
         text += "\n\n" + safe_t(language, "admin_help_title", commands=admin_help())
     await message.answer(text, reply_markup=_nav_keyboard())
@@ -337,15 +353,21 @@ async def admin_help_command(message: Message, db: Database, settings: Settings)
 @router.message(Command("support", "contact"))
 async def support_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
-    await message.answer(safe_t(language, "support", link=settings.support_bot_link or "support"), reply_markup=_nav_keyboard())
+    intro = safe_t(language, "support_intro")
+    await message.answer(
+        f"{intro}\n\n🔗 {settings.support_bot_link or 'support'}",
+        reply_markup=_nav_keyboard(),
+    )
 
 @router.message(Command("updates", "channel"))
-async def updates_command(message: Message, settings: Settings) -> None:
+async def updates_command(message: Message, db: Database, settings: Settings) -> None:
+    language = await _language_for_message(db, message)
+    intro = safe_t(language, "updates_intro")
     await message.answer(
-        "📢 Updates Channel",
+        intro,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Join Updates Channel", url=f"https://t.me/{settings.update_channel_username.lstrip('@')}")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")]
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
     )
 
@@ -401,23 +423,64 @@ async def faq_page(callback: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data.startswith("faq:expand:"))
 async def faq_expand(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None: return
+    """Backwards-compatible handler for old faq:expand:<page>:<index> callbacks."""
+    if callback.message is None:
+        await callback.answer()
+        return
     language = await _language_for_callback(db, callback)
-    _, _, page_str, index_str = callback.data.split(":")
-    page, index = int(page_str), int(index_str)
-    faq = FAQS[language][index]
-    text = safe_t(language, "faq_answer", question=safe_html(faq.question), answer=safe_html(faq.answer))
-    await callback.message.edit_text(text, reply_markup=faq_accordion_keyboard(language, page, index))
+    parts = callback.data.split(":")
+    # old format: faq:expand:page:index
+    if len(parts) >= 4:
+        page, index = int(parts[2]), int(parts[3])
+    else:
+        page, index = 1, int(parts[2])
+    await callback.message.edit_text(
+        safe_t(language, "faq_title", page=page, pages=max(1, (len(FAQS[language_for(language)]) + 4) // 5)),
+        reply_markup=faq_accordion_keyboard(language, page, index),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("faq:item:"))
+async def faq_item(callback: CallbackQuery, db: Database) -> None:
+    """New accordion: faq:item:<page>:<index> - toggle expand."""
+    if callback.message is None:
+        await callback.answer()
+        return
+    language = await _language_for_callback(db, callback)
+    parts = callback.data.split(":")
+    if len(parts) < 4:
+        return await callback.answer()
+    page, index = int(parts[2]), int(parts[3])
+    faqs = FAQS[language_for(language)]
+    if index < 0 or index >= len(faqs):
+        return await callback.answer()
+    await callback.message.edit_text(
+        safe_t(language, "faq_title", page=page, pages=max(1, (len(faqs) + 4) // 5)),
+        reply_markup=faq_accordion_keyboard(language, page, index),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "faq:noop")
+async def faq_noop(callback: CallbackQuery) -> None:
+    """No-op for the static answer preview button."""
     await callback.answer()
 
 @router.callback_query(F.data.startswith("faq:collapse:"))
 async def faq_collapse(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None: return
+    if callback.message is None:
+        await callback.answer()
+        return
     language = await _language_for_callback(db, callback)
     page = int(callback.data.split(":")[2])
     faqs = FAQS[language_for(language)]
-    total_pages = (len(faqs) + 4) // 5
-    await callback.message.edit_text(safe_t(language, "faq_title", page=page, pages=total_pages), reply_markup=faq_accordion_keyboard(language, page, -1))
+    total_pages = max(1, (len(faqs) + 4) // 5)
+    await callback.message.edit_text(
+        safe_t(language, "faq_title", page=page, pages=total_pages),
+        reply_markup=faq_accordion_keyboard(language, page, -1),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 # ==========================================
@@ -447,6 +510,8 @@ async def cancel_flow(callback: CallbackQuery, state: FSMContext, db: Database, 
 
 @router.message(Command("account", "myaccount"))
 async def account_command(message: Message, db: Database) -> None:
+    """Primary /account command. /myaccount is the backward-compatible alias
+    but only /account shows in /help and the Telegram command menu."""
     user = await _ensure_user(db, message)
     language = language_for(user["preferred_language"])
     session = "connected" if await db.has_active_session(message.from_user.id) else "not connected"
@@ -454,7 +519,7 @@ async def account_command(message: Message, db: Database) -> None:
     expiry = user["plan_expiry"].astimezone(ist_zone).strftime("%d %b %Y, %I:%M %p IST") if user["plan_expiry"] else "Lifetime"
     tasks = await db.count_tasks(message.from_user.id)
     usage = await db.daily_usage(message.from_user.id)
-    
+
     await message.answer(
         safe_t(
             language, "account_details",
@@ -507,7 +572,7 @@ async def menu_account(callback: CallbackQuery, db: Database) -> None:
 async def disconnect_command(message: Message, db: Database, telethon: TelethonService, forwarding: ForwardingEngine, settings: Settings) -> None:
     language = await _language_for_message(db, message)
     await message.answer(
-        "⚠️ Are you sure you want to disconnect your Telegram session? Your tasks will be paused, but data is kept safely." if language == "en" else "⚠️ Kya aap sach me apna Telegram session disconnect karna chahte ho?",
+        safe_t(language, "disconnect_confirm"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Yes, Disconnect", callback_data="auth:disconnect")],
             [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")]
@@ -522,7 +587,7 @@ async def auth_disconnect_callback(callback: CallbackQuery, db: Database, teleth
     await _notify_admins(callback.bot, settings, f"🔌 Session disconnected\nUser ID: <code>{callback.from_user.id}</code>")
     if callback.message:
         await callback.message.edit_text(
-            "✅ Session disconnected safely. Product data was kept." if language == "en" else "✅ Session disconnect ho gaya. Tasks aur plan safe hain.",
+            safe_t(language, "disconnect_done"),
             reply_markup=_nav_keyboard()
         )
     await callback.answer()
@@ -870,13 +935,45 @@ async def task_destination(message: Message, state: FSMContext, db: Database, te
 async def task_action(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
     parts = (message.text or "").split()
     cmd = parts[0].lstrip("/").lower() if parts else ""
+    language = await _language_for_message(db, message)
+
+    # Bare command (no ID) -> open interactive task picker (no task ID typing required)
+    if len(parts) == 1:
+        tasks = await db.list_tasks(message.from_user.id)
+        if cmd == "pause":
+            targets = [t for t in tasks if not t["is_paused"]]
+            title = "⏸️ <b>Pause a Task</b>\n\nSelect a task to pause:"
+        elif cmd == "resume":
+            targets = [t for t in tasks if t["is_paused"]]
+            title = "▶️ <b>Resume a Task</b>\n\nSelect a task to resume:"
+        else:  # deletetask
+            targets = tasks
+            title = "🗑️ <b>Delete a Task</b>\n\nSelect a task to delete:"
+
+        if not targets:
+            await message.answer(safe_t(language, "no_tasks_short"), reply_markup=_nav_keyboard())
+            return
+
+        rows = []
+        for t in targets[:20]:
+            label = f"{'⏸️' if t['is_paused'] else '▶️'} {safe_html(t['task_name'])}"
+            prefix = "task:resume:" if cmd == "resume" else "task:pause:" if cmd == "pause" else "task:delete:"
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}{t['id']}")])
+        rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+        await message.answer(title, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+        return
+
+    # Explicit task ID path (backward compatibility)
     if len(parts) != 2 or not parts[1].isdigit():
-        return await message.answer(f"Usage: /{cmd} &lt;task_id&gt;\nOr use /tasks buttons.")
+        return await message.answer(
+            f"Usage: <code>/{cmd} &lt;task_id&gt;</code>\n\nOr send <code>/{cmd}</code> without ID to pick from buttons.",
+            parse_mode="HTML",
+        )
     task_id = int(parts[1])
     if cmd == "deletetask":
         changed = await db.delete_task(message.from_user.id, task_id)
         if changed: await forwarding.remove_task(task_id)
-        await message.answer("🗑️ Deleted." if changed else "⚠️ Not found.")
+        await message.answer("🗑️ Deleted." if changed else " ️ Not found.")
     else:
         paused = cmd == "pause"
         changed = await db.set_task_paused(message.from_user.id, task_id, paused, "user" if paused else None)
@@ -894,18 +991,31 @@ async def task_pause_resume_cb(callback: CallbackQuery, db: Database, forwarding
     await callback.answer(f"Task {action}d" if changed else "Not found")
 
 @router.callback_query(F.data.startswith("task:delete:"))
-async def task_delete_prompt(callback: CallbackQuery) -> None:
+async def task_delete_prompt(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None: return
     task_id = int(callback.data.split(":")[2])
-    await callback.message.edit_text(f"⚠️ Delete task #{task_id} permanently?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Yes, Delete", callback_data=f"task:delete-confirm:{task_id}")],
-        [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:tasks")]
-    ]))
+    task = await db.get_task(task_id)
+    if not task or int(task["user_id"]) != callback.from_user.id:
+        return await callback.answer("Not found", show_alert=True)
+    language = await _language_for_callback(db, callback)
+    name = safe_html(task["task_name"])
+    await callback.message.edit_text(
+        safe_t(language, "delete_confirm", name=name),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Yes, Delete", callback_data=f"task:delete-confirm:{task_id}")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:tasks")]
+        ]),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("task:delete-confirm:"))
 async def task_delete_confirm_cb(callback: CallbackQuery, db: Database, forwarding: ForwardingEngine) -> None:
     task_id = int(callback.data.split(":")[2])
+    # Re-verify ownership before deletion (safety)
+    task = await db.get_task(task_id)
+    if not task or int(task["user_id"]) != callback.from_user.id:
+        return await callback.answer("Not found", show_alert=True)
     changed = await db.delete_task(callback.from_user.id, task_id)
     if changed: await forwarding.remove_task(task_id)
     if callback.message: await _render_tasks(callback.message, db, callback.from_user.id)
@@ -940,6 +1050,32 @@ TIER_FEATURES: dict[str, set[str]] = {
     "silver": {"header", "footer"},
     "gold": {"header", "footer", "blacklist", "whitelist", "replace"},
     "platinum": {"header", "footer", "blacklist", "whitelist", "replace", "watermark", "auto_delete_seconds", "edit_sync", "user_filter"},
+}
+
+# Feature -> (category callback suffix, required plan display name)
+FEATURE_META: dict[str, tuple[str, str]] = {
+    "header":              ("msg",  "Silver"),
+    "footer":              ("msg",  "Silver"),
+    "replace":             ("msg",  "Gold"),
+    "blacklist":           ("flt",  "Gold"),
+    "whitelist":           ("flt",  "Gold"),
+    "watermark":           ("med",  "Platinum"),
+    "auto_delete_seconds": ("med",  "Platinum"),
+    "edit_sync":           ("fwd",  "Platinum"),
+    "user_filter":         ("snd",  "Platinum"),
+}
+
+# Feature -> i18n key (used for confirmation message)
+FEATURE_DISPLAY = {
+    "header": "Header",
+    "footer": "Footer",
+    "replace": "Text Replacement",
+    "blacklist": "Blacklist",
+    "whitelist": "Whitelist",
+    "watermark": "Watermark",
+    "auto_delete_seconds": "Auto Delete",
+    "edit_sync": "Edit Sync",
+    "user_filter": "Sender Filter",
 }
 
 @router.message(Command("setting", "settings"))
@@ -1030,13 +1166,18 @@ async def setting_category(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 @router.callback_query(F.data.startswith("set:lock:"))
-async def setting_locked(callback: CallbackQuery) -> None:
+async def setting_locked(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None: return
+    feature = callback.data.split(":", 2)[2]
+    _, required_plan = FEATURE_META.get(feature, ("msg", "Silver"))
+    language = await _language_for_callback(db, callback)
+    text = safe_t(language, "feature_locked", feature=FEATURE_DISPLAY.get(feature, feature), required_plan=required_plan)
     await callback.message.edit_text(
-        "🔒 <b>Feature Locked</b>\n\nThis feature is not available on your current plan. Please upgrade to unlock it.",
+        text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:settings")]
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:settings")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
         parse_mode="HTML"
     )
@@ -1062,26 +1203,33 @@ async def setting_edit_input(callback: CallbackQuery, state: FSMContext, db: Dat
     if callback.message is None: return
     _, _, task_id_str, feature = callback.data.split(":")
     task_id = int(task_id_str)
-    
+
     user = await db.get_user(callback.from_user.id)
     plan_name = str(user["plan"]) if user else "free"
     if feature not in TIER_FEATURES.get(plan_name, set()): return await callback.answer("Locked", show_alert=True)
-    
-    cat = "msg" if feature in ("header", "footer", "replace") else "flt" if feature in ("blacklist", "whitelist") else "med" if feature == "auto_delete_seconds" else "snd"
-    
+
+    cat, _ = FEATURE_META.get(feature, ("msg", "Silver"))
+
     await state.set_state(SettingsFlow.waiting_value)
     await state.update_data(task_id=task_id, feature=feature, cat=cat)
-    
-    prompts = {
-        "header": "Enter new Header text. Type /clear to remove.",
-        "footer": "Enter new Footer text. Type /clear to remove.",
-        "replace": "Enter replace rules (e.g. `old=>new, apple=>orange`). Type /clear to remove.",
-        "blacklist": "Enter comma separated blacklist words. Type /clear to remove.",
-        "whitelist": "Enter comma separated whitelist words. Type /clear to remove.",
-        "auto_delete_seconds": "Enter seconds to auto-delete (e.g. 3600). Type /clear to turn off.",
-        "user_filter": "Enter comma separated Telegram Sender IDs. Type /clear to remove."
-    }
-    await callback.message.edit_text(f"✏️ <b>{feature.title()}</b>\n\n{prompts.get(feature, 'Enter value:')}", reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"), parse_mode="HTML")
+
+    language = await _language_for_callback(db, callback)
+    prompt_key = {
+        "header": "header_prompt",
+        "footer": "footer_prompt",
+        "replace": "replace_prompt",
+        "blacklist": "blacklist_prompt",
+        "whitelist": "whitelist_prompt",
+        "auto_delete_seconds": "autodelete_prompt",
+        "user_filter": "userfilter_prompt",
+    }.get(feature)
+    feature_label = FEATURE_DISPLAY.get(feature, feature.title())
+    prompt_text = safe_t(language, prompt_key) if prompt_key else "Enter value:"
+    await callback.message.edit_text(
+        f"✏️ <b>{safe_html(feature_label)}</b>\n\n{prompt_text}",
+        reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 @router.message(SettingsFlow.waiting_value)
@@ -1092,38 +1240,71 @@ async def setting_save_value(message: Message, state: FSMContext, db: Database, 
     feature = data["feature"]
     cat = data["cat"]
     val = message.text.strip()
-    
+    language = await _language_for_message(db, message)
+
     clear = val.lower() == "/clear"
-    
+
     update_val = None
+    cleared = False
     if feature in ("header", "footer"):
         update_val = "" if clear else val
+        cleared = clear
     elif feature in ("blacklist", "whitelist"):
-        update_val = [] if clear else [w.strip() for w in val.split(",") if w.strip()]
+        if clear:
+            update_val = []
+            cleared = True
+        else:
+            update_val = [w.strip() for w in val.split(",") if w.strip()]
+            if not update_val:
+                return await message.answer(safe_t(language, "validation_invalid"), reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"))
     elif feature == "user_filter":
-        if clear: update_val = []
+        if clear:
+            update_val = []
+            cleared = True
         else:
-            try: update_val = [int(w.strip()) for w in val.split(",") if w.strip()]
-            except ValueError: return await message.answer("⚠️ Must be valid numeric IDs.", reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"))
+            try:
+                update_val = [int(w.strip()) for w in val.split(",") if w.strip()]
+            except ValueError:
+                return await message.answer(safe_t(language, "setting_invalid_ids"), reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"))
     elif feature == "auto_delete_seconds":
-        if clear: update_val = 0
+        if clear:
+            update_val = 0
+            cleared = True
         else:
-            try: update_val = int(val)
-            except ValueError: return await message.answer("⚠️ Must be a number in seconds.", reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"))
+            try:
+                update_val = int(val)
+                if update_val < 0:
+                    raise ValueError
+            except ValueError:
+                return await message.answer(safe_t(language, "setting_invalid_number"), reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"))
     elif feature == "replace":
-        if clear: update_val = {}
+        if clear:
+            update_val = {}
+            cleared = True
         else:
-            mapping = {}
+            mapping: dict[str, str] = {}
             for pair in val.split(","):
                 if "=>" in pair:
                     o, n = pair.split("=>", 1)
-                    mapping[o.strip()] = n.strip()
+                    o_s, n_s = o.strip(), n.strip()
+                    if o_s and n_s:
+                        mapping[o_s] = n_s
+            if not mapping:
+                return await message.answer(safe_t(language, "setting_invalid_replace"), reply_markup=_nav_keyboard(back=f"set:cat:{task_id}:{cat}"))
             update_val = mapping
-            
+
     await db.update_task_settings(message.from_user.id, task_id, {feature: update_val})
     await forwarding.refresh_task(task_id)
     await state.clear()
-    await message.answer("✅ Setting saved.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Back to Category", callback_data=f"set:cat:{task_id}:{cat}")]]))
+    feature_label = FEATURE_DISPLAY.get(feature, feature)
+    success_key = "setting_cleared" if cleared else "setting_saved"
+    await message.answer(
+        safe_t(language, success_key, feature=feature_label),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=" ️ Back to Category", callback_data=f"set:cat:{task_id}:{cat}")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ])
+    )
 
 # ==========================================
 # ADMIN COMMANDS
@@ -1448,6 +1629,9 @@ async def _run(settings: Settings) -> None:
     
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
+    # SAFETY: clear any stale webhook so polling doesn't conflict on Replit/Railway restart
+    with suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_my_commands(_bot_commands())
     for admin_id in settings.admin_telegram_ids:
         await bot.set_my_commands(_bot_commands() + _admin_bot_commands(), scope=BotCommandScopeChat(chat_id=admin_id))
