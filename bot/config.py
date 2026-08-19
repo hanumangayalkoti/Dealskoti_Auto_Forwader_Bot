@@ -27,6 +27,7 @@ class Settings:
     razorpay_key_secret: str
     razorpay_webhook_secret: str
     razorpay_webhook_path: str
+    session_encryption_key: str
     
     support_bot_link: str | None = None
     log_level: str = "INFO"
@@ -82,6 +83,9 @@ class Settings:
         if not razorpay_webhook_path.startswith("/"):
             razorpay_webhook_path = f"/{razorpay_webhook_path}"
 
+        # --- SESSION ENCRYPTION ---
+        session_encryption_key = get_env("SESSION_ENCRYPTION_KEY")
+
         # --- MISC & OPTIONAL ---
         log_level = get_env("LOG_LEVEL", default="INFO", required=False).upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
@@ -105,6 +109,7 @@ class Settings:
             razorpay_key_secret=razorpay_key_secret,
             razorpay_webhook_secret=razorpay_webhook_secret,
             razorpay_webhook_path=razorpay_webhook_path,
+            session_encryption_key=session_encryption_key,
             support_bot_link=support_bot_link,
             log_level=log_level,
             default_timezone=default_timezone,
