@@ -63,6 +63,24 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT;
 
+-- The very first version of this table (long before this rewrite) declared
+-- a required column named `encrypted_session_string`. This live production
+-- table was created back then and still has that column with a NOT NULL
+-- constraint, even though the current code only ever writes to the newer
+-- `session_string` column. Left as-is, every session save fails with:
+--   null value in column "encrypted_session_string" violates not-null constraint
+-- Drop that leftover constraint safely (no-op on a fresh database that never
+-- had this legacy column in the first place).
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'sessions' AND column_name = 'encrypted_session_string'
+    ) THEN
+        ALTER TABLE sessions ALTER COLUMN encrypted_session_string DROP NOT NULL;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS payments (
     id SERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES users(telegram_user_id),
