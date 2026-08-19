@@ -615,13 +615,14 @@ async def menu_connect(callback: CallbackQuery, db: Database, settings: Settings
     language = await _language_for_callback(db, callback)
     if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language): return
     if await db.has_active_session(callback.from_user.id):
-        await callback.message.edit_text(
-            "ℹ️ You're already connected. Reconnecting replaces existing session." if language == "en" else "ℹ️ Aap already connect ho. Dobara connect karne se purana replace hoga.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Reconnect anyway", callback_data="connect:force")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-            ])
-        )
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(
+                "ℹ️ You're already connected. Reconnecting replaces existing session." if language == "en" else "ℹ️ Aap already connect ho. Dobara connect karne se purana replace hoga.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Reconnect anyway", callback_data="connect:force")],
+                    [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                ])
+            )
         await callback.answer()
         return
     await telethon.cancel_login(callback.from_user.id)
