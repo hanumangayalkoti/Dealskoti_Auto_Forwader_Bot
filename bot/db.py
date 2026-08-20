@@ -292,6 +292,30 @@ class Database:
                 ON CONFLICT (user_id, usage_date) DO UPDATE SET message_count = usage_daily.message_count + 1
             """, user_id, today)
 
+    async def try_reserve_usage(self, user_id: int, daily_limit: int) -> bool:
+        """Atomically reserve one daily message slot."""
+        if self.pool is None:
+            return False
+        if daily_limit <= 0:
+            return True
+
+        today = datetime.now(timezone.utc).date()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO usage_daily (user_id, usage_date, message_count)
+                VALUES ($1, $2, 1)
+                ON CONFLICT (user_id, usage_date) DO UPDATE
+                    SET message_count = usage_daily.message_count + 1
+                    WHERE usage_daily.message_count < $3
+                RETURNING message_count
+                """,
+                user_id,
+                today,
+                daily_limit,
+            )
+            return row is not None
+
     async def has_paid_order(self, user_id: int) -> bool:
         if self.pool is None: return False
         async with self.pool.acquire() as conn:
@@ -317,9 +341,20 @@ class Database:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                payment = await conn.fetchrow("SELECT user_id, status FROM payments WHERE order_id = $1 FOR UPDATE", order_id)
+                payment = await conn.fetchrow(
+                    """
+                    SELECT user_id, status, payable_amount_paise
+                    FROM payments
+                    WHERE order_id = $1
+                    FOR UPDATE
+                    """,
+                    order_id,
+                )
                 if not payment or payment["status"] == "captured":
                     return None  # idempotent: already activated
+
+                if payment["payable_amount_paise"] != amount_paise:
+                    raise ValueError("Payment amount does not match the stored order.")
 
                 user_id = payment["user_id"]
                 await conn.execute("UPDATE payments SET payment_id = $1, status = 'captured' WHERE order_id = $2", payment_id, order_id)
@@ -420,7 +455,7 @@ class Database:
             res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
             return res == "UPDATE 1"
 
-    async def activate_payment(self, user_id: int, plan: str, cycle: str) -> bool:
+    async def update_manual_plan(self, user_id: int, plan: str, cycle: str) -> bool:
         """Convenience wrapper used when admin/manual plans change so that the
         forwarding engine can be hot-reloaded. Returns True on success."""
         if self.pool is None: return False
