@@ -63,24 +63,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT;
 
--- The very first version of this table (long before this rewrite) declared
--- a required column named `encrypted_session_string`. This live production
--- table was created back then and still has that column with a NOT NULL
--- constraint, even though the current code only ever writes to the newer
--- `session_string` column. Left as-is, every session save fails with:
---   null value in column "encrypted_session_string" violates not-null constraint
--- Drop that leftover constraint safely (no-op on a fresh database that never
--- had this legacy column in the first place).
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'sessions' AND column_name = 'encrypted_session_string'
-    ) THEN
-        ALTER TABLE sessions ALTER COLUMN encrypted_session_string DROP NOT NULL;
-    END IF;
-END $$;
-
 CREATE TABLE IF NOT EXISTS payments (
     id SERIAL PRIMARY KEY,
     user_id BIGINT REFERENCES users(telegram_user_id),
@@ -228,17 +210,6 @@ class Database:
         if self.pool is None: return []
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM tasks WHERE user_id = $1 ORDER BY id ASC", user_id)
-
-    async def get_user_ids_with_active_tasks(self) -> list[int]:
-        """Distinct users who have at least one unpaused task — used at
-        startup so we only connect Telethon sessions that are actually
-        needed, instead of every user who has ever logged in."""
-        if self.pool is None: return []
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT DISTINCT user_id FROM tasks WHERE is_paused = FALSE"
-            )
-            return [int(r["user_id"]) for r in rows]
 
     async def get_task(self, task_id: int) -> asyncpg.Record | None:
         if self.pool is None: return None
@@ -403,19 +374,12 @@ class Database:
 
     async def get_expiring_users(self, days: int) -> list[asyncpg.Record]:
         if self.pool is None: return []
+        now = datetime.now(timezone.utc)
+        target = now + timedelta(days=days)
+        start = target - timedelta(hours=1)
+        end = target + timedelta(hours=1)
         async with self.pool.acquire() as conn:
-            # Match on calendar date, not a narrow time-of-day window — a
-            # user's plan_expiry timestamp is whatever time they originally
-            # paid, which rarely lines up with the scheduler's run time, so
-            # a tight +/-1hr window silently misses almost everyone.
-            return await conn.fetch(
-                """
-                SELECT telegram_user_id, plan, preferred_language FROM users
-                WHERE plan != 'free' AND plan_expiry IS NOT NULL
-                  AND plan_expiry::date = (CURRENT_DATE + $1::int)
-                """,
-                days,
-            )
+            return await conn.fetch("SELECT telegram_user_id, plan, preferred_language FROM users WHERE plan != 'free' AND plan_expiry BETWEEN $1 AND $2", start, end)
 
     async def downgrade_expired_users(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
@@ -454,6 +418,17 @@ class Database:
             base_time = user["plan_expiry"] if user["plan_expiry"] and user["plan_expiry"] > now else now
             new_expiry = base_time + timedelta(days=days)
             res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
+            return res == "UPDATE 1"
+
+    async def activate_payment(self, user_id: int, plan: str, cycle: str) -> bool:
+        """Convenience wrapper used when admin/manual plans change so that the
+        forwarding engine can be hot-reloaded. Returns True on success."""
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute(
+                "UPDATE users SET plan = $1 WHERE telegram_user_id = $2",
+                plan, user_id
+            )
             return res == "UPDATE 1"
 
     async def stats(self) -> dict[str, Any]:
