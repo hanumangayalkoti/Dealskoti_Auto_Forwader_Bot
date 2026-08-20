@@ -615,14 +615,13 @@ async def menu_connect(callback: CallbackQuery, db: Database, settings: Settings
     language = await _language_for_callback(db, callback)
     if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language): return
     if await db.has_active_session(callback.from_user.id):
-        with suppress(TelegramBadRequest):
-            await callback.message.edit_text(
-                "ℹ️ You're already connected. Reconnecting replaces existing session." if language == "en" else "ℹ️ Aap already connect ho. Dobara connect karne se purana replace hoga.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Reconnect anyway", callback_data="connect:force")],
-                    [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-                ])
-            )
+        await callback.message.edit_text(
+            "ℹ️ You're already connected. Reconnecting replaces existing session." if language == "en" else "ℹ️ Aap already connect ho. Dobara connect karne se purana replace hoga.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Reconnect anyway", callback_data="connect:force")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ])
+        )
         await callback.answer()
         return
     await telethon.cancel_login(callback.from_user.id)
@@ -1074,6 +1073,7 @@ FEATURE_DISPLAY = {
     "blacklist": "Blacklist",
     "whitelist": "Whitelist",
     "watermark": "Watermark",
+    "watermark_text": "Watermark Text",
     "auto_delete_seconds": "Auto Delete",
     "edit_sync": "Edit Sync",
     "user_filter": "Sender Filter",
@@ -1153,6 +1153,9 @@ async def setting_category(callback: CallbackQuery, db: Database) -> None:
     elif cat == "med":
         text = "🖼️ <b>Media Settings</b>"
         rows.append([_get_toggle_btn("Watermark", "watermark", task_id, plan_name, st)])
+        # Watermark text is only meaningful when watermark is enabled & on Platinum.
+        if plan_name == "platinum" and st.get("watermark", False):
+            rows.append([_get_setting_btn("Watermark Text", "watermark_text", task_id, plan_name)])
         rows.append([_get_setting_btn("Auto Delete", "auto_delete_seconds", task_id, plan_name)])
     elif cat == "fwd":
         text = "🚀 <b>Forwarding Settings</b>"
@@ -1223,6 +1226,7 @@ async def setting_edit_input(callback: CallbackQuery, state: FSMContext, db: Dat
         "whitelist": "whitelist_prompt",
         "auto_delete_seconds": "autodelete_prompt",
         "user_filter": "userfilter_prompt",
+        "watermark_text": "watermark_text_prompt",
     }.get(feature)
     feature_label = FEATURE_DISPLAY.get(feature, feature.title())
     prompt_text = safe_t(language, prompt_key) if prompt_key else "Enter value:"
@@ -1247,7 +1251,7 @@ async def setting_save_value(message: Message, state: FSMContext, db: Database, 
 
     update_val = None
     cleared = False
-    if feature in ("header", "footer"):
+    if feature in ("header", "footer", "watermark_text"):
         update_val = "" if clear else val
         cleared = clear
     elif feature in ("blacklist", "whitelist"):
@@ -1295,19 +1299,14 @@ async def setting_save_value(message: Message, state: FSMContext, db: Database, 
             update_val = mapping
 
     await db.update_task_settings(message.from_user.id, task_id, {feature: update_val})
-    # No forwarding.refresh_task() here on purpose: _on_new_message() already
-    # re-reads each task's settings fresh from the DB on every incoming
-    # message, so a full client disconnect/reconnect isn't needed for a pure
-    # settings change (header/footer/filters/watermark/etc). Reconnecting
-    # here for every single settings tweak was previously causing repeated
-    # session churn and contributing to "session limit" errors.
+    await forwarding.refresh_task(task_id)
     await state.clear()
     feature_label = FEATURE_DISPLAY.get(feature, feature)
     success_key = "setting_cleared" if cleared else "setting_saved"
     await message.answer(
         safe_t(language, success_key, feature=feature_label),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=" ️ Back to Category", callback_data=f"set:cat:{task_id}:{cat}")],
+            [InlineKeyboardButton(text="◀️ Back to Category", callback_data=f"set:cat:{task_id}:{cat}")],
             [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
     )
