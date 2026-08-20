@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import suppress
 
@@ -10,6 +11,10 @@ from .db import Database
 logger = logging.getLogger("dealskoti.telethon")
 
 class TelethonService:
+    LOGIN_TIMEOUT_SECONDS = 10 * 60
+    MAX_PIN_ATTEMPTS = 5
+    MAX_2FA_ATTEMPTS = 5
+
     def __init__(self, settings: Settings, db: Database):
         self.api_id = settings.telegram_api_id
         self.api_hash = settings.telegram_api_hash
@@ -58,8 +63,13 @@ class TelethonService:
             self.login_clients[user_id] = {
                 "client": client,
                 "phone": phone,
-                "phone_code_hash": sent_code.phone_code_hash
+                "phone_code_hash": sent_code.phone_code_hash,
+                "pin_attempts": 0,
+                "two_fa_attempts": 0,
             }
+            self.login_clients[user_id]["expiry_task"] = asyncio.create_task(
+                self._expire_login(user_id, client)
+            )
         except errors.PhoneNumberInvalidError:
             await client.disconnect()
             raise ValueError("The phone number is invalid. Please include the country code (e.g. +91...)")
@@ -81,18 +91,23 @@ class TelethonService:
         phone_code_hash = login_data["phone_code_hash"]
 
         try:
+            login_data["pin_attempts"] += 1
+            if login_data["pin_attempts"] > self.MAX_PIN_ATTEMPTS:
+                await self.cancel_login(user_id)
+                raise ValueError("Too many PIN attempts. Please start login again.")
+
             await client.sign_in(phone=phone, code=pin, phone_code_hash=phone_code_hash)
             session_string = client.session.save()
             await self._save_session(user_id, session_string)
-            # Keep client alive until 2FA step if needed; cleanup happens via
-            # submit_2fa() on success or cancel_login() on failure.
+            await self.cancel_login(user_id)
             return "success"
         except errors.SessionPasswordNeededError:
             # DON'T cancel login — keep client around so we can submit 2FA next.
             return "2fa_required"
         except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):
-            # Bad/expired OTP → kill the in-memory client so user must restart.
-            await self.cancel_login(user_id)
+            if login_data["pin_attempts"] >= self.MAX_PIN_ATTEMPTS:
+                await self.cancel_login(user_id)
+                raise ValueError("Too many PIN attempts. Please start login again.")
             raise ValueError("Invalid or expired PIN. Please try again or restart login.")
         except Exception as e:
             logger.error(f"Error submitting PIN for {user_id}: {e}")
@@ -107,13 +122,20 @@ class TelethonService:
         client: TelegramClient = login_data["client"]
 
         try:
+            login_data["two_fa_attempts"] += 1
+            if login_data["two_fa_attempts"] > self.MAX_2FA_ATTEMPTS:
+                await self.cancel_login(user_id)
+                raise ValueError("Too many 2FA attempts. Please start login again.")
+
             await client.sign_in(password=password)
             session_string = client.session.save()
             await self._save_session(user_id, session_string)
             await self.cancel_login(user_id)  # Clean up memory only on success
             return "success"
         except errors.PasswordHashInvalidError:
-            # Keep client alive so user can retry the password — DO NOT cancel_login.
+            if login_data["two_fa_attempts"] >= self.MAX_2FA_ATTEMPTS:
+                await self.cancel_login(user_id)
+                raise ValueError("Too many 2FA attempts. Please start login again.")
             raise ValueError("Incorrect 2FA password. Please try again.")
         except errors.FloodWaitError as e:
             await self.cancel_login(user_id)
@@ -123,9 +145,19 @@ class TelethonService:
             await self.cancel_login(user_id)
             raise ValueError("An unexpected error occurred. Please try again.")
 
+    async def _expire_login(self, user_id: int, client: TelegramClient) -> None:
+        await asyncio.sleep(self.LOGIN_TIMEOUT_SECONDS)
+        login_data = self.login_clients.get(user_id)
+        if login_data and login_data.get("client") is client:
+            logger.info("Expiring inactive Telegram login for user %s", user_id)
+            await self.cancel_login(user_id)
+
     async def cancel_login(self, user_id: int) -> None:
         login_data = self.login_clients.pop(user_id, None)
         if login_data:
+            expiry_task = login_data.get("expiry_task")
+            if expiry_task and expiry_task is not asyncio.current_task():
+                expiry_task.cancel()
             client: TelegramClient = login_data["client"]
             if client.is_connected():
                 await client.disconnect()
