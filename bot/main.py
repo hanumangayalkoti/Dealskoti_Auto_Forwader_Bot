@@ -1561,8 +1561,19 @@ def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilli
 
     @app.post(settings.razorpay_webhook_path)
     async def razorpay_webhook(request: Request) -> JSONResponse:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > 1_000_000:
+                    return JSONResponse({"error": "Request body too large"}, status_code=413)
+            except ValueError:
+                return JSONResponse({"error": "Invalid content length"}, status_code=400)
+
         signature = request.headers.get("X-Razorpay-Signature", "")
         raw_body = await request.body()
+        if len(raw_body) > 1_000_000:
+            return JSONResponse({"error": "Request body too large"}, status_code=413)
+
         if not billing.verify_webhook_signature(raw_body, signature):
             await _notify_admins(bot, settings, "🚨 Invalid Razorpay webhook signature rejected")
             return JSONResponse({"error": "Invalid signature"}, status_code=401)
@@ -1583,7 +1594,7 @@ def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilli
                 duration_days(stored_cycle), stored_plan, stored_cycle
             )
             
-        except (BillingError, ValueError) as exc:
+        except (BillingError, KeyError, ValueError) as exc:
             logger.warning("Rejected webhook: %s", str(exc))
             return JSONResponse({"error": str(exc)}, status_code=400)
             
