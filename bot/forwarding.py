@@ -27,15 +27,12 @@ class ForwardingEngine:
         self.edit_map: dict[str, list[tuple[int, int]]] = {}  # "user_id:source_chat:msg_id" -> [(dest_chat, dest_msg_id)]
 
     async def start(self) -> None:
-        """Starts the forwarding engine and connects only users who
-        actually have at least one active task — connecting a session for
-        every logged-in user regardless of task status wastes connections
-        and was contributing to hitting Telegram's session limits."""
+        """Starts the forwarding engine and connects all valid users."""
         self._running = True
-        user_ids = await self.db.get_user_ids_with_active_tasks()
-        for user_id in user_ids:
-            user = await self.db.get_user(user_id)
-            if user and not user["is_blocked"]:
+        users = await self.db.list_users(limit=10000)
+        for user in users:
+            user_id = int(user["telegram_user_id"])
+            if not user["is_blocked"]:
                 await self.refresh_user(user_id)
         logger.info(f"Forwarding Engine started. Active clients: {len(self.clients)}")
 
@@ -97,14 +94,15 @@ class ForwardingEngine:
         """Stops and removes the user's forwarding client."""
         client = self.clients.pop(user_id, None)
         if client:
-            # Telethon has no `remove_event_handlers()` (plural) method — only
-            # `remove_event_handler()` for one at a time. We don't need either
-            # here: disconnecting stops all event delivery for this client
-            # immediately, and a brand new TelegramClient object is created
-            # on the next refresh_user() call anyway, so there's nothing to
-            # leak by skipping explicit handler removal.
+            client.remove_event_handlers()
             if client.is_connected():
                 await client.disconnect()
+        # Also drop any edit-map entries belonging to this user so a future
+        # reconnect doesn't accidentally replay edits on stale destinations.
+        prefix = f"{user_id}:"
+        for k in list(self.edit_map.keys()):
+            if k.startswith(prefix):
+                self.edit_map.pop(k, None)
 
     async def refresh_task(self, task_id: int) -> None:
         """Hot-reloads a user's client if a specific task was updated."""
@@ -121,42 +119,52 @@ class ForwardingEngine:
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
         """Applies Blacklist, Replace, Header, and Footer based on user plan."""
         if not text:
+            # Even with empty body, header/footer should still be appended for paid plans.
+            if plan_name in ["silver", "gold", "platinum"]:
+                header = settings.get("header", "")
+                footer = settings.get("footer", "")
+                if header or footer:
+                    parts = []
+                    if header: parts.append(header)
+                    if footer: parts.append(footer)
+                    return "\n\n".join(parts)
             return text
-            
+
         # Blacklist/Whitelist is checked before this function.
         # This function only does replacements and append/prepend.
-        
+
         if plan_name in ["gold", "platinum"]:
             replacements = settings.get("replace", {})
             if isinstance(replacements, dict):
                 for old_word, new_word in replacements.items():
                     # Simple case-sensitive replace (could be upgraded to regex if needed)
-                    text = text.replace(old_word, new_word)
+                    if old_word:  # safety: skip empty keys
+                        text = text.replace(old_word, new_word)
 
         if plan_name in ["silver", "gold", "platinum"]:
             header = settings.get("header", "")
             footer = settings.get("footer", "")
-            
+
             parts = []
             if header:
                 parts.append(header)
             parts.append(text)
             if footer:
                 parts.append(footer)
-                
+
             text = "\n\n".join(parts)
-            
+
         return text
 
     async def _on_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         """Triggered when the user's account receives a new message in any chat."""
         message: Message = event.message
         chat_id = event.chat_id
-        
+
         user = await self.db.get_user(user_id)
         if not user or user["is_blocked"]:
             return
-            
+
         tasks = await self.db.list_tasks(user_id)
         if not tasks:
             return
@@ -164,10 +172,14 @@ class ForwardingEngine:
         plan_name = str(user["plan"] or "free")
         plan = PLANS.get(plan_name, PLANS["free"])
 
+        client = self.clients.get(user_id)
+        if not client:
+            return
+
         for task in tasks:
             if task["is_paused"]:
                 continue
-                
+
             # Check if this chat is a source for this task
             sources = json.loads(task["sources"] or "[]")
             source_ids = [s.get("id") for s in sources if isinstance(s, dict)]
@@ -175,9 +187,9 @@ class ForwardingEngine:
                 continue
 
             settings = json.loads(task["settings"] or "{}")
-            
+
             # --- FILTERS ---
-            
+
             # Sender Filter (Platinum) — apply safely; None sender cannot match
             if plan_name == "platinum":
                 allowed_senders = settings.get("user_filter", [])
@@ -191,7 +203,7 @@ class ForwardingEngine:
             if plan_name in ["gold", "platinum"]:
                 whitelist = settings.get("whitelist", [])
                 blacklist = settings.get("blacklist", [])
-                
+
                 if whitelist and not any(w.lower() in raw_text for w in whitelist):
                     continue
                 if blacklist and any(b.lower() in raw_text for b in blacklist):
@@ -208,12 +220,20 @@ class ForwardingEngine:
             if not destinations:
                 continue
 
-            client = self.clients.get(user_id)
-            if not client:
-                return
+            # --- WATERMARK (Platinum) — build media file if enabled ---
+            watermark_text = ""
+            media_file = message.media
+            if plan_name == "platinum" and settings.get("watermark", False):
+                watermark_text = settings.get("watermark_text", "Forwarded via DealsKoti")
+                if message.media and isinstance(message.media, MessageMediaPhoto):
+                    watermarked = await self._apply_image_watermark(
+                        client, message, watermark_text, max_image_bytes=10 * 1024 * 1024
+                    )
+                    if watermarked:
+                        media_file = watermarked  # bytes are accepted by send_message(file=...)
 
             sent_tracking = []
-            
+
             for dest in destinations:
                 dest_id = dest.get("id")
                 if not dest_id: continue
@@ -225,11 +245,15 @@ class ForwardingEngine:
                         sent_msg = await client.forward_messages(dest_id, message)
                     else:
                         # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
-                        new_text = self._clean_text(message.message or "", settings, plan_name)
+                        base_text = message.message or ""
+                        if plan_name == "platinum" and watermark_text and not message.media:
+                            # text watermark only when there's no image watermark to draw
+                            base_text = self._apply_text_watermark(base_text, watermark_text)
+                        new_text = self._clean_text(base_text, settings, plan_name)
                         sent_msg = await client.send_message(
                             dest_id,
                             message=new_text,
-                            file=message.media,
+                            file=media_file,
                             link_preview=bool(message.web_preview),
                         )
                 except Exception as e:
@@ -245,46 +269,54 @@ class ForwardingEngine:
                     if plan_name == "platinum" and auto_delete_secs > 0:
                         asyncio.create_task(self._auto_delete(client, dest_id, sent_msg.id, auto_delete_secs))
 
-            # Save to Edit Sync Map (Platinum)
+            # Save to Edit Sync Map (Platinum) — store task_id so edit applies correct settings
             if plan_name == "platinum" and settings.get("edit_sync", False) and sent_tracking:
                 map_key = f"{user_id}:{chat_id}:{message.id}"
-                self.edit_map[map_key] = sent_tracking
+                self.edit_map[map_key] = {
+                    "task_id": task["id"],
+                    "dests": sent_tracking,
+                }
+                # Cap the map size to avoid memory leaks on long-running bots
+                if len(self.edit_map) > 5000:
+                    # Drop oldest half (dict preserves insertion order in CPython 3.7+)
+                    for k in list(self.edit_map.keys())[:2500]:
+                        self.edit_map.pop(k, None)
 
     async def _on_message_edited(self, event: events.MessageEdited.Event, user_id: int) -> None:
         """Triggered when a source message is edited, applies live Edit Sync."""
         message: Message = event.message
         chat_id = event.chat_id
-        
+
         map_key = f"{user_id}:{chat_id}:{message.id}"
-        mapped_dests = self.edit_map.get(map_key)
-        
-        if not mapped_dests:
+        entry = self.edit_map.get(map_key)
+
+        if not entry:
             return
-            
+
         user = await self.db.get_user(user_id)
         if not user or user["plan"] != "platinum":
             return
-            
+
         client = self.clients.get(user_id)
         if not client:
             return
 
-        # Need to re-apply the user's text replacement settings for this task
-        # Since we map dynamically, we fetch tasks that contain this source.
-        tasks = await self.db.list_tasks(user_id)
-        matched_settings = {}
-        for t in tasks:
-            srcs = json.loads(t["sources"] or "[]")
-            if chat_id in [s.get("id") for s in srcs if isinstance(s, dict)]:
-                matched_settings = json.loads(t["settings"] or "{}")
-                break
-                
-        if not matched_settings.get("edit_sync", False):
+        # Use the EXACT task whose settings were applied at forward-time
+        task = await self.db.get_task(entry["task_id"])
+        if not task or int(task["user_id"]) != user_id:
             return
 
-        new_text = self._clean_text(message.text or "", matched_settings, "platinum")
-        
-        for dest_id, dest_msg_id in mapped_dests:
+        settings = json.loads(task["settings"] or "{}")
+        if not settings.get("edit_sync", False):
+            return
+
+        base_text = message.text or message.message or ""
+        if settings.get("watermark", False):
+            watermark_text = settings.get("watermark_text", "Forwarded via DealsKoti")
+            base_text = self._apply_text_watermark(base_text, watermark_text)
+        new_text = self._clean_text(base_text, settings, "platinum")
+
+        for dest_id, dest_msg_id in entry["dests"]:
             try:
                 await client.edit_message(dest_id, dest_msg_id, text=new_text)
             except Exception as e:
