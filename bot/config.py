@@ -29,6 +29,9 @@ class Settings:
     razorpay_webhook_path: str
     session_encryption_key: str
     
+    # NEW: Dummy channel for storing user APKs/Files
+    dummy_storage_channel: str
+    
     support_bot_link: str | None = None
     log_level: str = "INFO"
     default_timezone: str = "Asia/Kolkata"
@@ -73,6 +76,10 @@ class Settings:
         if not update_channel_username.startswith("@"):
             update_channel_username = f"@{update_channel_username}"
             
+        dummy_storage_channel = get_env("DUMMY_STORAGE_CHANNEL", default=update_channel_username, required=False)
+        if dummy_storage_channel and not dummy_storage_channel.startswith("@") and not dummy_storage_channel.startswith("-100"):
+            dummy_storage_channel = f"@{dummy_storage_channel}"
+            
         support_bot_link = get_env("SUPPORT_BOT_LINK", required=False) or None
 
         # --- RAZORPAY BILLING ---
@@ -105,6 +112,7 @@ class Settings:
             database_url=database_url,
             admin_telegram_ids=admin_telegram_ids,
             update_channel_username=update_channel_username,
+            dummy_storage_channel=dummy_storage_channel,
             razorpay_key_id=razorpay_key_id,
             razorpay_key_secret=razorpay_key_secret,
             razorpay_webhook_secret=razorpay_webhook_secret,
