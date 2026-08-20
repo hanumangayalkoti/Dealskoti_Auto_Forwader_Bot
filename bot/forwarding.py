@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 from contextlib import suppress
 from datetime import datetime, timezone
 
@@ -38,8 +39,6 @@ class ForwardingEngine:
                 before = len(self.clients)
                 await self.refresh_user(user_id)
                 if len(self.clients) == before and await self.db.has_active_session(user_id):
-                    # refresh_user refused to register the client, so the stored
-                    # session must be invalid — count it so we log a useful number.
                     bad_sessions += 1
         logger.info(f"Forwarding Engine started. Active clients: {len(self.clients)}. Invalid sessions cleared: {bad_sessions}")
 
@@ -115,8 +114,7 @@ class ForwardingEngine:
             client.remove_event_handlers()
             if client.is_connected():
                 await client.disconnect()
-        # Also drop any edit-map entries belonging to this user so a future
-        # reconnect doesn't accidentally replay edits on stale destinations.
+        # Also drop any edit-map entries belonging to this user
         prefix = f"{user_id}:"
         for k in list(self.edit_map.keys()):
             if k.startswith(prefix):
@@ -129,15 +127,13 @@ class ForwardingEngine:
             await self.refresh_user(int(task["user_id"]))
 
     async def remove_task(self, task_id: int) -> None:
-        """Handled gracefully by refresh_user/refresh_task dynamically checking DB."""
         pass
 
     # --- MESSAGE PROCESSING ENGINE ---
 
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
-        """Applies Blacklist, Replace, Header, and Footer based on user plan."""
+        """Applies Blacklist, Replace, Header, Footer AND NEW Premium filters."""
         if not text:
-            # Even with empty body, header/footer should still be appended for paid plans.
             if plan_name in ["silver", "gold", "platinum"]:
                 header = settings.get("header", "")
                 footer = settings.get("footer", "")
@@ -148,15 +144,20 @@ class ForwardingEngine:
                     return "\n\n".join(parts)
             return text
 
-        # Blacklist/Whitelist is checked before this function.
-        # This function only does replacements and append/prepend.
-
+        # NEW LAYER: Advanced Text Filters (Premium Features)
         if plan_name in ["gold", "platinum"]:
+            if settings.get("remove_links", False):
+                # Removes http/https and standard domains
+                text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+            
+            if settings.get("remove_usernames", False):
+                # Removes @usernames
+                text = re.sub(r'@[a-zA-Z0-9_]+', '', text)
+                
             replacements = settings.get("replace", {})
             if isinstance(replacements, dict):
                 for old_word, new_word in replacements.items():
-                    # Simple case-sensitive replace (could be upgraded to regex if needed)
-                    if old_word:  # safety: skip empty keys
+                    if old_word:  
                         text = text.replace(old_word, new_word)
 
         if plan_name in ["silver", "gold", "platinum"]:
@@ -166,7 +167,13 @@ class ForwardingEngine:
             parts = []
             if header:
                 parts.append(header)
-            parts.append(text)
+            
+            # Mono text conversion layer
+            if settings.get("mono_text", False) and plan_name in ["gold", "platinum"]:
+                parts.append(f"`{text}`")
+            else:
+                parts.append(text)
+                
             if footer:
                 parts.append(footer)
 
@@ -198,7 +205,6 @@ class ForwardingEngine:
             if task["is_paused"]:
                 continue
 
-            # Check if this chat is a source for this task
             sources = json.loads(task["sources"] or "[]")
             source_ids = [s.get("id") for s in sources if isinstance(s, dict)]
             if chat_id not in source_ids:
@@ -207,8 +213,6 @@ class ForwardingEngine:
             settings = json.loads(task["settings"] or "{}")
 
             # --- FILTERS ---
-
-            # Sender Filter (Platinum) — apply safely; None sender cannot match
             if plan_name == "platinum":
                 allowed_senders = settings.get("user_filter", [])
                 if allowed_senders:
@@ -216,7 +220,6 @@ class ForwardingEngine:
                     if sender is None or sender not in allowed_senders:
                         continue
 
-            # Blacklist & Whitelist (Gold, Platinum)
             raw_text = (message.raw_text or "").lower()
             if plan_name in ["gold", "platinum"]:
                 whitelist = settings.get("whitelist", [])
@@ -232,7 +235,7 @@ class ForwardingEngine:
             if not destinations:
                 continue
 
-            # --- WATERMARK (Platinum) — build media file if enabled ---
+            # --- WATERMARK (Platinum) ---
             watermark_text = ""
             media_file = message.media
             if plan_name == "platinum" and settings.get("watermark", False):
@@ -242,7 +245,7 @@ class ForwardingEngine:
                         client, message, watermark_text, max_image_bytes=10 * 1024 * 1024
                     )
                     if watermarked:
-                        media_file = watermarked  # bytes are accepted by send_message(file=...)
+                        media_file = watermarked  
 
             sent_tracking = []
 
@@ -250,29 +253,29 @@ class ForwardingEngine:
                 dest_id = dest.get("id")
                 if not dest_id: continue
 
-                # Reserve quota atomically before sending so concurrent events
-                # cannot all pass the same daily usage check.
                 if not await self.db.try_reserve_usage(user_id, plan.daily_messages or 0):
                     break
 
                 sent_msg = None
                 try:
                     async with self._send_semaphore:
-                        # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
                         if plan_name == "free":
                             sent_msg = await client.forward_messages(dest_id, message)
                         else:
-                            # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
                             base_text = message.message or ""
                             if plan_name == "platinum" and watermark_text and not message.media:
-                                # text watermark only when there's no image watermark to draw
                                 base_text = self._apply_text_watermark(base_text, watermark_text)
+                                
                             new_text = self._clean_text(base_text, settings, plan_name)
+                            
+                            # NEW: Respect user's URL Preview setting
+                            use_preview = settings.get("url_preview", bool(message.web_preview))
+                            
                             sent_msg = await client.send_message(
                                 dest_id,
                                 message=new_text,
                                 file=media_file,
-                                link_preview=bool(message.web_preview),
+                                link_preview=use_preview,
                             )
                 except Exception as e:
                     logger.warning(f"Task {task['id']} failed to send to {dest_id} for user {user_id}: {e}")
@@ -285,16 +288,13 @@ class ForwardingEngine:
                     if plan_name == "platinum" and auto_delete_secs > 0:
                         asyncio.create_task(self._auto_delete(client, dest_id, sent_msg.id, auto_delete_secs))
 
-            # Save to Edit Sync Map (Platinum) — store task_id so edit applies correct settings
             if plan_name == "platinum" and settings.get("edit_sync", False) and sent_tracking:
                 map_key = f"{user_id}:{chat_id}:{message.id}"
                 self.edit_map[map_key] = {
                     "task_id": task["id"],
                     "dests": sent_tracking,
                 }
-                # Cap the map size to avoid memory leaks on long-running bots
                 if len(self.edit_map) > 5000:
-                    # Drop oldest half (dict preserves insertion order in CPython 3.7+)
                     for k in list(self.edit_map.keys())[:2500]:
                         self.edit_map.pop(k, None)
 
@@ -317,7 +317,6 @@ class ForwardingEngine:
         if not client:
             return
 
-        # Use the EXACT task whose settings were applied at forward-time
         task = await self.db.get_task(entry["task_id"])
         if not task or int(task["user_id"]) != user_id:
             return
@@ -332,9 +331,12 @@ class ForwardingEngine:
             base_text = self._apply_text_watermark(base_text, watermark_text)
         new_text = self._clean_text(base_text, settings, "platinum")
 
+        # Edit preview logic
+        use_preview = settings.get("url_preview", bool(message.web_preview))
+
         for dest_id, dest_msg_id in entry["dests"]:
             try:
-                await client.edit_message(dest_id, dest_msg_id, text=new_text)
+                await client.edit_message(dest_id, dest_msg_id, text=new_text, link_preview=use_preview)
             except Exception as e:
                 logger.debug(f"Failed to edit synced message {dest_msg_id} in {dest_id}: {e}")
 
@@ -348,7 +350,6 @@ class ForwardingEngine:
     # --- WATERMARK ENGINE (Platinum only) ---
 
     def _apply_text_watermark(self, text: str, watermark_text: str) -> str:
-        """Append a subtle watermark line to text content. Platinum-only feature."""
         if not text:
             return watermark_text
         return f"{text}\n\n— {watermark_text}"
@@ -360,15 +361,12 @@ class ForwardingEngine:
         watermark_text: str,
         max_image_bytes: int,
     ) -> bytes | None:
-        """Download a photo, draw watermark on bottom-right, return PNG bytes.
-        Returns None if the message has no downloadable photo or processing fails."""
         try:
             from PIL import Image, ImageDraw, ImageFont
         except ImportError:
             logger.warning("Pillow not available; skipping image watermark")
             return None
 
-        # Try to get the largest available photo
         try:
             photo_bytes = await client.download_media(
                 message.media,
@@ -388,11 +386,9 @@ class ForwardingEngine:
             logger.debug(f"Could not decode source image: {e}")
             return None
 
-        # Create a transparent overlay for the watermark
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        # Choose font size proportional to image height (capped)
         font_size = max(14, min(48, img.size[1] // 20))
         font = None
         for font_path in (
@@ -409,7 +405,6 @@ class ForwardingEngine:
         if font is None:
             font = ImageFont.load_default()
 
-        # Measure text and place a semi-transparent black pill behind it for legibility
         bbox = draw.textbbox((0, 0), watermark_text, font=font)
         text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         padding = 8
@@ -419,13 +414,11 @@ class ForwardingEngine:
         pill_x = img.size[0] - pill_w - margin
         pill_y = img.size[1] - pill_h - margin
 
-        # Draw rounded background pill
         draw.rounded_rectangle(
             [(pill_x, pill_y), (pill_x + pill_w, pill_y + pill_h)],
             radius=8,
             fill=(0, 0, 0, 140),
         )
-        # Draw white text on top
         draw.text(
             (pill_x + padding, pill_y + padding - bbox[1]),
             watermark_text,
