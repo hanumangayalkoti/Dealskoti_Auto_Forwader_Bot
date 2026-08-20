@@ -147,8 +147,14 @@ class TelethonService:
         session_string = await self._get_session_string(user_id)
         if not session_string:
             raise ValueError("Your Telegram account is not connected. Please use /connect first.")
-            
-        client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+
+        try:
+            client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+        except (ValueError, TypeError) as exc:
+            # Session corrupt — wipe it so the user can /connect again.
+            logger.warning(f"Invalid stored session for user {user_id}: {exc}")
+            await self.disconnect(user_id)
+            raise ValueError("Your stored Telegram session is invalid. Please /connect again.")
         
         try:
             await client.connect()
