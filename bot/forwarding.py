@@ -19,7 +19,8 @@ class ForwardingEngine:
     def __init__(self, db: Database, telethon: TelethonService, max_concurrent_tasks: int = 100):
         self.db = db
         self.telethon = telethon
-        self.max_concurrent = max_concurrent_tasks
+        self.max_concurrent = max(1, max_concurrent_tasks)
+        self._send_semaphore = asyncio.Semaphore(self.max_concurrent)
         
         # In-memory stores
         self.clients: dict[int, TelegramClient] = {}  # user_id -> TelegramClient
@@ -226,12 +227,6 @@ class ForwardingEngine:
                 if blacklist and any(b.lower() in raw_text for b in blacklist):
                     continue
 
-            # --- LIMITS ---
-            usage = await self.db.daily_usage(user_id)
-            if plan.daily_messages and usage >= plan.daily_messages:
-                # Quota exceeded, ignore silently to prevent spam
-                continue
-
             # --- FORWARDING ACTIONS ---
             destinations = json.loads(task["destinations"] or "[]")
             if not destinations:
@@ -255,32 +250,36 @@ class ForwardingEngine:
                 dest_id = dest.get("id")
                 if not dest_id: continue
 
+                # Reserve quota atomically before sending so concurrent events
+                # cannot all pass the same daily usage check.
+                if not await self.db.try_reserve_usage(user_id, plan.daily_messages or 0):
+                    break
+
                 sent_msg = None
                 try:
-                    # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
-                    if plan_name == "free":
-                        sent_msg = await client.forward_messages(dest_id, message)
-                    else:
-                        # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
-                        base_text = message.message or ""
-                        if plan_name == "platinum" and watermark_text and not message.media:
-                            # text watermark only when there's no image watermark to draw
-                            base_text = self._apply_text_watermark(base_text, watermark_text)
-                        new_text = self._clean_text(base_text, settings, plan_name)
-                        sent_msg = await client.send_message(
-                            dest_id,
-                            message=new_text,
-                            file=media_file,
-                            link_preview=bool(message.web_preview),
-                        )
+                    async with self._send_semaphore:
+                        # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
+                        if plan_name == "free":
+                            sent_msg = await client.forward_messages(dest_id, message)
+                        else:
+                            # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
+                            base_text = message.message or ""
+                            if plan_name == "platinum" and watermark_text and not message.media:
+                                # text watermark only when there's no image watermark to draw
+                                base_text = self._apply_text_watermark(base_text, watermark_text)
+                            new_text = self._clean_text(base_text, settings, plan_name)
+                            sent_msg = await client.send_message(
+                                dest_id,
+                                message=new_text,
+                                file=media_file,
+                                link_preview=bool(message.web_preview),
+                            )
                 except Exception as e:
                     logger.warning(f"Task {task['id']} failed to send to {dest_id} for user {user_id}: {e}")
                     continue
 
                 if sent_msg:
                     sent_tracking.append((dest_id, sent_msg.id))
-                    # Only count usage on SUCCESS — failed sends do not consume quota
-                    await self.db.increment_usage(user_id)
                     # Auto-Delete (Platinum)
                     auto_delete_secs = settings.get("auto_delete_seconds", 0)
                     if plan_name == "platinum" and auto_delete_secs > 0:
