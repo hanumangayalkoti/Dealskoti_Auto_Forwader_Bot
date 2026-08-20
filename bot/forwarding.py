@@ -30,11 +30,17 @@ class ForwardingEngine:
         """Starts the forwarding engine and connects all valid users."""
         self._running = True
         users = await self.db.list_users(limit=10000)
+        bad_sessions = 0
         for user in users:
             user_id = int(user["telegram_user_id"])
             if not user["is_blocked"]:
+                before = len(self.clients)
                 await self.refresh_user(user_id)
-        logger.info(f"Forwarding Engine started. Active clients: {len(self.clients)}")
+                if len(self.clients) == before and await self.db.has_active_session(user_id):
+                    # refresh_user refused to register the client, so the stored
+                    # session must be invalid — count it so we log a useful number.
+                    bad_sessions += 1
+        logger.info(f"Forwarding Engine started. Active clients: {len(self.clients)}. Invalid sessions cleared: {bad_sessions}")
 
     async def stop(self) -> None:
         """Stops the engine and safely disconnects all clients."""
@@ -65,12 +71,23 @@ class ForwardingEngine:
         if not session_string:
             return
 
-        client = TelegramClient(StringSession(session_string), self.telethon.api_id, self.telethon.api_hash)
+        try:
+            client = TelegramClient(StringSession(session_string), self.telethon.api_id, self.telethon.api_hash)
+        except (ValueError, TypeError) as exc:
+            # Corrupted / not-a-valid-string session — nuke it so user has to /connect again.
+            logger.warning(f"Dropping invalid session for user {user_id}: {exc}")
+            try:
+                await self.telethon.disconnect(user_id)
+            except Exception:
+                pass
+            return
 
         try:
             await client.connect()
             if not await client.is_user_authorized():
                 await self.telethon.disconnect(user_id)
+                if client.is_connected():
+                    await client.disconnect()
                 return
 
             # Register Event Handlers with weak refs so duplicates from refresh never stack
