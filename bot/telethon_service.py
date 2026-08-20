@@ -6,7 +6,6 @@ from telethon.sessions import StringSession
 
 from .config import Settings
 from .db import Database
-from .security import SessionCrypto
 
 logger = logging.getLogger("dealskoti.telethon")
 
@@ -15,7 +14,6 @@ class TelethonService:
         self.api_id = settings.telegram_api_id
         self.api_hash = settings.telegram_api_hash
         self.db = db
-        self.crypto = SessionCrypto(settings.session_encryption_key)
         # Stores temporary login states: {user_id: {"client": TelegramClient, "phone": str, "phone_code_hash": str}}
         self.login_clients: dict[int, dict] = {}
 
@@ -24,7 +22,6 @@ class TelethonService:
     async def _save_session(self, user_id: int, session_string: str) -> None:
         if self.db.pool is None:
             raise RuntimeError("Database not connected")
-        encrypted = self.crypto.encrypt(session_string)
         async with self.db.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -33,7 +30,7 @@ class TelethonService:
                 ON CONFLICT (user_id) DO UPDATE 
                 SET session_string = EXCLUDED.session_string, updated_at = CURRENT_TIMESTAMP
                 """,
-                user_id, encrypted
+                user_id, session_string
             )
 
     async def _delete_session(self, user_id: int) -> None:
@@ -46,17 +43,7 @@ class TelethonService:
         if self.db.pool is None:
             return None
         async with self.db.pool.acquire() as conn:
-            stored = await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
-        if not stored:
-            return None
-        try:
-            return self.crypto.decrypt(stored)
-        except ValueError:
-            # Backward-compat: a row saved before encryption was wired up.
-            # Use it as-is this once, then re-encrypt it immediately.
-            logger.warning("Session for user %s was stored unencrypted; re-encrypting now.", user_id)
-            await self._save_session(user_id, stored)
-            return stored
+            return await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
 
     # --- LOGIN FLOW ---
 
@@ -88,44 +75,52 @@ class TelethonService:
         login_data = self.login_clients.get(user_id)
         if not login_data:
             raise ValueError("Login session expired or not found. Please start over.")
-            
+
         client: TelegramClient = login_data["client"]
         phone = login_data["phone"]
         phone_code_hash = login_data["phone_code_hash"]
-        
+
         try:
             await client.sign_in(phone=phone, code=pin, phone_code_hash=phone_code_hash)
             session_string = client.session.save()
             await self._save_session(user_id, session_string)
-            await self.cancel_login(user_id)  # Clean up temp client memory
+            # Keep client alive until 2FA step if needed; cleanup happens via
+            # submit_2fa() on success or cancel_login() on failure.
             return "success"
         except errors.SessionPasswordNeededError:
+            # DON'T cancel login — keep client around so we can submit 2FA next.
             return "2fa_required"
         except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):
+            # Bad/expired OTP → kill the in-memory client so user must restart.
+            await self.cancel_login(user_id)
             raise ValueError("Invalid or expired PIN. Please try again or restart login.")
         except Exception as e:
             logger.error(f"Error submitting PIN for {user_id}: {e}")
+            await self.cancel_login(user_id)
             raise ValueError("An unexpected error occurred. Please try again.")
 
     async def submit_2fa(self, user_id: int, password: str) -> str:
         login_data = self.login_clients.get(user_id)
         if not login_data:
             raise ValueError("Login session expired or not found. Please start over.")
-            
+
         client: TelegramClient = login_data["client"]
-        
+
         try:
             await client.sign_in(password=password)
             session_string = client.session.save()
             await self._save_session(user_id, session_string)
-            await self.cancel_login(user_id)  # Clean up memory
+            await self.cancel_login(user_id)  # Clean up memory only on success
             return "success"
         except errors.PasswordHashInvalidError:
+            # Keep client alive so user can retry the password — DO NOT cancel_login.
             raise ValueError("Incorrect 2FA password. Please try again.")
         except errors.FloodWaitError as e:
+            await self.cancel_login(user_id)
             raise ValueError(f"Too many attempts. Try again in {e.seconds} seconds.")
         except Exception as e:
             logger.error(f"Error submitting 2FA for {user_id}: {e}")
+            await self.cancel_login(user_id)
             raise ValueError("An unexpected error occurred. Please try again.")
 
     async def cancel_login(self, user_id: int) -> None:
