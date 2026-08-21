@@ -1,13 +1,18 @@
 import logging
 from contextlib import suppress
 
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, utils
 from telethon.sessions import StringSession
 
 from .config import Settings
 from .db import Database
+from .security import SessionCrypto
 
 logger = logging.getLogger("dealskoti.telethon")
+
+
+class SessionExpired(ValueError):
+    """The stored Telethon session is no longer usable — the user must /connect again."""
 
 class TelethonService:
     def __init__(self, settings: Settings, db: Database):
@@ -16,8 +21,36 @@ class TelethonService:
         self.db = db
         # Stores temporary login states: {user_id: {"client": TelegramClient, "phone": str, "phone_code_hash": str}}
         self.login_clients: dict[int, dict] = {}
+        # Optional at-rest encryption for session strings.
+        self._crypto: SessionCrypto | None = None
+        if settings.session_encryption_key:
+            try:
+                self._crypto = SessionCrypto(settings.session_encryption_key)
+            except ValueError as exc:
+                logger.error("Session encryption disabled: %s", exc)
 
     # --- DATABASE SESSION HELPERS ---
+
+    def _encode_session(self, session_string: str) -> str:
+        if self._crypto is None:
+            return session_string
+        return f"enc:{self._crypto.encrypt(session_string)}"
+
+    def _decode_session(self, stored: str | None) -> str | None:
+        """Reads a stored session. Rows written before encryption was enabled are
+        still plaintext, so only the `enc:` prefix is decrypted."""
+        if not stored:
+            return None
+        if not stored.startswith("enc:"):
+            return stored
+        if self._crypto is None:
+            logger.error("Encrypted session found but SESSION_ENCRYPTION_KEY is not set")
+            return None
+        try:
+            return self._crypto.decrypt(stored[4:])
+        except ValueError as exc:
+            logger.error("Could not decrypt stored session: %s", exc)
+            return None
 
     async def _save_session(self, user_id: int, session_string: str) -> None:
         if self.db.pool is None:
@@ -25,12 +58,12 @@ class TelethonService:
         async with self.db.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO sessions (user_id, session_string) 
-                VALUES ($1, $2) 
-                ON CONFLICT (user_id) DO UPDATE 
+                INSERT INTO sessions (user_id, session_string)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE
                 SET session_string = EXCLUDED.session_string, updated_at = CURRENT_TIMESTAMP
                 """,
-                user_id, session_string
+                user_id, self._encode_session(session_string)
             )
 
     async def _delete_session(self, user_id: int) -> None:
@@ -43,7 +76,8 @@ class TelethonService:
         if self.db.pool is None:
             return None
         async with self.db.pool.acquire() as conn:
-            return await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
+            stored = await conn.fetchval("SELECT session_string FROM sessions WHERE user_id = $1", user_id)
+        return self._decode_session(stored)
 
     # --- LOGIN FLOW ---
 
@@ -160,29 +194,53 @@ class TelethonService:
             await client.connect()
             if not await client.is_user_authorized():
                 await self.disconnect(user_id)
-                raise ValueError("Session expired. Please use /connect to login again.")
-                
+                raise SessionExpired("Session expired. Please use /connect to login again.")
+
             # If target looks like a negative or positive ID, treat it as int
             target_clean = target.strip()
             if target_clean.lstrip("-").isdigit():
-                target_obj = int(target_clean)
+                target_obj: object = int(target_clean)
             else:
-                target_obj = target_clean
+                target_obj = target_clean.lstrip("@") or target_clean
 
-            entity = await client.get_entity(target_obj)
-            
+            try:
+                entity = await client.get_entity(target_obj)
+            except (ValueError, TypeError) as exc:
+                # Telethon raises ValueError for "no user has X as username" and
+                # for un-cached ids; retry after a dialog sweep before giving up.
+                logger.info(f"Direct entity lookup failed for '{target}': {exc}")
+                entity = None
+                with suppress(Exception):
+                    async for dialog in client.iter_dialogs(limit=200):
+                        ent = dialog.entity
+                        if isinstance(target_obj, int):
+                            if getattr(ent, "id", None) == abs(target_obj) or utils.get_peer_id(ent) == target_obj:
+                                entity = ent
+                                break
+                        else:
+                            uname = (getattr(ent, "username", None) or "").lower()
+                            if uname and uname == str(target_obj).lower():
+                                entity = ent
+                                break
+                if entity is None:
+                    raise ValueError(
+                        "Could not find this chat. Make sure your account is a member of it, "
+                        "or forward any message from that chat to me instead."
+                    )
+
             # Extract safe title
             title = getattr(entity, 'title', getattr(entity, 'username', getattr(entity, 'first_name', str(entity.id))))
-            
+
             return {
                 "id": entity.id,
                 "title": title,
                 "access_hash": getattr(entity, 'access_hash', None),
+                "username": getattr(entity, 'username', None),
                 "type": type(entity).__name__
             }
-            
-        except ValueError:
-            raise ValueError("Could not find this chat. Make sure you are a member of it, or use a valid public username.")
+
+        except (SessionExpired, ValueError):
+            raise
         except errors.FloodWaitError as e:
             raise ValueError(f"Telegram is limiting requests. Try again in {e.seconds} seconds.")
         except Exception as e:
