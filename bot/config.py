@@ -41,6 +41,10 @@ class Settings:
     file_storage_channel_id: int | None = None
     max_file_size_mb: int = 2000
 
+    # Optional Fernet key used to encrypt Telethon session strings at rest.
+    # When empty, sessions are stored as-is (backwards compatible).
+    session_encryption_key: str = ""
+
     @classmethod
     def from_env(cls) -> Settings:
         """
@@ -116,6 +120,9 @@ class Settings:
         except ValueError:
             max_file_size_mb = 2000
 
+        # --- SESSION ENCRYPTION (OPTIONAL BUT RECOMMENDED) ---
+        session_encryption_key = get_env("SESSION_ENCRYPTION_KEY", required=False) or ""
+
         return cls(
             telegram_bot_token=telegram_bot_token,
             telegram_api_id=telegram_api_id,
@@ -131,4 +138,9 @@ class Settings:
             log_level=log_level,
             default_timezone=default_timezone,
             max_concurrent_forward_tasks=max_tasks,
+            usdt_wallet_address=usdt_wallet_address,
+            usdt_network=usdt_network,
+            file_storage_channel_id=file_storage_channel_id,
+            max_file_size_mb=max_file_size_mb,
+            session_encryption_key=session_encryption_key,
         )
