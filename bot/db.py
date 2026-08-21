@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -107,6 +109,10 @@ CREATE TABLE IF NOT EXISTS referrals (
     is_paid BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Older deployments created this table before the `id` column existed on it.
+-- Adding it here (idempotently) fixes "column id does not exist" on /referralpayout.
+ALTER TABLE referrals ADD COLUMN IF NOT EXISTS id SERIAL;
 
 CREATE TABLE IF NOT EXISTS usdt_payments (
     id SERIAL PRIMARY KEY,
@@ -355,6 +361,16 @@ class Database:
                 limit,
             )
 
+    async def list_users_by_ids(self, user_ids: list[int]) -> list[asyncpg.Record]:
+        """Used by the admin 'Select Users' broadcast flow to resolve the final
+        picked telegram_user_ids into broadcastable rows."""
+        if self.pool is None or not user_ids: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT telegram_user_id FROM users WHERE telegram_user_id = ANY($1::bigint[]) AND is_blocked = FALSE",
+                list(user_ids),
+            )
+
     # --- USDT MANUAL PAYMENTS ---
 
     async def create_usdt_request(self, user_id: int, plan: str, cycle: str, amount_usd: float, txid: str) -> int:
@@ -384,6 +400,13 @@ class Database:
     async def save_stored_file(self, user_id: int, file_name: str, extension: str, file_size: int, local_path: str | None, channel_message_id: int | None, telegram_file_id: str | None) -> int:
         if self.pool is None: raise RuntimeError("DB Error")
         async with self.pool.acquire() as conn:
+            # A user can only have ONE stored file. Before replacing the DB row,
+            # remove the old file from disk too, so replaced uploads don't pile up.
+            old = await conn.fetchrow("SELECT local_path FROM stored_files WHERE user_id = $1", user_id)
+            if old and old["local_path"]:
+                with suppress(Exception):
+                    if os.path.exists(old["local_path"]):
+                        os.remove(old["local_path"])
             await conn.execute("DELETE FROM stored_files WHERE user_id = $1", user_id)
             return await conn.fetchval(
                 """INSERT INTO stored_files (user_id, file_name, extension, file_size, local_path, channel_message_id, telegram_file_id)
@@ -534,7 +557,13 @@ class Database:
             if not user: return False
             base_time = user["plan_expiry"] if user["plan_expiry"] and user["plan_expiry"] > now else now
             new_expiry = base_time + timedelta(days=days)
-            res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
+            # Also clear any scheduled downgrade — an admin setting the plan directly
+            # should win outright, not get silently overwritten by a stale schedule
+            # on the next expiry cron run.
+            res = await conn.execute(
+                "UPDATE users SET plan = $1, plan_expiry = $2, scheduled_plan = NULL, scheduled_days = NULL WHERE telegram_user_id = $3",
+                plan, new_expiry, user_id,
+            )
             return res == "UPDATE 1"
 
     async def stats(self) -> dict[str, Any]:
