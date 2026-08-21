@@ -27,15 +27,19 @@ class Settings:
     razorpay_key_secret: str
     razorpay_webhook_secret: str
     razorpay_webhook_path: str
-    session_encryption_key: str
-    
-    # NEW: Dummy channel for storing user APKs/Files
-    dummy_storage_channel: str
     
     support_bot_link: str | None = None
     log_level: str = "INFO"
     default_timezone: str = "Asia/Kolkata"
     max_concurrent_forward_tasks: int = 100
+
+    # USDT manual payments (optional — if wallet empty, USDT option is hidden)
+    usdt_wallet_address: str = ""
+    usdt_network: str = "TRC20"
+
+    # Platinum file-upload storage
+    file_storage_channel_id: int | None = None
+    max_file_size_mb: int = 2000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -76,10 +80,6 @@ class Settings:
         if not update_channel_username.startswith("@"):
             update_channel_username = f"@{update_channel_username}"
             
-        dummy_storage_channel = get_env("DUMMY_STORAGE_CHANNEL", default=update_channel_username, required=False)
-        if dummy_storage_channel and not dummy_storage_channel.startswith("@") and not dummy_storage_channel.startswith("-100"):
-            dummy_storage_channel = f"@{dummy_storage_channel}"
-            
         support_bot_link = get_env("SUPPORT_BOT_LINK", required=False) or None
 
         # --- RAZORPAY BILLING ---
@@ -89,9 +89,6 @@ class Settings:
         razorpay_webhook_path = get_env("RAZORPAY_WEBHOOK_PATH", default="/webhooks/razorpay", required=False)
         if not razorpay_webhook_path.startswith("/"):
             razorpay_webhook_path = f"/{razorpay_webhook_path}"
-
-        # --- SESSION ENCRYPTION ---
-        session_encryption_key = get_env("SESSION_ENCRYPTION_KEY")
 
         # --- MISC & OPTIONAL ---
         log_level = get_env("LOG_LEVEL", default="INFO", required=False).upper()
@@ -105,6 +102,20 @@ class Settings:
         except ValueError:
             max_tasks = 100
 
+        # --- USDT MANUAL PAYMENTS (OPTIONAL) ---
+        usdt_wallet_address = get_env("USDT_WALLET_ADDRESS", required=False) or ""
+        usdt_network = get_env("USDT_NETWORK", default="TRC20", required=False) or "TRC20"
+
+        # --- FILE STORAGE (PLATINUM /upload_file) ---
+        file_storage_channel_id: int | None = None
+        fs_raw = get_env("FILE_STORAGE_CHANNEL_ID", required=False) or ""
+        if fs_raw.lstrip("-").isdigit():
+            file_storage_channel_id = int(fs_raw)
+        try:
+            max_file_size_mb = int(get_env("MAX_FILE_SIZE_MB", default="2000", required=False))
+        except ValueError:
+            max_file_size_mb = 2000
+
         return cls(
             telegram_bot_token=telegram_bot_token,
             telegram_api_id=telegram_api_id,
@@ -112,12 +123,10 @@ class Settings:
             database_url=database_url,
             admin_telegram_ids=admin_telegram_ids,
             update_channel_username=update_channel_username,
-            dummy_storage_channel=dummy_storage_channel,
             razorpay_key_id=razorpay_key_id,
             razorpay_key_secret=razorpay_key_secret,
             razorpay_webhook_secret=razorpay_webhook_secret,
             razorpay_webhook_path=razorpay_webhook_path,
-            session_encryption_key=session_encryption_key,
             support_bot_link=support_bot_link,
             log_level=log_level,
             default_timezone=default_timezone,
