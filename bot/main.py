@@ -125,7 +125,8 @@ def safe_html(text: str) -> str:
 def safe_t(lang: str, key: str, **kwargs) -> str:
     try:
         return t(lang, key, **kwargs)
-    except KeyError:
+    except Exception:
+        logger.warning("Missing translation key %r for language %r", key, lang)
         return f"[{key}]"
 
 async def _menu_text(db: Database, user_id: int, language: str) -> str:
@@ -618,13 +619,44 @@ async def faq_collapse(callback: CallbackQuery, db: Database) -> None:
 # MAIN MENU NAVIGATION
 # ==========================================
 
+@router.callback_query(F.data == "gate:check")
+async def gate_check(callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine) -> None:
+    """Handles the "I've Joined" button on the force-join prompt."""
+    language = await _language_for_callback(db, callback)
+    user_id = callback.from_user.id
+    is_member = await user_is_member(callback.bot, settings, user_id)
+    await db.set_membership(user_id, is_member)
+
+    if not is_member:
+        await callback.answer(
+            "You have not joined yet. Please join the channel first, then tap again."
+            if language == "en" else
+            "Aap ne abhi join nahi kiya. Pehle channel join karein, phir dobara dabayein.",
+            show_alert=True,
+        )
+        return
+
+    # Membership restored — bring paused tasks back and reload the engine.
+    with suppress(Exception):
+        await db.resume_channel_gate_tasks(user_id)
+    with suppress(Exception):
+        await forwarding.refresh_user(user_id)
+
+    await callback.answer("Verified ✅", show_alert=False)
+    if callback.message is not None:
+        await _safe_edit(
+            callback.message,
+            await _menu_text(db, user_id, language),
+            main_menu_keyboard(settings),
+        )
+
 @router.callback_query(F.data == "menu:home")
 async def menu_home(callback: CallbackQuery, db: Database, settings: Settings, state: FSMContext) -> None:
     await state.clear()
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
     if await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
-        await callback.message.edit_text(await _menu_text(db, callback.from_user.id, language), reply_markup=main_menu_keyboard(settings))
+        await _safe_edit(callback.message, await _menu_text(db, callback.from_user.id, language), main_menu_keyboard(settings))
     await callback.answer()
 
 @router.callback_query(F.data == "flow:cancel")
@@ -632,7 +664,7 @@ async def cancel_flow(callback: CallbackQuery, state: FSMContext, db: Database, 
     await state.clear()
     language = await _language_for_callback(db, callback)
     if callback.message:
-        await callback.message.edit_text(await _menu_text(db, callback.from_user.id, language), reply_markup=main_menu_keyboard(settings))
+        await _safe_edit(callback.message, await _menu_text(db, callback.from_user.id, language), main_menu_keyboard(settings))
     await callback.answer("Cancelled", show_alert=False)
 
 # ==========================================
@@ -887,23 +919,33 @@ async def billing_cycle(callback: CallbackQuery, db: Database) -> None:
 @router.callback_query(F.data.startswith("payment:confirm:"))
 async def confirm_payment(callback: CallbackQuery, db: Database, billing: RazorpayBilling, settings: Settings) -> None:
     if callback.message is None: return
-    _, _, plan_name, cycle = callback.data.split(":")
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        return await callback.answer("Invalid option", show_alert=True)
+    plan_name, cycle = parts[2], parts[3]
     language = await _language_for_callback(db, callback)
+    if plan_name not in PLANS or plan_name == "free" or cycle not in {"weekly", "monthly", "yearly"}:
+        return await callback.answer("Invalid option", show_alert=True)
     if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language): return
     first_order = not await db.has_paid_order(callback.from_user.id)
     original, discount, payable = payable_amount_paise(plan_name, cycle, first_paid_order=first_order)
+    if payable <= 0:
+        return await callback.answer("Invalid option", show_alert=True)
     unique_suffix = uuid4().hex[:10]
     try:
         link = await billing.create_payment_link(amount_paise=payable, receipt=f"dk_{callback.from_user.id}_{plan_name}_{cycle}_{unique_suffix}", plan=plan_name, cycle=cycle, user_id=callback.from_user.id)
         await db.save_payment(callback.from_user.id, link.link_id, plan_name, cycle, original, discount, payable)
-    except BillingError:
-        return await callback.answer(safe_t(language, "payment_failed"), show_alert=True)
-    
-    await callback.message.edit_text(
+    except BillingError as exc:
+        logger.warning("Payment link creation failed for %s: %s", callback.from_user.id, exc)
+        return await callback.answer(f"{safe_t(language, 'payment_failed')}\n\n{exc}"[:200], show_alert=True)
+
+    await _safe_edit(
+        callback.message,
         safe_t(language, "payment_link", plan=PLANS[plan_name].name, cycle=cycle.title(), amount=format_paise(payable)),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Pay Now", url=link.short_url)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
     )
     await callback.answer()
@@ -915,36 +957,46 @@ async def confirm_payment(callback: CallbackQuery, db: Database, billing: Razorp
 @router.callback_query(F.data.startswith("payusdt:"))
 async def payusdt_start(callback: CallbackQuery, db: Database, settings: Settings) -> None:
     if callback.message is None: return
-    _, plan_name, cycle = callback.data.split(":")
-    if plan_name not in PLANS or cycle not in {"weekly", "monthly", "yearly"}:
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        return await callback.answer("Invalid option", show_alert=True)
+    plan_name, cycle = parts[1], parts[2]
+    if plan_name not in PLANS or plan_name == "free" or cycle not in {"weekly", "monthly", "yearly"}:
         return await callback.answer("Invalid option", show_alert=True)
     language = await _language_for_callback(db, callback)
     if not settings.usdt_wallet_address:
         return await callback.answer(safe_t(language, "usdt_unavailable"), show_alert=True)
     amount = usdt_amount_usd(plan_name, cycle)
-    await callback.message.edit_text(
+    await _safe_edit(
+        callback.message,
         safe_t(language, "usdt_instructions",
                plan=PLANS[plan_name].name, cycle=cycle.title(), amount=amount,
                network=safe_html(settings.usdt_network), wallet=safe_html(settings.usdt_wallet_address)),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=safe_t(language, "usdt_paid_btn"), callback_data=f"payusdt:txid:{plan_name}:{cycle}")],
+        InlineKeyboardMarkup(inline_keyboard=[
+            # Distinct prefix so this never collides with the "payusdt:" filter above.
+            [InlineKeyboardButton(text=safe_t(language, "usdt_paid_btn"), callback_data=f"usdttxid:{plan_name}:{cycle}")],
             [InlineKeyboardButton(text="◀️ Back", callback_data=f"plan:{plan_name}")],
             [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
-        parse_mode="HTML",
     )
     await callback.answer()
 
-@router.callback_query(F.data.startswith("payusdt:txid:"))
+@router.callback_query(F.data.startswith("usdttxid:"))
 async def payusdt_txid_prompt(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     if callback.message is None: return
-    _, _, plan_name, cycle = callback.data.split(":")
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        return await callback.answer("Invalid option", show_alert=True)
+    plan_name, cycle = parts[1], parts[2]
+    if plan_name not in PLANS or cycle not in {"weekly", "monthly", "yearly"}:
+        return await callback.answer("Invalid option", show_alert=True)
     language = await _language_for_callback(db, callback)
     await state.set_state(UsdtStates.waiting_txid)
     await state.update_data(usdt_plan=plan_name, usdt_cycle=cycle)
-    await callback.message.edit_text(
+    await _safe_edit(
+        callback.message,
         safe_t(language, "usdt_txid_prompt"),
-        reply_markup=_nav_keyboard(back="menu:plans", include_cancel=False),
+        _nav_keyboard(back="menu:plans", include_cancel=True),
     )
     await callback.answer()
 
@@ -988,48 +1040,52 @@ async def payusdt_txid_submit(message: Message, state: FSMContext, db: Database,
             pass
 
 @router.callback_query(F.data.startswith("usdt:approve:") | F.data.startswith("usdt:reject:"))
-async def usdt_review(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+async def usdt_review(callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None: return
     parts = callback.data.split(":")
-    action, request_id_str = parts[1], parts[2]
-    request_id = int(request_id_str)
+    if len(parts) != 3 or not parts[2].isdigit():
+        return await callback.answer("Invalid option", show_alert=True)
+    action, request_id = parts[1], int(parts[2])
     req = await db.get_usdt_request(request_id)
     if not req: return await callback.answer("Not found", show_alert=True)
     if str(req["status"]) != "pending":
         return await callback.answer(f"Already {req['status']}", show_alert=True)
 
-    language = "en"
+    target_user_id = int(req["user_id"])
+    target_user = await db.get_user(target_user_id)
+    language = language_for(target_user["preferred_language"]) if target_user else "en"
+    plan_key = str(req["plan"])
+    plan_label = PLANS[plan_key].name if plan_key in PLANS else plan_key.title()
+
     if action == "approve":
         days = duration_days(str(req["cycle"]))
-        ok = await db.set_plan(int(req["user_id"]), str(req["plan"]), days)
+        ok = await db.set_plan(target_user_id, plan_key, days)
         if not ok: return await callback.answer("Activation failed", show_alert=True)
         await db.set_usdt_status(request_id, "approved", callback.from_user.id)
-        user = await db.get_user(int(req["user_id"]))
+        with suppress(Exception):
+            await forwarding.refresh_user(target_user_id)
+        user = await db.get_user(target_user_id)
         expiry = user["plan_expiry"] if user else None
-        expiry_str = expiry.strftime("%d %b %Y") if expiry else "—"
-        try:
+        expiry_str = expiry.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M %p IST") if expiry else "—"
+        with suppress(Exception):
             await callback.bot.send_message(
-                int(req["user_id"]),
-                safe_t(language, "usdt_approved_user", plan=PLANS[str(req["plan"])].name, days=days, expiry=expiry_str),
+                target_user_id,
+                safe_t(language, "usdt_approved_user", plan=plan_label, days=days, expiry=expiry_str),
                 parse_mode="HTML",
             )
-        except Exception:
-            pass
         with suppress(TelegramBadRequest):
             await callback.message.edit_text((callback.message.html_text or "") + "\n\n✅ APPROVED", reply_markup=None)
         return await callback.answer("Approved & activated")
     else:
         await db.set_usdt_status(request_id, "rejected", callback.from_user.id)
-        try:
+        with suppress(Exception):
             await callback.bot.send_message(
-                int(req["user_id"]),
-                safe_t(language, "usdt_rejected_user", txid=str(req["txid"])),
+                target_user_id,
+                safe_t(language, "usdt_rejected_user", txid=safe_html(str(req["txid"]))),
                 parse_mode="HTML",
             )
-        except Exception:
-            pass
         with suppress(TelegramBadRequest):
             await callback.message.edit_text((callback.message.html_text or "") + "\n\n❌ REJECTED", reply_markup=None)
         return await callback.answer("Rejected")
@@ -1213,10 +1269,13 @@ def _text_or_forwarded_chat_id(message: Message) -> str | None:
     return None
 
 # ==========================================
-# CHANNEL PICKER (TOP-20 RECENT CHATS)
+# CHANNEL PICKER (RECENT CHATS + NUMBER KEYPAD)
 # ==========================================
 
 CHANNEL_INPUT_RE = re.compile(r"^(?:@[\w]{2,64}|https?://t\.me/\S+|t\.me/\S+|-?\d{5,})$", re.IGNORECASE)
+
+PICKER_DIALOG_LIMIT = 30
+PICKER_BUTTONS_PER_ROW = 5
 
 def _picker_field_state(data: dict, field: str) -> tuple[list, list]:
     """Returns (selected_entities, all_dialogs) for 'src' or 'dst'."""
@@ -1224,15 +1283,40 @@ def _picker_field_state(data: dict, field: str) -> tuple[list, list]:
     dialogs = list(data.get("picker_dialogs") or [])
     return selected, dialogs
 
+def _picker_keyboard(dialogs: list, selected_ids: set[int], field: str, language: str) -> InlineKeyboardMarkup:
+    """A numeric keypad — one button per listed chat — so nothing has to be typed.
+    Selected entries are shown with a tick, tapping again deselects."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, d in enumerate(dialogs):
+        try:
+            did = int(d.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        number = idx + 1
+        label = f"✅ {number}" if did in selected_ids else str(number)
+        row.append(InlineKeyboardButton(text=label, callback_data=f"pick:{field}:{number}"))
+        if len(row) == PICKER_BUTTONS_PER_ROW:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text=safe_t(language, "picker_done"), callback_data=f"pick:done:{field}"),
+        InlineKeyboardButton(text=safe_t(language, "picker_refresh"), callback_data=f"pick:refresh:{field}"),
+    ])
+    rows.append([InlineKeyboardButton(text=safe_t(language, "picker_cancel"), callback_data="flow:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 async def _render_chat_picker(message_obj, db: Database, telethon: TelethonService, state: FSMContext,
                               user_id: int, field: str, language: str, *, refresh: bool = False,
                               edit: bool = False) -> None:
-    """Renders the chat selector as a TEXT list (no inline buttons).
-    User replies with a number to select/deselect, /done to confirm."""
+    """Renders the chat selector: a numbered text list plus a tap-to-select number keypad.
+    Typing a number or forwarding a message still works as a fallback."""
     data = await state.get_data()
     selected, dialogs = _picker_field_state(data, field)
     if refresh or not dialogs:
-        dialogs = await telethon.get_top_dialogs(user_id, limit=20)
+        dialogs = await telethon.get_top_dialogs(user_id, limit=PICKER_DIALOG_LIMIT)
         await state.update_data(picker_dialogs=dialogs)
     user = await db.get_user(user_id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
@@ -1256,20 +1340,23 @@ async def _render_chat_picker(message_obj, db: Database, telethon: TelethonServi
     lines.append("")
     lines.append(safe_t(language, "picker_instructions"))
     text = "\n".join(lines)
+    keyboard = _picker_keyboard(dialogs, selected_ids, field, language)
 
     if not dialogs:
         text = safe_t(language, "picker_empty")
+        keyboard = _nav_keyboard(include_cancel=True)
 
     if edit and hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
         try:
-            await message_obj.edit_text(text, parse_mode="HTML")
+            await _safe_edit(message_obj, text, keyboard)
             return
         except TelegramBadRequest:
             pass
-    await message_obj.answer(text, parse_mode="HTML")
+    await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def _picker_toggle_number(message_obj, state: FSMContext, db: Database, telethon: TelethonService,
-                                user_id: int, field: str, language: str, number: int) -> bool:
+                                user_id: int, field: str, language: str, number: int, *,
+                                edit: bool = False) -> bool:
     """Toggles dialog #number (1-based) for 'src'/'dst'. Re-renders the list. Returns True if handled."""
     data = await state.get_data()
     key = "sources" if field == "src" else "destinations"
@@ -1287,13 +1374,126 @@ async def _picker_toggle_number(message_obj, state: FSMContext, db: Database, te
         plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
         limit = plan.sources_per_task if field == "src" else plan.destinations_per_task
         if len(selected) >= limit:
-            label = "sources" if field == "src" else "destinations"
-            await message_obj.answer(f"⚠️ Max {label} reached ({limit}). Send /done to continue.")
+            await message_obj.answer(safe_t(language, "picker_limit_reached", limit=limit), parse_mode="HTML")
             return True
         selected.append(entity)
     await state.update_data({key: selected})
-    await _render_chat_picker(message_obj, db, telethon, state, user_id, field, language)
+    await _render_chat_picker(message_obj, db, telethon, state, user_id, field, language, edit=edit)
     return True
+
+async def _reply_or_edit(message_obj, text: str, keyboard, edit: bool) -> None:
+    """Edits the picker message in place when we came from a button tap, otherwise
+    posts a new message. Keeps a single tidy message instead of a growing chat."""
+    if edit and hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
+        try:
+            await _safe_edit(message_obj, text, keyboard)
+            return
+        except TelegramBadRequest:
+            pass
+    await message_obj.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+async def _finish_sources(message_obj, state: FSMContext, db: Database, telethon: TelethonService,
+                          forwarding: ForwardingEngine, user_id: int, language: str, *,
+                          edit: bool = False) -> str | None:
+    """Confirms the selected sources. Shared by the /done command and the Done button.
+    Returns a short toast string when the caller is a callback, else None."""
+    data = await state.get_data()
+    sources = list(data.get("sources") or [])
+    edit_task_id = data.get("edit_task_id")
+    is_editing = edit_task_id is not None and data.get("edit_field") == "sources"
+    if not sources:
+        if not edit:
+            await message_obj.answer(safe_t(language, "picker_need_source"), parse_mode="HTML")
+        return safe_t(language, "picker_need_source_toast")
+    if is_editing:
+        changed = await db.update_task_sources(user_id, int(edit_task_id), sources)
+        await state.clear()
+        if changed:
+            await forwarding.refresh_task(int(edit_task_id))
+        await _reply_or_edit(
+            message_obj,
+            safe_t(language, "sources_updated") if changed else safe_t(language, "generic_error"),
+            _nav_keyboard(back=f"set:task:{edit_task_id}"), edit,
+        )
+        return None
+    await state.update_data(sources=sources, destinations=[], picker_dialogs=None)
+    await state.set_state(TaskStates.waiting_destination)
+    await _render_chat_picker(message_obj, db, telethon, state, user_id, "dst", language, edit=edit)
+    return None
+
+async def _finish_destinations(message_obj, state: FSMContext, db: Database, telethon: TelethonService,
+                               forwarding: ForwardingEngine, settings: Settings, user_id: int,
+                               language: str, *, edit: bool = False) -> str | None:
+    """Confirms destinations and creates (or updates) the task. Shared by /done and the Done button."""
+    data = await state.get_data()
+    destinations = list(data.get("destinations") or [])
+    edit_task_id = data.get("edit_task_id")
+    is_editing = edit_task_id is not None and data.get("edit_field") == "destinations"
+    if not destinations:
+        if not edit:
+            await message_obj.answer(safe_t(language, "picker_need_destination"), parse_mode="HTML")
+        return safe_t(language, "picker_need_destination_toast")
+    if is_editing:
+        changed = await db.update_task_destinations(user_id, int(edit_task_id), destinations)
+        await state.clear()
+        if changed:
+            await forwarding.refresh_task(int(edit_task_id))
+        await _reply_or_edit(
+            message_obj,
+            safe_t(language, "destinations_updated") if changed else safe_t(language, "generic_error"),
+            _nav_keyboard(back=f"set:task:{edit_task_id}"), edit,
+        )
+        return None
+    task_id = await db.create_task_multi(user_id, str(data.get("task_name") or "Task"),
+                                        list(data.get("sources") or []), destinations)
+    await state.clear()
+    await forwarding.refresh_task(task_id)
+    await _notify_admins(message_obj.bot, settings, f"➕ New task\nID: {task_id}")
+    await _reply_or_edit(message_obj, safe_t(language, "task_created", task_id=task_id),
+                         _nav_keyboard(), edit)
+    return None
+
+@router.callback_query(F.data.startswith("pick:"))
+async def picker_callback(callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService,
+                          forwarding: ForwardingEngine, settings: Settings) -> None:
+    """Handles the tap-to-select number keypad: pick:<src|dst|done|refresh>:<value>."""
+    if callback.message is None:
+        return await callback.answer()
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        return await callback.answer()
+    action, value = parts[1], parts[2]
+    language = await _language_for_callback(db, callback)
+    current = await state.get_state()
+    if current not in {TaskStates.waiting_source.state, TaskStates.waiting_destination.state}:
+        # Stale keyboard from an earlier, already-finished flow.
+        return await callback.answer(safe_t(language, "picker_expired"), show_alert=True)
+
+    if action == "refresh":
+        field = value if value in {"src", "dst"} else "src"
+        await _render_chat_picker(callback.message, db, telethon, state, callback.from_user.id,
+                                  field, language, refresh=True, edit=True)
+        return await callback.answer(safe_t(language, "picker_refreshed"))
+
+    if action == "done":
+        field = value if value in {"src", "dst"} else "src"
+        if field == "src":
+            toast = await _finish_sources(callback.message, state, db, telethon, forwarding,
+                                          callback.from_user.id, language, edit=True)
+        else:
+            toast = await _finish_destinations(callback.message, state, db, telethon, forwarding,
+                                               settings, callback.from_user.id, language, edit=True)
+        return await callback.answer(toast or "")
+
+    if action in {"src", "dst"}:
+        if not value.isdigit():
+            return await callback.answer()
+        handled = await _picker_toggle_number(callback.message, state, db, telethon, callback.from_user.id,
+                                              action, language, int(value), edit=True)
+        if not handled:
+            return await callback.answer(safe_t(language, "picker_expired"), show_alert=True)
+        return await callback.answer()
+    await callback.answer()
 
 @router.message(TaskStates.waiting_source)
 async def task_source(message: Message, state: FSMContext, db: Database, telethon: TelethonService, forwarding: ForwardingEngine) -> None:
@@ -1305,31 +1505,22 @@ async def task_source(message: Message, state: FSMContext, db: Database, teletho
         return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
     data = await state.get_data()
     sources = list(data.get("sources", []))
-    edit_task_id = data.get("edit_task_id")
-    is_editing = edit_task_id is not None and data.get("edit_field") == "sources"
     user = await db.get_user(message.from_user.id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
 
     if text.lower() == "/done":
-        if not sources: return await message.answer("⚠️ Send at least one source." if language == "en" else "⚠️ Kam se kam ek source zaroori hai.")
-        if is_editing:
-            changed = await db.update_task_sources(message.from_user.id, int(edit_task_id), sources)
-            await state.clear()
-            if changed: await forwarding.refresh_task(int(edit_task_id))
-            return await message.answer("✅ Updated." if changed else "⚠️ Error.", reply_markup=_nav_keyboard(back=f"set:task:{edit_task_id}"))
-        await state.update_data(sources=sources, destinations=[], picker_dialogs=None)
-        await state.set_state(TaskStates.waiting_destination)
-        return await _render_chat_picker(message, db, telethon, state, message.from_user.id, "dst", language)
+        return await _finish_sources(message, state, db, telethon, forwarding,
+                                     message.from_user.id, language)
 
-    # Numeric selection from the text list (1-20)
+    # Typing a number still works as a fallback for the keypad above.
     if text.isdigit():
         handled = await _picker_toggle_number(message, state, db, telethon, message.from_user.id, "src", language, int(text))
         if handled:
             return
-        return await message.answer(safe_t(language, "picker_bad_number"))
+        return await message.answer(safe_t(language, "picker_bad_number"), parse_mode="HTML")
 
     if len(sources) >= plan.sources_per_task:
-        return await message.answer(f"⚠️ Max sources reached ({plan.sources_per_task}). Send /done.")
+        return await message.answer(safe_t(language, "picker_limit_reached", limit=plan.sources_per_task), parse_mode="HTML")
     # Manual entry format validation (@name / t.me link / forwarded chat id)
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
@@ -1337,20 +1528,14 @@ async def task_source(message: Message, state: FSMContext, db: Database, teletho
         entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         return await message.answer(f"⚠️ {safe_html(exc)}")
+    if any(int(e.get("id", 0)) == int(entity.get("id", 0)) for e in sources):
+        return await message.answer(safe_t(language, "picker_already_added"), parse_mode="HTML")
     sources.append(entity)
     await state.update_data(sources=sources)
-    remaining = plan.sources_per_task - len(sources)
-    if remaining > 0:
+    if len(sources) < plan.sources_per_task:
         await _render_chat_picker(message, db, telethon, state, message.from_user.id, "src", language)
     else:
-        if is_editing:
-            changed = await db.update_task_sources(message.from_user.id, int(edit_task_id), sources)
-            await state.clear()
-            if changed: await forwarding.refresh_task(int(edit_task_id))
-            return await message.answer("✅ Updated." if changed else "⚠️ Error.", reply_markup=_nav_keyboard(back=f"set:task:{edit_task_id}"))
-        await state.update_data(destinations=[])
-        await state.set_state(TaskStates.waiting_destination)
-        await message.answer(safe_t(language, "task_destination"), reply_markup=_nav_keyboard(include_cancel=True))
+        await _finish_sources(message, state, db, telethon, forwarding, message.from_user.id, language)
 
 @router.message(TaskStates.waiting_destination)
 async def task_destination(message: Message, state: FSMContext, db: Database, telethon: TelethonService, forwarding: ForwardingEngine, settings: Settings) -> None:
@@ -1362,46 +1547,37 @@ async def task_destination(message: Message, state: FSMContext, db: Database, te
         return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
     data = await state.get_data()
     destinations = list(data.get("destinations", []))
-    edit_task_id = data.get("edit_task_id")
-    is_editing = edit_task_id is not None and data.get("edit_field") == "destinations"
     user = await db.get_user(message.from_user.id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
 
     if text.lower() == "/done":
-        if not destinations: return await message.answer("⚠️ Send at least one destination." if language == "en" else "⚠️ Kam se kam ek destination zaroori hai.")
-    elif text.isdigit():
+        return await _finish_destinations(message, state, db, telethon, forwarding, settings,
+                                          message.from_user.id, language)
+
+    # Typing a number still works as a fallback for the keypad above.
+    if text.isdigit():
         handled = await _picker_toggle_number(message, state, db, telethon, message.from_user.id, "dst", language, int(text))
         if handled:
             return
-        return await message.answer(safe_t(language, "picker_bad_number"))
-    elif len(destinations) >= plan.destinations_per_task:
-        return await message.answer(f"⚠️ Max destinations reached ({plan.destinations_per_task}). Send /done.")
-    else:
-        # Manual entry format validation (@name / t.me link / forwarded chat id)
-        if not CHANNEL_INPUT_RE.match(text):
-            return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
-        try:
-            destination = await telethon.validate_for_user(message.from_user.id, text)
-        except ValueError as exc:
-            return await message.answer(f"⚠️ {safe_html(exc)}")
-        destinations.append(destination)
-        await state.update_data(destinations=destinations)
-        remaining = plan.destinations_per_task - len(destinations)
-        if remaining > 0:
-            return await _render_chat_picker(message, db, telethon, state, message.from_user.id, "dst", language)
+        return await message.answer(safe_t(language, "picker_bad_number"), parse_mode="HTML")
 
-    if is_editing:
-        changed = await db.update_task_destinations(message.from_user.id, int(edit_task_id), destinations)
-        await state.clear()
-        if changed: await forwarding.refresh_task(int(edit_task_id))
-        return await message.answer("✅ Updated." if changed else "⚠️ Error.", reply_markup=_nav_keyboard(back=f"set:task:{edit_task_id}"))
-
-    data = await state.get_data()
-    task_id = await db.create_task_multi(message.from_user.id, str(data["task_name"]), list(data["sources"]), list(data["destinations"]))
-    await state.clear()
-    await forwarding.refresh_task(task_id)
-    await _notify_admins(message.bot, settings, f"➕ New task\nID: {task_id}")
-    await message.answer(safe_t(language, "task_created", task_id=task_id), reply_markup=_nav_keyboard())
+    if len(destinations) >= plan.destinations_per_task:
+        return await message.answer(safe_t(language, "picker_limit_reached", limit=plan.destinations_per_task), parse_mode="HTML")
+    # Manual entry format validation (@name / t.me link / forwarded chat id)
+    if not CHANNEL_INPUT_RE.match(text):
+        return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
+    try:
+        destination = await telethon.validate_for_user(message.from_user.id, text)
+    except ValueError as exc:
+        return await message.answer(f"⚠️ {safe_html(exc)}")
+    if any(int(e.get("id", 0)) == int(destination.get("id", 0)) for e in destinations):
+        return await message.answer(safe_t(language, "picker_already_added"), parse_mode="HTML")
+    destinations.append(destination)
+    await state.update_data(destinations=destinations)
+    if len(destinations) < plan.destinations_per_task:
+        return await _render_chat_picker(message, db, telethon, state, message.from_user.id, "dst", language)
+    await _finish_destinations(message, state, db, telethon, forwarding, settings,
+                               message.from_user.id, language)
 
 @router.message(Command("pause", "resume", "deletetask"))
 async def task_action(message: Message, db: Database, forwarding: ForwardingEngine) -> None:
@@ -1445,7 +1621,7 @@ async def task_action(message: Message, db: Database, forwarding: ForwardingEngi
     if cmd == "deletetask":
         changed = await db.delete_task(message.from_user.id, task_id)
         if changed: await forwarding.remove_task(task_id)
-        await message.answer("🗑️ Deleted." if changed else " ️ Not found.")
+        await message.answer("🗑️ Deleted." if changed else "🗑️ Not found.")
     else:
         paused = cmd == "pause"
         changed = await db.set_task_paused(message.from_user.id, task_id, paused, "user" if paused else None)
@@ -2119,7 +2295,7 @@ def _admin_bot_commands() -> list[BotCommand]:
 # FASTAPI & WEBHOOKS
 # ==========================================
 
-def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilling) -> FastAPI:
+def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilling, forwarding: ForwardingEngine) -> FastAPI:
     app = FastAPI(title="Dealskoti Forwarder", version="0.1.0", docs_url=None, redoc_url=None)
 
     @app.get("/health")
@@ -2133,28 +2309,53 @@ def build_app(bot: Bot, db: Database, settings: Settings, billing: RazorpayBilli
         if not billing.verify_webhook_signature(raw_body, signature):
             await _notify_admins(bot, settings, "🚨 Invalid Razorpay webhook signature rejected")
             return JSONResponse({"error": "Invalid signature"}, status_code=401)
+
+        user_id: int | None = None
+        stored_plan = ""
+        stored_cycle = ""
         try:
             payload = billing.parse_json(raw_body)
             captured = billing.parse_captured_payment(payload)
-            if captured is None: return JSONResponse({"status": "ignored"})
-            
-            stored_payment = await db.get_payment_for_order(captured.order_id)
-            if stored_payment is None:
+            if captured is None:
                 return JSONResponse({"status": "ignored"})
-                
+
+            stored_payment = None
+            if captured.order_id:
+                stored_payment = await db.get_payment_for_order(captured.order_id)
+
+            # Fallback: `payment.captured` cannot carry the payment-link id, so
+            # recover the order from the notes we attached when creating the link.
+            if stored_payment is None:
+                notes = captured.notes or {}
+                raw_uid = str(notes.get("user_id") or "").strip()
+                note_plan = str(notes.get("plan") or "").strip().lower()
+                note_cycle = str(notes.get("cycle") or "").strip().lower()
+                if raw_uid.isdigit() and note_plan and note_cycle:
+                    stored_payment = await db.find_pending_payment(int(raw_uid), note_plan, note_cycle)
+
+            if stored_payment is None:
+                logger.info("Webhook had no matching pending payment (order_id=%s)", captured.order_id)
+                return JSONResponse({"status": "ignored"})
+
             stored_plan = str(stored_payment["plan"])
             stored_cycle = str(stored_payment["cycle"])
-            
+
             user_id = await db.activate_payment(
-                captured.order_id, captured.payment_id, captured.amount_paise,
+                str(stored_payment["order_id"]), captured.payment_id, captured.amount_paise,
                 duration_days(stored_cycle), stored_plan, stored_cycle
             )
-            
+
         except (BillingError, ValueError) as exc:
             logger.warning("Rejected webhook: %s", str(exc))
             return JSONResponse({"error": str(exc)}, status_code=400)
-            
+        except Exception:
+            logger.exception("Webhook processing failed")
+            return JSONResponse({"error": "internal error"}, status_code=500)
+
         if user_id is not None:
+            # Hot-reload the engine so the new plan's limits/features apply at once.
+            with suppress(Exception):
+                await forwarding.refresh_user(user_id)
             user = await db.get_user(user_id)
             if user is not None:
                 language = language_for(user["preferred_language"])
@@ -2208,7 +2409,7 @@ async def _run(settings: Settings) -> None:
     for admin_id in settings.admin_telegram_ids:
         await bot.set_my_commands(_bot_commands() + _admin_bot_commands(), scope=BotCommandScopeChat(chat_id=admin_id))
 
-    api = build_app(bot, db, settings, billing)
+    api = build_app(bot, db, settings, billing, forwarding)
     server = uvicorn.Server(uvicorn.Config(api, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info"))
     
     dispatcher_task = asyncio.create_task(dispatcher.start_polling(bot, db=db, settings=settings, telethon=telethon, billing=billing, forwarding=forwarding))
