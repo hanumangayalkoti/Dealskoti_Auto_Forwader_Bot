@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from contextlib import suppress
 
@@ -11,10 +10,6 @@ from .db import Database
 logger = logging.getLogger("dealskoti.telethon")
 
 class TelethonService:
-    LOGIN_TIMEOUT_SECONDS = 10 * 60
-    MAX_PIN_ATTEMPTS = 5
-    MAX_2FA_ATTEMPTS = 5
-
     def __init__(self, settings: Settings, db: Database):
         self.api_id = settings.telegram_api_id
         self.api_hash = settings.telegram_api_hash
@@ -63,13 +58,8 @@ class TelethonService:
             self.login_clients[user_id] = {
                 "client": client,
                 "phone": phone,
-                "phone_code_hash": sent_code.phone_code_hash,
-                "pin_attempts": 0,
-                "two_fa_attempts": 0,
+                "phone_code_hash": sent_code.phone_code_hash
             }
-            self.login_clients[user_id]["expiry_task"] = asyncio.create_task(
-                self._expire_login(user_id, client)
-            )
         except errors.PhoneNumberInvalidError:
             await client.disconnect()
             raise ValueError("The phone number is invalid. Please include the country code (e.g. +91...)")
@@ -91,23 +81,18 @@ class TelethonService:
         phone_code_hash = login_data["phone_code_hash"]
 
         try:
-            login_data["pin_attempts"] += 1
-            if login_data["pin_attempts"] > self.MAX_PIN_ATTEMPTS:
-                await self.cancel_login(user_id)
-                raise ValueError("Too many PIN attempts. Please start login again.")
-
             await client.sign_in(phone=phone, code=pin, phone_code_hash=phone_code_hash)
             session_string = client.session.save()
             await self._save_session(user_id, session_string)
-            await self.cancel_login(user_id)
+            # Keep client alive until 2FA step if needed; cleanup happens via
+            # submit_2fa() on success or cancel_login() on failure.
             return "success"
         except errors.SessionPasswordNeededError:
             # DON'T cancel login — keep client around so we can submit 2FA next.
             return "2fa_required"
         except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError):
-            if login_data["pin_attempts"] >= self.MAX_PIN_ATTEMPTS:
-                await self.cancel_login(user_id)
-                raise ValueError("Too many PIN attempts. Please start login again.")
+            # Bad/expired OTP → kill the in-memory client so user must restart.
+            await self.cancel_login(user_id)
             raise ValueError("Invalid or expired PIN. Please try again or restart login.")
         except Exception as e:
             logger.error(f"Error submitting PIN for {user_id}: {e}")
@@ -122,20 +107,13 @@ class TelethonService:
         client: TelegramClient = login_data["client"]
 
         try:
-            login_data["two_fa_attempts"] += 1
-            if login_data["two_fa_attempts"] > self.MAX_2FA_ATTEMPTS:
-                await self.cancel_login(user_id)
-                raise ValueError("Too many 2FA attempts. Please start login again.")
-
             await client.sign_in(password=password)
             session_string = client.session.save()
             await self._save_session(user_id, session_string)
             await self.cancel_login(user_id)  # Clean up memory only on success
             return "success"
         except errors.PasswordHashInvalidError:
-            if login_data["two_fa_attempts"] >= self.MAX_2FA_ATTEMPTS:
-                await self.cancel_login(user_id)
-                raise ValueError("Too many 2FA attempts. Please start login again.")
+            # Keep client alive so user can retry the password — DO NOT cancel_login.
             raise ValueError("Incorrect 2FA password. Please try again.")
         except errors.FloodWaitError as e:
             await self.cancel_login(user_id)
@@ -145,19 +123,9 @@ class TelethonService:
             await self.cancel_login(user_id)
             raise ValueError("An unexpected error occurred. Please try again.")
 
-    async def _expire_login(self, user_id: int, client: TelegramClient) -> None:
-        await asyncio.sleep(self.LOGIN_TIMEOUT_SECONDS)
-        login_data = self.login_clients.get(user_id)
-        if login_data and login_data.get("client") is client:
-            logger.info("Expiring inactive Telegram login for user %s", user_id)
-            await self.cancel_login(user_id)
-
     async def cancel_login(self, user_id: int) -> None:
         login_data = self.login_clients.pop(user_id, None)
         if login_data:
-            expiry_task = login_data.get("expiry_task")
-            if expiry_task and expiry_task is not asyncio.current_task():
-                expiry_task.cancel()
             client: TelegramClient = login_data["client"]
             if client.is_connected():
                 await client.disconnect()
@@ -220,6 +188,59 @@ class TelethonService:
         except Exception as e:
             logger.error(f"Error validating entity '{target}' for user {user_id}: {e}")
             raise ValueError("Failed to validate chat. Please try forwarding a message from it instead.")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
+    # --- RECENT CHATS (TOP-20 PICKER) ---
+
+    async def get_top_dialogs(self, user_id: int, limit: int = 20) -> list[dict]:
+        """Returns the user's most recent chats/channels (pinned chats come first,
+        matching Telegram's own dialog order)."""
+        session_string = await self._get_session_string(user_id)
+        if not session_string:
+            return []
+        client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+        results: list[dict] = []
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                return []
+            async for dialog in client.iter_dialogs(limit=limit):
+                entity = dialog.entity
+                # Skip the bot itself and saved-messages
+                if getattr(entity, "bot", False):
+                    continue
+                results.append({
+                    "id": entity.id,
+                    "title": dialog.title or getattr(entity, "username", "") or str(entity.id),
+                    "access_hash": getattr(entity, "access_hash", None),
+                    "username": getattr(entity, "username", None),
+                    "type": type(entity).__name__,
+                })
+        except Exception as e:
+            logger.error(f"Error fetching dialogs for user {user_id}: {e}")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+        return results
+
+    # --- BIG FILE DOWNLOAD (MTProto BOT CLIENT, >20MB Bot API limit) ---
+
+    async def download_media_big(self, bot_token: str, chat_id: int, message_id: int, dest_path: str) -> bool:
+        """Downloads media from a chat using an MTProto bot client (no 20MB cap)."""
+        client = TelegramClient(StringSession(), self.api_id, self.api_hash)
+        try:
+            await client.start(bot_token=bot_token)
+            msg = await client.get_messages(chat_id, ids=[message_id])
+            msg = msg[0] if isinstance(msg, list) else msg
+            if not msg or not msg.media:
+                return False
+            await client.download_media(msg, file=dest_path)
+            return True
+        except Exception as e:
+            logger.error(f"download_media_big failed for chat {chat_id} msg {message_id}: {e}")
+            return False
         finally:
             if client.is_connected():
                 await client.disconnect()
