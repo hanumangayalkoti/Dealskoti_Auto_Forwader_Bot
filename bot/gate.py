@@ -54,12 +54,14 @@ async def enforce_gate(bot: Bot, db: Database, settings: Settings, user_id: int,
     
     if not is_member:
         text = (
-            "⚠️ **Action Required**\n\nYou must join our Updates Channel to use this bot and keep your forwarding active." 
-            if language == "en" else 
-            "⚠️ **Dhyan Dein**\n\nBot ko use karne aur apna forwarding chalu rakhne ke liye humara Updates Channel join karna zaroori hai."
+            "⚠️ <b>Action Required</b>\n\nYou must join our Updates Channel to use this bot "
+            "and keep your forwarding active.\n\nJoin the channel, then tap <b>I've Joined</b>."
+            if language == "en" else
+            "⚠️ <b>Dhyan Dein</b>\n\nBot ko use karne aur apna forwarding chalu rakhne ke liye "
+            "humara Updates Channel join karna zaroori hai.\n\nChannel join karke <b>Maine Join Kar Liya</b> dabayein."
         )
         with suppress(Exception):
             await bot.send_message(user_id, text, reply_markup=join_keyboard(settings, language), parse_mode="HTML")
         return False
-        
+
     return True
