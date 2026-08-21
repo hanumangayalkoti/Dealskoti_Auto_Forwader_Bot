@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Message, MessageMediaPhoto
+from telethon.tl.types import (
+    Message,
+    MessageMediaPhoto,
+    MessageMediaWebPage,
+    PeerChannel,
+    PeerChat,
+    PeerUser,
+)
 
 from .db import Database
 from .plans import PLANS
@@ -17,14 +24,43 @@ from .telethon_service import TelethonService
 
 logger = logging.getLogger("dealskoti.forwarding")
 
-# Speed presets (seconds between sends). Keys mirror the UI buttons.
-DELAY_PRESETS: dict[str, int] = {"off": 0, "slow": 20, "normal": 10, "fast": 5}
-ANTIBAN_PRESETS: dict[str, int] = {"slow": 12, "normal": 6, "fast": 2}
-
+# Used by Replace Usernames to find @tokens in text
 USERNAME_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{3,}")
-LINK_RE = re.compile(r"(?:https?://\S+|www\.\S+|(?<![\w@.])t\.me/\S+)", re.IGNORECASE)
-# Hidden/background invite links commonly spammed inside posts
-BG_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:\+|joinchat/)\S+|tg://resolve\?\S+", re.IGNORECASE)
+
+# Delay Timer waits between each destination; Anti-Ban Speed waits between
+# messages. Both are advertised from Silver upward.
+DELAY_PRESETS = {"off": 0.0, "fast": 1.0, "normal": 3.0, "slow": 8.0}
+ANTIBAN_PRESETS = {"off": 0.0, "fast": 1.0, "normal": 3.0, "slow": 8.0}
+
+
+def _preset_seconds(table: dict[str, float], value, default: str = "off") -> float:
+    """Reads a speed setting that may be a preset name or a raw number."""
+    if value is None:
+        value = default
+    if isinstance(value, (int, float)):
+        return max(0.0, min(300.0, float(value)))
+    key = str(value).strip().lower()
+    return table.get(key, table.get(default, 0.0))
+
+
+def raw_peer_id(value) -> int | None:
+    """Normalises any Telegram chat id to its bare positive form.
+
+    Telethon events expose *marked* ids (-100xxxxxxxxxx for channels, -xxxx for
+    basic groups) while the ids we persist in `sources`/`destinations` come from
+    `entity.id`, which is bare and positive. Bot API forwards give the marked
+    form too. Comparing the two directly never matches, which is why forwarding
+    silently did nothing. Everything is reduced to the bare id before comparing.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    text = str(number)
+    if text.startswith("-100"):
+        stripped = text[4:]
+        return int(stripped) if stripped.isdigit() else None
+    return abs(number)
 
 class ForwardingEngine:
     def __init__(self, db: Database, telethon: TelethonService, max_concurrent_tasks: int = 100):
@@ -35,8 +71,30 @@ class ForwardingEngine:
         # In-memory stores
         self.clients: dict[int, TelegramClient] = {}  # user_id -> TelegramClient
         self._running = False
-        self.edit_map: dict[str, list[tuple[int, int]]] = {}  # "user_id:source_chat:msg_id" -> [(dest_chat, dest_msg_id)]
-        self.last_sent: dict[tuple[int, int], int] = {}  # (user_id, dest_id) -> last sent msg id (reply sync)
+        # "user_id:raw_source_chat:msg_id" -> {"task_id": int, "dests": [(dest_id, msg_id)]}
+        self.edit_map: dict[str, dict] = {}
+        # Messages this engine just produced, so we never re-forward our own output
+        # (which would loop forever when a destination is also somebody's source).
+        self._recent_sends: set[tuple[int, int]] = set()
+        self._recent_sends_order: list[tuple[int, int]] = []
+        # user_id -> {raw_id: resolved telethon entity}
+        self._peer_cache: dict[int, dict[int, object]] = {}
+        # Users whose dialog list we already pulled once to warm the entity cache
+        self._dialogs_synced: set[int] = set()
+
+    def _remember_send(self, chat_id: int, message_id: int) -> None:
+        raw = raw_peer_id(chat_id)
+        if raw is None:
+            return
+        key = (raw, int(message_id))
+        if key in self._recent_sends:
+            return
+        self._recent_sends.add(key)
+        self._recent_sends_order.append(key)
+        if len(self._recent_sends_order) > 5000:
+            for stale in self._recent_sends_order[:2500]:
+                self._recent_sends.discard(stale)
+            del self._recent_sends_order[:2500]
 
     async def start(self) -> None:
         """Starts the forwarding engine and connects all valid users."""
@@ -123,7 +181,10 @@ class ForwardingEngine:
         """Stops and removes the user's forwarding client."""
         client = self.clients.pop(user_id, None)
         if client:
-            client.remove_event_handlers()
+            # Telethon has no remove_event_handlers(); detach each registered handler
+            for handler, event in client.list_event_handlers():
+                with suppress(Exception):
+                    client.remove_event_handler(handler, event)
             if client.is_connected():
                 await client.disconnect()
         # Also drop any edit-map entries belonging to this user so a future
@@ -132,9 +193,8 @@ class ForwardingEngine:
         for k in list(self.edit_map.keys()):
             if k.startswith(prefix):
                 self.edit_map.pop(k, None)
-        for key in list(self.last_sent.keys()):
-            if key[0] == user_id:
-                self.last_sent.pop(key, None)
+        self._peer_cache.pop(user_id, None)
+        self._dialogs_synced.discard(user_id)
 
     async def refresh_task(self, task_id: int) -> None:
         """Hot-reloads a user's client if a specific task was updated."""
@@ -146,10 +206,62 @@ class ForwardingEngine:
         """Handled gracefully by refresh_user/refresh_task dynamically checking DB."""
         pass
 
+    # --- PEER RESOLUTION ---
+
+    async def _resolve_peer(self, client: TelegramClient, user_id: int, ref: dict):
+        """Turns a stored {id, access_hash, type, username} record into something
+        Telethon can send to. Bare ids are not directly usable, so we rebuild the
+        proper Peer* wrapper and warm the session's entity cache from the dialog
+        list the first time a lookup fails."""
+        raw = raw_peer_id(ref.get("id"))
+        if raw is None:
+            return None
+
+        cached = self._peer_cache.setdefault(user_id, {}).get(raw)
+        if cached is not None:
+            return cached
+
+        username = (ref.get("username") or "").strip().lstrip("@")
+        kind = str(ref.get("type") or "")
+        if kind in ("Channel", "ChannelForbidden"):
+            peer = PeerChannel(raw)
+        elif kind in ("Chat", "ChatForbidden"):
+            peer = PeerChat(raw)
+        elif kind == "User":
+            peer = PeerUser(raw)
+        else:
+            # Unknown type: negative stored ids were already marked, so reuse them.
+            peer = int(ref["id"]) if str(ref.get("id", "")).lstrip("-").isdigit() else raw
+
+        candidates: list[object] = []
+        if username:
+            candidates.append(username)
+        candidates.append(peer)
+
+        for attempt in range(2):
+            for candidate in candidates:
+                try:
+                    entity = await client.get_input_entity(candidate)
+                except Exception:
+                    continue
+                self._peer_cache[user_id][raw] = entity
+                return entity
+            if attempt == 0 and user_id not in self._dialogs_synced:
+                # A fresh StringSession has an empty entity cache; one dialog
+                # sweep populates the access hashes we need.
+                self._dialogs_synced.add(user_id)
+                with suppress(Exception):
+                    await client.get_dialogs(limit=200)
+                continue
+            break
+
+        logger.warning("Could not resolve peer %s for user %s", ref.get("id"), user_id)
+        return None
+
     # --- MESSAGE PROCESSING ENGINE ---
 
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
-        """Applies removals, replacements, and Header/Footer based on user plan."""
+        """Applies replacements and Header/Footer based on user plan."""
         if not text:
             # Even with empty body, header/footer should still be appended for paid plans.
             if plan_name in ["silver", "gold", "platinum"]:
@@ -161,17 +273,6 @@ class ForwardingEngine:
                     if footer: parts.append(footer)
                     return "\n\n".join(parts)
             return text
-
-        # --- REMOVALS (Silver+) ---
-        if plan_name in ["silver", "gold", "platinum"]:
-            if settings.get("remove_usernames", False):
-                text = USERNAME_RE.sub("", text)
-            if settings.get("remove_links", False):
-                text = LINK_RE.sub("", text)
-
-        # --- HIDDEN/BACKGROUND LINKS (Gold+) ---
-        if plan_name in ["gold", "platinum"] and settings.get("disable_bg_links", False):
-            text = BG_LINK_RE.sub("", text)
 
         # --- REPLACEMENTS ---
         # Legacy plain replace (Gold+) — kept for backward compatibility with old tasks
@@ -218,22 +319,21 @@ class ForwardingEngine:
 
         return text
 
-    @staticmethod
-    def _message_ext(message: Message) -> str:
-        """Extension of the message's document file, lowercase without dot ('' if none)."""
-        doc = getattr(message, "document", None)
-        name = getattr(doc, "name", None) if doc is not None else None
-        if not name:
-            mime = getattr(doc, "mime_type", "") if doc is not None else ""
-            if "/" in mime:
-                return mime.split("/")[-1].split("+")[0]
-            return ""
-        return os.path.splitext(name)[1].lower().lstrip(".")
-
     async def _on_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         """Triggered when the user's account receives a new message in any chat."""
         message: Message = event.message
-        chat_id = event.chat_id
+        source_raw = raw_peer_id(event.chat_id)
+        if source_raw is None:
+            return
+
+        # Never re-forward something this engine itself just delivered, otherwise
+        # A -> B and B -> A task pairs ping-pong forever.
+        if (source_raw, int(message.id)) in self._recent_sends:
+            return
+
+        client = self.clients.get(user_id)
+        if not client:
+            return
 
         user = await self.db.get_user(user_id)
         if not user or user["is_blocked"]:
@@ -246,164 +346,192 @@ class ForwardingEngine:
         plan_name = str(user["plan"] or "free")
         plan = PLANS.get(plan_name, PLANS["free"])
 
-        client = self.clients.get(user_id)
-        if not client:
-            return
+        # One usage read per incoming message instead of one per task.
+        usage = await self.db.daily_usage(user_id)
 
         for task in tasks:
             if task["is_paused"]:
                 continue
 
-            # Check if this chat is a source for this task
-            sources = json.loads(task["sources"] or "[]")
-            source_ids = [s.get("id") for s in sources if isinstance(s, dict)]
-            if chat_id not in source_ids:
+            # Check if this chat is a source for this task (ids normalised both ways)
+            try:
+                sources = json.loads(task["sources"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            source_ids = {
+                raw_peer_id(s.get("id"))
+                for s in sources
+                if isinstance(s, dict)
+            }
+            if source_raw not in source_ids:
                 continue
 
-            settings = json.loads(task["settings"] or "{}")
+            try:
+                settings = json.loads(task["settings"] or "{}")
+            except (TypeError, ValueError):
+                settings = {}
+            if not isinstance(settings, dict):
+                settings = {}
 
             # --- FILTERS ---
 
-            # Sender Filter (Platinum) — apply safely; None sender cannot match
+            # Sender Filter (Platinum) — accepts user IDs and @usernames
             if plan_name == "platinum":
-                allowed_senders = settings.get("user_filter", [])
+                allowed_senders = settings.get("user_filter") or []
+                if isinstance(allowed_senders, str):
+                    allowed_senders = [allowed_senders]
                 if allowed_senders:
-                    sender = message.sender_id
-                    if sender is None or sender not in allowed_senders:
+                    sender = None
+                    with suppress(Exception):
+                        sender = await message.get_sender()
+                    sid = getattr(sender, "id", None)
+                    uname = (getattr(sender, "username", None) or "").lower()
+                    allowed = False
+                    if sid is not None and any(str(a).strip() == str(sid) for a in allowed_senders):
+                        allowed = True
+                    elif uname and any(str(a).lstrip("@").lower() == uname for a in allowed_senders):
+                        allowed = True
+                    if not allowed:
                         continue
 
             # Blacklist & Whitelist (Gold, Platinum)
             raw_text = (message.raw_text or "").lower()
             if plan_name in ["gold", "platinum"]:
-                whitelist = settings.get("whitelist", [])
-                blacklist = settings.get("blacklist", [])
+                whitelist = settings.get("whitelist") or []
+                blacklist = settings.get("blacklist") or []
+                if isinstance(whitelist, str): whitelist = [whitelist]
+                if isinstance(blacklist, str): blacklist = [blacklist]
 
-                if whitelist and not any(w.lower() in raw_text for w in whitelist):
+                # Entries can be non-strings if they came from older task data.
+                whitelist = [str(w).lower() for w in whitelist if str(w).strip()]
+                blacklist = [str(b).lower() for b in blacklist if str(b).strip()]
+
+                if whitelist and not any(w in raw_text for w in whitelist):
                     continue
-                if blacklist and any(b.lower() in raw_text for b in blacklist):
+                if blacklist and any(b in raw_text for b in blacklist):
                     continue
 
             # --- LIMITS ---
-            usage = await self.db.daily_usage(user_id)
             if plan.daily_messages and usage >= plan.daily_messages:
                 # Quota exceeded, ignore silently to prevent spam
                 continue
 
-            # --- MEDIA FORWARD TOGGLE (Silver+) ---
-            if plan_name != "free" and not settings.get("media_forward", True) and message.media:
-                continue
-
             # --- FORWARDING ACTIONS ---
-            destinations = json.loads(task["destinations"] or "[]")
+            try:
+                destinations = json.loads(task["destinations"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            destinations = [d for d in destinations if isinstance(d, dict)]
             if not destinations:
                 continue
 
-            # --- PLATINUM STORED FILE (attach / replace-same-type) ---
+            # --- PLATINUM STORED FILE (auto-attached to every message) ---
             stored_file = None
-            if plan_name == "platinum" and (settings.get("attach_file_every") or settings.get("replace_same_ext")):
+            if plan_name == "platinum":
                 with suppress(Exception):
                     stored_file = await self.db.get_stored_file(user_id)
-                if stored_file is not None and not (stored_file["local_path"] or stored_file["channel_message_id"]):
-                    stored_file = None
-            replace_media = bool(
-                stored_file is not None
-                and settings.get("replace_same_ext")
-                and stored_file["extension"]
-                and str(stored_file["extension"]).lower() == self._message_ext(message)
-            )
-
-            # --- SPEED PRESETS (Delay Timer + Anti-Ban) ---
-            try:
-                delay_secs = int(settings.get("delay_timer_seconds", 0) or 0)
-            except (TypeError, ValueError):
-                delay_secs = 0
-            try:
-                antiban_secs = int(settings.get("anti_ban_speed_seconds", 0) or 0)
-            except (TypeError, ValueError):
-                antiban_secs = 0
-            send_gap = max(delay_secs, antiban_secs)
+                if stored_file is not None:
+                    local_path = stored_file["local_path"]
+                    # Only a file still present on disk can be re-attached; a bare
+                    # storage-channel message id is not a file reference.
+                    if not (local_path and os.path.exists(str(local_path))):
+                        stored_file = None
 
             # --- WATERMARK (Platinum) — build media file if enabled ---
             watermark_text = ""
             media_file = message.media
-            if replace_media:
-                media_file = None  # original media replaced by the user's uploaded file
+            if isinstance(media_file, MessageMediaWebPage):
+                # Link previews are not sendable media; the URL lives in the text.
+                media_file = None
             if plan_name == "platinum" and settings.get("watermark", False):
-                watermark_text = settings.get("watermark_text", "Forwarded via DealsKoti")
-                if message.media and isinstance(message.media, MessageMediaPhoto):
+                watermark_text = settings.get("watermark_text") or "Forwarded via DealsKoti"
+                if isinstance(message.media, MessageMediaPhoto):
                     watermarked = await self._apply_image_watermark(
                         client, message, watermark_text, max_image_bytes=10 * 1024 * 1024
                     )
                     if watermarked:
-                        media_file = watermarked  # bytes are accepted by send_message(file=...)
+                        buffer = io.BytesIO(watermarked)
+                        buffer.name = "photo.png"  # Telethon needs a name to infer type
+                        media_file = buffer
 
             sent_tracking = []
-            sent_count = 0
 
-            for dest in destinations:
-                dest_id = dest.get("id")
-                if not dest_id: continue
+            # Speed controls (Silver and above); free plan always runs at "off".
+            paid = plan_name in ("silver", "gold", "platinum")
+            dest_delay = _preset_seconds(DELAY_PRESETS, settings.get("delay_timer")) if paid else 0.0
+            antiban_delay = _preset_seconds(ANTIBAN_PRESETS, settings.get("antiban_speed")) if paid else 0.0
 
-                # Speed gap between sends (never before the first send)
-                if send_gap > 0 and sent_count > 0:
-                    await asyncio.sleep(send_gap)
-
-                # Reply Sync (Silver+): thread replies onto our last sent message
-                reply_to_id = None
-                if plan_name != "free" and settings.get("reply_sync", False) and message.reply_to_msg_id:
-                    reply_to_id = self.last_sent.get((user_id, dest_id))
+            for index, dest in enumerate(destinations):
+                if index and dest_delay:
+                    await asyncio.sleep(dest_delay)
+                if dest.get("id") is None:
+                    continue
+                dest_raw = raw_peer_id(dest.get("id"))
+                if dest_raw is None or dest_raw == source_raw:
+                    # Never send a chat's messages back into itself.
+                    continue
+                dest_peer = await self._resolve_peer(client, user_id, dest)
+                if dest_peer is None:
+                    continue
 
                 sent_msg = None
                 try:
                     # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
                     if plan_name == "free":
-                        sent_msg = await client.forward_messages(dest_id, message)
+                        sent_msg = await client.forward_messages(dest_peer, message)
                     else:
                         # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
                         base_text = message.message or ""
-                        if plan_name == "platinum" and watermark_text and not message.media:
+                        if plan_name == "platinum" and watermark_text and media_file is None:
                             # text watermark only when there's no image watermark to draw
                             base_text = self._apply_text_watermark(base_text, watermark_text)
                         new_text = self._clean_text(base_text, settings, plan_name)
-                        link_preview = bool(message.web_preview) and not settings.get("disable_bg_links", False)
+                        if not new_text and media_file is None:
+                            # Nothing to send (e.g. service message) — skip quietly.
+                            continue
+                        if isinstance(media_file, io.BytesIO):
+                            media_file.seek(0)
                         sent_msg = await client.send_message(
-                            dest_id,
+                            dest_peer,
                             message=new_text,
                             file=media_file,
-                            link_preview=link_preview,
-                            reply_to=reply_to_id,
+                            link_preview=bool(message.web_preview),
                         )
                 except Exception as e:
-                    logger.warning(f"Task {task['id']} failed to send to {dest_id} for user {user_id}: {e}")
+                    logger.warning(f"Task {task['id']} failed to send to {dest_raw} for user {user_id}: {e}")
                     continue
 
+                if isinstance(sent_msg, list):
+                    sent_msg = sent_msg[0] if sent_msg else None
                 if sent_msg:
-                    sent_tracking.append((dest_id, sent_msg.id))
-                    sent_count += 1
-                    self.last_sent[(user_id, dest_id)] = sent_msg.id
+                    sent_tracking.append((dest_raw, sent_msg.id))
+                    self._remember_send(dest_raw, sent_msg.id)
                     # Only count usage on SUCCESS — failed sends do not consume quota
                     await self.db.increment_usage(user_id)
+                    usage += 1
 
-                    # Platinum stored file: attach to every message / replaced media
-                    if stored_file is not None and (replace_media or settings.get("attach_file_every")):
-                        file_ref: object = None
-                        local_path = stored_file["local_path"]
-                        if local_path and os.path.exists(str(local_path)):
-                            file_ref = str(local_path)
-                        elif stored_file["channel_message_id"]:
-                            file_ref = int(stored_file["channel_message_id"])
-                        if file_ref is not None:
-                            with suppress(Exception):
-                                await client.send_file(dest_id, file_ref)
+                    # Platinum stored file: auto-attached to every forwarded message
+                    if stored_file is not None:
+                        with suppress(Exception):
+                            extra = await client.send_file(dest_peer, str(stored_file["local_path"]))
+                            if extra is not None:
+                                extra_msg = extra[0] if isinstance(extra, list) else extra
+                                self._remember_send(dest_raw, extra_msg.id)
 
                     # Auto-Delete (Platinum)
-                    auto_delete_secs = settings.get("auto_delete_seconds", 0)
+                    try:
+                        auto_delete_secs = int(settings.get("auto_delete_seconds") or 0)
+                    except (TypeError, ValueError):
+                        auto_delete_secs = 0
                     if plan_name == "platinum" and auto_delete_secs > 0:
-                        asyncio.create_task(self._auto_delete(client, dest_id, sent_msg.id, auto_delete_secs))
+                        asyncio.create_task(self._auto_delete(client, dest_peer, sent_msg.id, auto_delete_secs))
+
+                    if plan.daily_messages and usage >= plan.daily_messages:
+                        break
 
             # Save to Edit Sync Map — AUTOMATIC for Platinum (no toggle needed)
             if plan_name == "platinum" and sent_tracking:
-                map_key = f"{user_id}:{chat_id}:{message.id}"
+                map_key = f"{user_id}:{source_raw}:{message.id}"
                 self.edit_map[map_key] = {
                     "task_id": task["id"],
                     "dests": sent_tracking,
@@ -414,12 +542,18 @@ class ForwardingEngine:
                     for k in list(self.edit_map.keys())[:2500]:
                         self.edit_map.pop(k, None)
 
+            if sent_tracking and antiban_delay:
+                # Anti-Ban Speed: pause before this account sends anything again.
+                await asyncio.sleep(antiban_delay)
+
     async def _on_message_edited(self, event: events.MessageEdited.Event, user_id: int) -> None:
         """Triggered when a source message is edited, applies live Edit Sync."""
         message: Message = event.message
-        chat_id = event.chat_id
+        source_raw = raw_peer_id(event.chat_id)
+        if source_raw is None:
+            return
 
-        map_key = f"{user_id}:{chat_id}:{message.id}"
+        map_key = f"{user_id}:{source_raw}:{message.id}"
         entry = self.edit_map.get(map_key)
 
         if not entry:
@@ -438,19 +572,43 @@ class ForwardingEngine:
         if not task or int(task["user_id"]) != user_id:
             return
 
-        settings = json.loads(task["settings"] or "{}")
+        try:
+            settings = json.loads(task["settings"] or "{}")
+        except (TypeError, ValueError):
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+
+        # Destination records are needed again to rebuild sendable peers.
+        try:
+            dest_refs = json.loads(task["destinations"] or "[]")
+        except (TypeError, ValueError):
+            dest_refs = []
+        by_raw = {
+            raw_peer_id(d.get("id")): d
+            for d in dest_refs
+            if isinstance(d, dict)
+        }
 
         base_text = message.text or message.message or ""
         if settings.get("watermark", False):
-            watermark_text = settings.get("watermark_text", "Forwarded via DealsKoti")
+            watermark_text = settings.get("watermark_text") or "Forwarded via DealsKoti"
             base_text = self._apply_text_watermark(base_text, watermark_text)
         new_text = self._clean_text(base_text, settings, "platinum")
+        if not new_text:
+            return
 
-        for dest_id, dest_msg_id in entry["dests"]:
+        for dest_raw, dest_msg_id in entry["dests"]:
+            ref = by_raw.get(dest_raw)
+            if ref is None:
+                continue
+            dest_peer = await self._resolve_peer(client, user_id, ref)
+            if dest_peer is None:
+                continue
             try:
-                await client.edit_message(dest_id, dest_msg_id, text=new_text)
+                await client.edit_message(dest_peer, dest_msg_id, text=new_text)
             except Exception as e:
-                logger.debug(f"Failed to edit synced message {dest_msg_id} in {dest_id}: {e}")
+                logger.debug(f"Failed to edit synced message {dest_msg_id} in {dest_raw}: {e}")
 
     async def _auto_delete(self, client: TelegramClient, chat_id: int, message_id: int, delay_seconds: int) -> None:
         """Background task to delete a message after X seconds."""
@@ -482,13 +640,10 @@ class ForwardingEngine:
             logger.warning("Pillow not available; skipping image watermark")
             return None
 
-        # Try to get the largest available photo
+        # Download the full-size photo. Passing thumb=0 would fetch the *smallest*
+        # thumbnail, producing a blurry watermarked image.
         try:
-            photo_bytes = await client.download_media(
-                message.media,
-                file=bytes,
-                thumb=0,
-            )
+            photo_bytes = await client.download_media(message.media, file=bytes)
         except Exception as e:
             logger.debug(f"Could not download source photo for watermark: {e}")
             return None
