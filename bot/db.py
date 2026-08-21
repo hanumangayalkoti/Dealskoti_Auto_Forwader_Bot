@@ -415,6 +415,19 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM payments WHERE order_id = $1 AND status != 'captured'", order_id)
 
+    async def find_pending_payment(self, user_id: int, plan: str, cycle: str) -> asyncpg.Record | None:
+        """Fallback lookup for webhooks that cannot give us the payment-link id
+        (e.g. `payment.captured`). Matches the newest un-captured order for the
+        same user/plan/cycle, which is what the notes on the payment carry."""
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """SELECT * FROM payments
+                   WHERE user_id = $1 AND plan = $2 AND cycle = $3 AND status != 'captured'
+                   ORDER BY id DESC LIMIT 1""",
+                user_id, plan, cycle,
+            )
+
     async def activate_payment(self, order_id: str, payment_id: str, amount_paise: int, purchased_days: int, purchased_plan: str, cycle: str) -> int | None:
         if self.pool is None: return None
         now = datetime.now(timezone.utc)
@@ -522,17 +535,6 @@ class Database:
             base_time = user["plan_expiry"] if user["plan_expiry"] and user["plan_expiry"] > now else now
             new_expiry = base_time + timedelta(days=days)
             res = await conn.execute("UPDATE users SET plan = $1, plan_expiry = $2 WHERE telegram_user_id = $3", plan, new_expiry, user_id)
-            return res == "UPDATE 1"
-
-    async def activate_payment(self, user_id: int, plan: str, cycle: str) -> bool:
-        """Convenience wrapper used when admin/manual plans change so that the
-        forwarding engine can be hot-reloaded. Returns True on success."""
-        if self.pool is None: return False
-        async with self.pool.acquire() as conn:
-            res = await conn.execute(
-                "UPDATE users SET plan = $1 WHERE telegram_user_id = $2",
-                plan, user_id
-            )
             return res == "UPDATE 1"
 
     async def stats(self) -> dict[str, Any]:
