@@ -39,33 +39,33 @@ ADMIN_COMMANDS = [
 TRANSLATIONS = {
     "en": {
         "main_menu": "Hi {name},\nWelcome to Dealskoti Auto Forwarder Bot.\nMake auto forwarding so simple.\nOur Bot Gives 100% Security For Account Data.\n\nPlease select an option from the menu below:",
-        "help_title": "📚 **Help & Commands**\n\nHere are the commands you can use:\n{commands}",
-        "admin_help_title": "🛠️ **Admin Commands**\n\n{commands}",
+        "help_title": "📚 <b>Help & Commands</b>\n\nHere are the commands you can use:\n{commands}",
+        "admin_help_title": "🛠️ <b>Admin Commands</b>\n\n{commands}",
         "admin_only": "⚠️ This command is restricted to administrators only.",
-        "support": "📞 **Customer Support**\n\nIf you need help with payments, tasks, or setup, contact us here:\n{link}\n\n*Our team usually replies within 24 hours.*",
+        "support": "📞 <b>Customer Support</b>\n\nIf you need help with payments, tasks, or setup, contact us here:\n{link}\n\n*Our team usually replies within 24 hours.*",
         "choose_language": "🌐 Choose your preferred language:",
         "language_saved": "✅ Language preference saved successfully!",
         "faq_title": "❓ <b>FAQ (Page {page} of {pages})</b>",
         "faq_hint": "👇 Tap a question to see the answer:",
         "faq_answer": "❓ <b>{question}</b>\n\n💡 {answer}",
-        "account_details": "👤 **My Account**\n\nName: {name}\nUsername: {username}\nUser ID: <code>{user_id}</code>\n\n💎 **Subscription**\nActive Plan: {plan}\nPlan Started: {plan_started}\nPlan Expiry: {expiry}\nLast Transaction ID: <code>{txn_id}</code>\nPayment Status: {payment}\n\n⚙️ **Usage & Status**\nTelegram Status: {session}\nActive Tasks: {tasks}\nMessages Today: {forwarding}\nChannel Membership: {membership}\nLanguage: {user_language}",
-        "login_phone": "📱 **Connect Account**\n\nPlease send your Telegram phone number with country code.\n\nExample (India): `+919876543210`\n\n⚠️ Important:\n• Number must start with `+` and country code\n• NO spaces inside the number\n• Correct: `+914527896325`\n• Wrong: `+91 45278 96325`",
-        "login_pin": "🔑 **Enter OTP/PIN**\n\nTelegram has sent a code to your app. Please enter it below.\n\n*(If your code is `12345`, simply type `12345`)*",
-        "login_2fa": "  **Two-Step Verification (Cloud Password)**\n\nYour account has an extra password enabled (this is <b>not</b> your account password).\n\n<b>What to enter:</b>\n• The 'Cloud Password' or 'Two-Step Verification' password you set in Telegram Settings → Privacy → Two-Step Verification.\n• This is <b>different</b> from your SMS login code.\n\n<b>If you forgot it:</b>\n1. Open Telegram on your phone\n2. Go to Settings → Privacy → Two-Step Verification\n3. Tap 'Forgot password?' to reset it\n4. Come back here and use /connect to retry\n\nPlease enter your 2FA password below:",
-        "login_success": "✅ **Account Connected Successfully!**\n\nYour session is securely established. You can now create and manage tasks.",
+        "account_details": "👤 <b>My Account</b>\n\nName: {name}\nUsername: {username}\nUser ID: <code>{user_id}</code>\n\n💎 <b>Subscription</b>\nActive Plan: {plan}\nPlan Started: {plan_started}\nPlan Expiry: {expiry}\nLast Transaction ID: <code>{txn_id}</code>\nPayment Status: {payment}\n\n⚙️ <b>Usage & Status</b>\nTelegram Status: {session}\nActive Tasks: {tasks}\nMessages Today: {forwarding}\nChannel Membership: {membership}\nLanguage: {user_language}",
+        "login_phone": "📱 <b>Connect Account</b>\n\nPlease send your Telegram phone number with country code.\n\nExample (India): <code>+919876543210</code>\n\n⚠️ Important:\n• Number must start with <code>+</code> and country code\n• NO spaces inside the number\n• Correct: <code>+914527896325</code>\n• Wrong: <code>+91 45278 96325</code>",
+        "login_pin": "🔑 <b>Enter OTP/PIN</b>\n\nTelegram has sent a code to your app. Please enter it below.\n\n*(If your code is <code>12345</code>, simply type <code>12345</code>)*",
+        "login_2fa": "🔒 <b>Two-Step Verification (Cloud Password)</b>\n\nYour account has an extra password enabled (this is <b>not</b> your account password).\n\n<b>What to enter:</b>\n• The 'Cloud Password' or 'Two-Step Verification' password you set in Telegram Settings → Privacy → Two-Step Verification.\n• This is <b>different</b> from your SMS login code.\n\n<b>If you forgot it:</b>\n1. Open Telegram on your phone\n2. Go to Settings → Privacy → Two-Step Verification\n3. Tap 'Forgot password?' to reset it\n4. Come back here and use /connect to retry\n\nPlease enter your 2FA password below:",
+        "login_success": "✅ <b>Account Connected Successfully!</b>\n\nYour session is securely established. You can now create and manage tasks.",
         "login_cancelled": "↩️ Connect process has been cancelled safely.",
         "login_failed": "⚠️ Login failed or timed out. Please try connecting again.",
-        "choose_plan": "💎 **Choose a Subscription Plan**\n\nSelect a tier below to view limits and features:",
-        "plan_details": "💎 **{plan} Plan**\n\nFeatures & Limits:\n{features}\n\nPrice: ₹{monthly} / month\n\nSelect your billing cycle below:",
-        "billing_details": "💳 **Checkout Summary**\n\nPlan: {plan}\nCycle: {cycle}\nOriginal Price: {original}\nDiscount: {discount}\n\n**Payable Amount: {payable}**\n\nClick below to securely generate your payment link.",
-        "payment_link": "🔗 **Payment Link Generated**\n\nPlan: {plan} ({cycle})\nPayable: {amount}\n\nClick the button below to pay via Razorpay. Your plan will activate automatically.",
-        "payment_success": "🎉 **Payment Successful!**\n\nPlan: {plan}\nDuration added: {days} days\nAmount Paid: {amount}\nTransaction ID: <code>{txn_id}</code>\nNew Expiry Date: {expiry}\n\nThank you for subscribing to DealsKoti! Your new limits have been applied.",
+        "choose_plan": "💎 <b>Choose a Subscription Plan</b>\n\nSelect a tier below to view limits and features:",
+        "plan_details": "💎 <b>{plan} Plan</b>\n\nFeatures & Limits:\n{features}\n\nPrice: ₹{monthly} / month\n\nSelect your billing cycle below:",
+        "billing_details": "💳 <b>Checkout Summary</b>\n\nPlan: {plan}\nCycle: {cycle}\nOriginal Price: {original}\nDiscount: {discount}\n\n<b>Payable Amount: {payable}</b>\n\nClick below to securely generate your payment link.",
+        "payment_link": "🔗 <b>Payment Link Generated</b>\n\nPlan: {plan} ({cycle})\nPayable: {amount}\n\nClick the button below to pay via Razorpay. Your plan will activate automatically.",
+        "payment_success": "🎉 <b>Payment Successful!</b>\n\nPlan: {plan}\nDuration added: {days} days\nAmount Paid: {amount}\nTransaction ID: <code>{txn_id}</code>\nNew Expiry Date: {expiry}\n\nThank you for subscribing to DealsKoti! Your new limits have been applied.",
         "payment_failed": "⚠️ Payment could not be initiated or was cancelled.",
-        "tasks_title": "📋 **Your Forwarding Tasks:**",
+        "tasks_title": "📋 <b>Your Forwarding Tasks:</b>",
         "no_tasks_short": "📋 You haven't created any tasks yet. Click 'Create New Task' to begin.",
-        "task_name": "📝 **New Task: Name**\n\nPlease send a short, recognizable name for this task (e.g., `Amazon Deals`):",
-        "task_source": "📥 **New Task: Source Chat**\n\nForward a message from the Source chat, or send its Public Username/ID.\n\n*(You can add multiple sources. Send `/done` when you are finished adding sources).* ",
-        "task_destination": "📤 **New Task: Destination Chat**\n\nForward a message from the Destination chat, or send its Public Username/ID.\n\n*(You can add multiple destinations. Send `/done` when you are finished).* ",
+        "task_name": "📝 <b>New Task: Name</b>\n\nPlease send a short, recognizable name for this task (e.g., <code>Amazon Deals</code>):",
+        "task_source": "📥 <b>New Task: Source Chat</b>\n\nForward a message from the Source chat, or send its Public Username/ID.\n\n*(You can add multiple sources. Send <code>/done</code> when you are finished adding sources).* ",
+        "task_destination": "📤 <b>New Task: Destination Chat</b>\n\nForward a message from the Destination chat, or send its Public Username/ID.\n\n*(You can add multiple destinations. Send <code>/done</code> when you are finished).* ",
         "task_created": "✅ Task #{task_id} has been created successfully!\n\nYou can now configure its settings or resume it from the Tasks menu.",
         "unknown_command": "⚠️ Unknown command. Please send /help to see the list of available commands.",
         # ===== PHASE 2 NEW KEYS =====
@@ -74,14 +74,14 @@ TRANSLATIONS = {
         "settings_main_title": "⚙️ <b>Settings for:</b> {task_name}\n\nChoose a category:",
         "settings_cat_messages": "💬 <b>Message Settings</b>\n\nCustomize the text that is forwarded:",
         "settings_cat_filters": "🔍 <b>Filters</b>\n\nControl which messages get forwarded:",
-        "settings_cat_media": " ️ <b>Media Settings</b>\n\nControl media handling:",
+        "settings_cat_media": "🖼️ <b>Media Settings</b>\n\nControl media handling:",
         "settings_cat_forwarding": "🚀 <b>Forwarding Settings</b>\n\nControl forwarding behavior:",
         "settings_cat_senderfilter": "👤 <b>Sender Filter</b>\n\nAllow only specific senders (Platinum):",
-        "feature_locked": "  <b>Feature Locked</b>\n\n<b>{feature}</b> is available on the <b>{required_plan}</b> plan.\n\nUpgrade to unlock this feature.",
+        "feature_locked": "🔒 <b>Feature Locked</b>\n\n<b>{feature}</b> is available on the <b>{required_plan}</b> plan.\n\nUpgrade to unlock this feature.",
         "feature_locked_short": "🔒 Locked — requires {required_plan}",
         "header_prompt": "✏️ Send the new <b>Header</b> text. A short line added to the top of every forwarded message.\n\nSend /clear to remove.\nSend /back to cancel.",
         "footer_prompt": "✏️ Send the new <b>Footer</b> text. A short line added to the bottom of every forwarded message.\n\nSend /clear to remove.\nSend /back to cancel.",
-        "replace_prompt": " ️ Send replacement rules.\n\nFormat: <code>old=new</code>\nExamples:\n• <code>sale=SALE</code>\n• <code>amazon=Amazon</code>\n\nSeparate multiple rules with commas.\nSend /clear to remove all.\nSend /back to cancel.",
+        "replace_prompt": "✏️ Send replacement rules.\n\nFormat: <code>old=new</code>\nExamples:\n• <code>sale=SALE</code>\n• <code>amazon=Amazon</code>\n\nSeparate multiple rules with commas.\nSend /clear to remove all.\nSend /back to cancel.",
         "blacklist_prompt": "🔍 Send words to <b>block</b>. Messages containing these words will be skipped.\n\nFormat: <code>spam, scam, ad</code>\nSend /clear to remove all.\nSend /back to cancel.",
         "whitelist_prompt": "🔍 Send words to <b>require</b>. Only messages containing at least one of these words will be forwarded (leave empty to allow all).\n\nFormat: <code>deal, offer, free</code>\nSend /clear to remove.\nSend /back to cancel.",
         "autodelete_prompt": "🗑️ Send the number of seconds after which forwarded messages should be auto-deleted from the destination.\n\nExample: <code>3600</code> (1 hour)\nSend <code>0</code> or /clear to turn off.\nSend /back to cancel.",
@@ -109,7 +109,7 @@ TRANSLATIONS = {
         "language_confirm_yes": "✅ Yes, switch",
         "language_confirm_no": "✖️ Cancel",
         "support_intro": "📞 <b>Support</b>\n\nDon't worry — most issues (payment, setup, task errors) can be solved quickly.\n\nTap the button below to contact our support team. We usually reply within 24 hours.",
-        "updates_intro": "  <b>Updates Channel</b>\n\nThis channel posts:\n• New features\n• Important changes\n• Announcements for all DealsKoti bots\n\nYou must stay joined to use the bot.",
+        "updates_intro": "📢 <b>Updates Channel</b>\n\nThis channel posts:\n• New features\n• Important changes\n• Announcements for all DealsKoti bots\n\nYou must stay joined to use the bot.",
         "cycle_explainer": "🗓️ <b>Billing Cycles</b>\n\n• <b>Weekly</b>: 7 days\n• <b>Monthly</b>: 30 days\n• <b>Yearly</b>: 365 days with 20% off\n\nFinal payable amount is calculated server-side and shown before payment.",
         "next_scheduled_plan": "📅 <b>Scheduled:</b> {plan} starts on {date}",
         "expired_notice": "⏳ Your {plan} plan expired. Renew from /plans.",
@@ -119,12 +119,13 @@ TRANSLATIONS = {
         "disconnect_done": "✅ Telegram session disconnected.",
         "delete_confirm": "⚠️ Delete task <b>{name}</b> permanently?",
         "broadcast_preview_title": "📣 <b>Broadcast Preview</b>",
-        "broadcast_sending": "  Sending to {count} users…",
+        "broadcast_sending": "📣 Sending to {count} users…",
         "broadcast_done": "✅ Broadcast complete\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}",
         # ===== PHASE 1 NEW KEYS =====
         "already_connected": "ℹ️ You're already connected. Reconnecting replaces your existing session.",
         "reconnect_anyway": "🔄 Reconnect Anyway",
-        "invalid_phone": "⚠️ Invalid phone number format.\n\nPlease send your number with country code and NO spaces:\n• India: `+919876543210`\n• Format: `+<country code><number>`\n\nTry again:",
+        "invalid_phone": "⚠️ Invalid phone number format.\n\nPlease send your number with country code and NO spaces:\n• India: <code>+919876543210</code>\n• Format: <code>+&lt;country code&gt;&lt;number&gt;</code>\n\nTry again:",
+        "picker_bad_number": "⚠️ Please tap one of the buttons above, or reply with a number from the list (for example <code>3</code>).",
         "help_intro": "📖 <b>Help</b> — Try the commands below:\n\n{commands}\n\nTap a command button or send the command to see its features.",
         "help_cat_setting": "General bot settings",
         "help_cat_forwarding": "All forwarding-related settings",
@@ -138,12 +139,24 @@ TRANSLATIONS = {
         # ===== PHASE 2-5 NEW KEYS =====
         "tier_limit_reached": "⚠️ You have the <b>{plan}</b> plan — you can select a maximum of <b>{limit}</b> {field}.\n\nUpgrade your plan for more.",
         "invalid_channel_format": "⚠️ Invalid format. Please send the channel in one of these formats:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
-        "picker_title_src": "📥 <b>Select Source Chats</b>\n\nSelect up to {limit}. You can also FORWARD any message from the desired chat here, or type its @username / t.me link.\n\n💡 Tip: Pin a chat in Telegram so it appears at the top of this list.",
-        "picker_title_dst": "📤 <b>Select Destination Chats</b>\n\nSelect up to {limit}. You can also FORWARD any message from the desired chat here, or type its @username / t.me link.\n\n💡 Tip: Pin a chat in Telegram so it appears at the top of this list.",
+        "picker_title_src": "📥 <b>Select the number below to set your SOURCE</b>\nYou can pick up to {limit}.\n\n💡 Tip: Pin a chat in Telegram so it appears at the top of this list.",
+        "picker_title_dst": "📤 <b>Select the number below to set your DESTINATION</b>\nYou can pick up to {limit}.\n\n💡 Tip: Pin a chat in Telegram so it appears at the top of this list.",
         "picker_done": "✅ Done",
         "picker_refresh": "🔄 Refresh List",
-        "picker_selected_marker": "<----",
-        "picker_instructions": "🔢 Send the NUMBER of a chat to select/deselect it\n✅ /done - confirm\n↩️ /back - cancel",
+        "picker_cancel": "✖️ Cancel",
+        "picker_refreshed": "List refreshed",
+        "picker_expired": "This list is out of date. Tap 🔄 Refresh List or start again.",
+        "picker_limit_reached": "⚠️ You have reached your plan limit of {limit}. Tap ✅ Done to continue, or upgrade with /plans.",
+        "picker_already_added": "ℹ️ That chat is already in your selection.",
+        "picker_need_source": "⚠️ Pick at least one source chat first — tap a number button above.",
+        "picker_need_source_toast": "Pick at least one source first",
+        "picker_need_destination": "⚠️ Pick at least one destination chat first — tap a number button above.",
+        "picker_need_destination_toast": "Pick at least one destination first",
+        "sources_updated": "✅ Sources updated.",
+        "destinations_updated": "✅ Destinations updated.",
+        "generic_error": "⚠️ Something went wrong. Please try again.",
+        "picker_selected_marker": "⬅️ selected",
+        "picker_instructions": "👆 Tap a number button below to select or deselect a chat\n✅ Tap <b>Done</b> when finished\n✍️ Not in the list? Forward any message from that chat, or send its @username",
         "picker_empty": "⚠️ No recent chats found. Type the @username manually or forward a message from the chat.",
         "min_one_source": "⚠️ Select at least one source first.",
         "min_one_dest": "⚠️ Select at least one destination first.",
@@ -167,33 +180,33 @@ TRANSLATIONS = {
     },
     "hinglish": {
         "main_menu": "Hi {name},\nDealskoti Auto Forwarder Bot me aapka swagat hai.\nAuto forwarding ab bilkul simple hai.\nHamara Bot aapke Account Data ki 100% Security deta hai.\n\nNeeche diye menu se ek option chunein:",
-        "help_title": "📚 **Help & Commands**\n\nYe commands aap use kar sakte hain:\n{commands}",
-        "admin_help_title": "🛠️ **Admin Commands**\n\n{commands}",
+        "help_title": "📚 <b>Help & Commands</b>\n\nYe commands aap use kar sakte hain:\n{commands}",
+        "admin_help_title": "🛠️ <b>Admin Commands</b>\n\n{commands}",
         "admin_only": "⚠️ Ye command sirf Admins use kar sakte hain.",
-        "support": "📞 **Customer Support**\n\nAgar aapko payment, tasks, ya setup me madad chahiye, toh yahan message karein:\n{link}\n\n*Humari team aam taur par 24 ghante me reply karti hai.*",
+        "support": "📞 <b>Customer Support</b>\n\nAgar aapko payment, tasks, ya setup me madad chahiye, toh yahan message karein:\n{link}\n\n*Humari team aam taur par 24 ghante me reply karti hai.*",
         "choose_language": "🌐 Apni bhasha (language) chunein:",
         "language_saved": "✅ Aapki language save ho gayi hai!",
         "faq_title": "❓ <b>FAQ (Page {page} of {pages})</b>",
         "faq_hint": "👇 Jawab dekhne ke liye sawal par tap karein:",
         "faq_answer": "❓ <b>{question}</b>\n\n💡 {answer}",
-        "account_details": "👤 **Mera Account**\n\nNaam: {name}\nUsername: {username}\nUser ID: <code>{user_id}</code>\n\n💎 **Subscription**\nActive Plan: {plan}\nPlan Start Hua: {plan_started}\nPlan Expiry: {expiry}\nLast Transaction ID: <code>{txn_id}</code>\nPayment Status: {payment}\n\n⚙️ **Usage & Status**\nTelegram Status: {session}\nActive Tasks: {tasks}\nAaj ke Messages: {forwarding}\nChannel Membership: {membership}\nLanguage: {user_language}",
-        "login_phone": "📱 **Connect Account**\n\nApna Telegram phone number country code ke sath bhejein.\n\nExample (India): `+919876543210`\n\n⚠️ Dhyan rakhein:\n• Number `+` aur country code se shuru ho\n• Number ke beech me KOI SPACE nahi hona chahiye\n• Sahi: `+914527896325`\n• Galat: `+91 45278 96325`",
-        "login_pin": "🔑 **OTP/PIN Daalein**\n\nTelegram ne aapke app par ek code bheja hoga. Kripya use yahan daalein.\n\n*(Agar code `12345` hai, toh seedha `12345` type karein)*",
-        "login_2fa": "🔒 **Two-Step Verification (Cloud Password)**\n\nAapke account par ek extra password hai (ye aapke account password se <b>alag</b> hai).\n\n<b>Kya daalna hai:</b>\n• Telegram Settings → Privacy → Two-Step Verification me jo 'Cloud Password' set kiya hai wahi.\n• Ye aapke SMS login code se <b>different</b> hai.\n\n<b>Agar bhool gaye:</b>\n1. Phone me Telegram kholein\n2. Settings → Privacy → Two-Step Verification par jayein\n3. 'Forgot password?' dabayein aur reset karein\n4. Wapas yahan aakar /connect se retry karein\n\nNeeche apna 2FA password daalein:",
-        "login_success": "✅ **Account Successfully Connect Ho Gaya!**\n\nAb aap tasks bana kar auto-forwarding shuru kar sakte hain.",
+        "account_details": "👤 <b>Mera Account</b>\n\nNaam: {name}\nUsername: {username}\nUser ID: <code>{user_id}</code>\n\n💎 <b>Subscription</b>\nActive Plan: {plan}\nPlan Start Hua: {plan_started}\nPlan Expiry: {expiry}\nLast Transaction ID: <code>{txn_id}</code>\nPayment Status: {payment}\n\n⚙️ <b>Usage & Status</b>\nTelegram Status: {session}\nActive Tasks: {tasks}\nAaj ke Messages: {forwarding}\nChannel Membership: {membership}\nLanguage: {user_language}",
+        "login_phone": "📱 <b>Connect Account</b>\n\nApna Telegram phone number country code ke sath bhejein.\n\nExample (India): <code>+919876543210</code>\n\n⚠️ Dhyan rakhein:\n• Number <code>+</code> aur country code se shuru ho\n• Number ke beech me KOI SPACE nahi hona chahiye\n• Sahi: <code>+914527896325</code>\n• Galat: <code>+91 45278 96325</code>",
+        "login_pin": "🔑 <b>OTP/PIN Daalein</b>\n\nTelegram ne aapke app par ek code bheja hoga. Kripya use yahan daalein.\n\n*(Agar code <code>12345</code> hai, toh seedha <code>12345</code> type karein)*",
+        "login_2fa": "🔒 <b>Two-Step Verification (Cloud Password)</b>\n\nAapke account par ek extra password hai (ye aapke account password se <b>alag</b> hai).\n\n<b>Kya daalna hai:</b>\n• Telegram Settings → Privacy → Two-Step Verification me jo 'Cloud Password' set kiya hai wahi.\n• Ye aapke SMS login code se <b>different</b> hai.\n\n<b>Agar bhool gaye:</b>\n1. Phone me Telegram kholein\n2. Settings → Privacy → Two-Step Verification par jayein\n3. 'Forgot password?' dabayein aur reset karein\n4. Wapas yahan aakar /connect se retry karein\n\nNeeche apna 2FA password daalein:",
+        "login_success": "✅ <b>Account Successfully Connect Ho Gaya!</b>\n\nAb aap tasks bana kar auto-forwarding shuru kar sakte hain.",
         "login_cancelled": "↩️ Login process safely cancel kar diya gaya hai.",
         "login_failed": "⚠️ Login fail ho gaya ya time out ho gaya. Kripya wapas try karein.",
-        "choose_plan": "💎 **Subscription Plan Chunein**\n\nLimits aur features dekhne ke liye neeche se ek plan select karein:",
-        "plan_details": "💎 **{plan} Plan**\n\nFeatures aur Limits:\n{features}\n\nPrice: ₹{monthly} / mahina\n\nNeeche se apna cycle (time) chunein:",
-        "billing_details": "💳 **Checkout Summary**\n\nPlan: {plan}\nCycle: {cycle}\nOriginal Price: {original}\nDiscount: {discount}\n\n**Payable Amount: {payable}**\n\nSecure payment link generate karne ke liye click karein.",
-        "payment_link": "🔗 **Payment Link Ban Gaya Hai**\n\nPlan: {plan} ({cycle})\nAmount: {amount}\n\nRazorpay se payment karne ke liye neeche click karein. Plan apne aap activate ho jayega.",
-        "payment_success": "🎉 **Payment Successful!**\n\nPlan: {plan}\nDays Added: {days} din\nAmount Paid: {amount}\nTransaction ID: <code>{txn_id}</code>\nNayi Expiry: {expiry}\n\nDealsKoti se judne ke liye shukriya! Aapki nayi limits apply ho chuki hain.",
+        "choose_plan": "💎 <b>Subscription Plan Chunein</b>\n\nLimits aur features dekhne ke liye neeche se ek plan select karein:",
+        "plan_details": "💎 <b>{plan} Plan</b>\n\nFeatures aur Limits:\n{features}\n\nPrice: ₹{monthly} / mahina\n\nNeeche se apna cycle (time) chunein:",
+        "billing_details": "💳 <b>Checkout Summary</b>\n\nPlan: {plan}\nCycle: {cycle}\nOriginal Price: {original}\nDiscount: {discount}\n\n<b>Payable Amount: {payable}</b>\n\nSecure payment link generate karne ke liye click karein.",
+        "payment_link": "🔗 <b>Payment Link Ban Gaya Hai</b>\n\nPlan: {plan} ({cycle})\nAmount: {amount}\n\nRazorpay se payment karne ke liye neeche click karein. Plan apne aap activate ho jayega.",
+        "payment_success": "🎉 <b>Payment Successful!</b>\n\nPlan: {plan}\nDays Added: {days} din\nAmount Paid: {amount}\nTransaction ID: <code>{txn_id}</code>\nNayi Expiry: {expiry}\n\nDealsKoti se judne ke liye shukriya! Aapki nayi limits apply ho chuki hain.",
         "payment_failed": "⚠️ Payment initiate nahi ho paya ya cancel ho gaya.",
-        "tasks_title": "📋 **Aapke Forwarding Tasks:**",
+        "tasks_title": "📋 <b>Aapke Forwarding Tasks:</b>",
         "no_tasks_short": "📋 Abhi tak koi task nahi banaya gaya hai. Naya task banane ke liye 'Create New Task' dabayein.",
-        "task_name": "📝 **Naya Task: Naam**\n\nIs task ko pehchanne ke liye ek chota naam bhejein (jaise: `Amazon Deals`):",
-        "task_source": "📥 **Naya Task: Source Chat (Jahan se aayega)**\n\nSource chat se koi bhi message yahan forward karein, ya uska Username/ID bhejein.\n\n*(Aap ek se zyada source add kar sakte hain. Kaam poora hone par `/done` bhejein).* ",
-        "task_destination": "📤 **Naya Task: Destination Chat (Jahan bhejnai hai)**\n\nDestination chat se koi bhi message yahan forward karein, ya uska Username/ID bhejein.\n\n*(Aap ek se zyada destination add kar sakte hain. Kaam poora hone par `/done` bhejein).* ",
+        "task_name": "📝 <b>Naya Task: Naam</b>\n\nIs task ko pehchanne ke liye ek chota naam bhejein (jaise: <code>Amazon Deals</code>):",
+        "task_source": "📥 <b>Naya Task: Source Chat (Jahan se aayega)</b>\n\nSource chat se koi bhi message yahan forward karein, ya uska Username/ID bhejein.\n\n*(Aap ek se zyada source add kar sakte hain. Kaam poora hone par <code>/done</code> bhejein).* ",
+        "task_destination": "📤 <b>Naya Task: Destination Chat (Jahan bhejnai hai)</b>\n\nDestination chat se koi bhi message yahan forward karein, ya uska Username/ID bhejein.\n\n*(Aap ek se zyada destination add kar sakte hain. Kaam poora hone par <code>/done</code> bhejein).* ",
         "task_created": "✅ Task #{task_id} successfully ban gaya hai!\n\nAb aap Tasks menu se iski settings set kar sakte hain ya isko Resume kar sakte hain.",
         "unknown_command": "⚠️ Galat command. Sahi commands ki list dekhne ke liye /help bhejein.",
         # ===== PHASE 2 NEW KEYS =====
@@ -209,8 +222,8 @@ TRANSLATIONS = {
         "feature_locked_short": "🔒 Locked — {required_plan} chahiye",
         "header_prompt": "✏️ Naya <b>Header</b> text bhejein. Ye har forwarded message ke upar add hoga.\n\nHatane ke liye /clear.\nCancel ke liye /back.",
         "footer_prompt": "✏️ Naya <b>Footer</b> text bhejein. Ye har forwarded message ke neeche add hoga.\n\nHatane ke liye /clear.\nCancel ke liye /back.",
-        "replace_prompt": " ️ Replacement rules bhejein.\n\nFormat: <code>purana=naya</code>\nExamples:\n• <code>sale=SALE</code>\n• <code>amazon=Amazon</code>\n\nMultiple rules ke liye comma lagayein.\nSab hatane ke liye /clear.\nCancel ke liye /back.",
-        "blacklist_prompt": "  Words bhejein jo <b>block</b> karne hain. In words wale messages skip ho jayenge.\n\nFormat: <code>spam, scam, ad</code>\nSab hatane ke liye /clear.\nCancel ke liye /back.",
+        "replace_prompt": "✏️ Replacement rules bhejein.\n\nFormat: <code>purana=naya</code>\nExamples:\n• <code>sale=SALE</code>\n• <code>amazon=Amazon</code>\n\nMultiple rules ke liye comma lagayein.\nSab hatane ke liye /clear.\nCancel ke liye /back.",
+        "blacklist_prompt": "🔍 Words bhejein jo <b>block</b> karne hain. In words wale messages skip ho jayenge.\n\nFormat: <code>spam, scam, ad</code>\nSab hatane ke liye /clear.\nCancel ke liye /back.",
         "whitelist_prompt": "🔍 Words bhejein jo <b>required</b> hain. Sirf in me se koi ek word hone wale messages forward honge (khali chhodein toh sab allowed).\n\nFormat: <code>deal, offer, free</code>\nHatane ke liye /clear.\nCancel ke liye /back.",
         "autodelete_prompt": "🗑️ Seconds ki sankhya bhejein. Utne seconds baad message destination se auto-delete ho jayega.\n\nExample: <code>3600</code> (1 ghanta)\nBand karne ke liye <code>0</code> ya /clear.\nCancel ke liye /back.",
         "userfilter_prompt": "👤 <b>Sender Filter</b> — sirf in users ke messages hi source se forward honge; baaki sab skip ho jayenge.\n\nAap Telegram user IDs ya @usernames bhej sakte ho:\nFormat: <code>123456789, @dealkoti</code>\n\nTip: Kisi user ki ID jaanne ke liye uska message @userinfobot ko forward karo.\nSab allow karne ke liye /clear.\nCancel ke liye /back.",
@@ -227,8 +240,8 @@ TRANSLATIONS = {
         "tasks_summary": "📋 <b>Aapke Tasks</b>\n\nPlan: {plan}\nBanaye: {created}\nBache: {remaining}\nTotal allowed: {total}",
         "task_renamed": "✅ Task ka naam <b>{name}</b> ho gaya.",
         "task_rename_prompt": "✏️ Task ke liye naya naam bhejein (max 120 characters).",
-        "rename_empty": " ️ Naam khali nahi ho sakta.",
-        "source_list_title": "  <b>Source Chat Chunein</b>\n\nList se chat pick karein, ya desired chat se koi bhi message forward karein, ya public username/ID type karein.\n\nTip: Chat ko temporarily pin kar lein taaki asani se mile.",
+        "rename_empty": "⚠️ Naam khali nahi ho sakta.",
+        "source_list_title": "📥 <b>Source Chat Chunein</b>\n\nList se chat pick karein, ya desired chat se koi bhi message forward karein, ya public username/ID type karein.\n\nTip: Chat ko temporarily pin kar lein taaki asani se mile.",
         "dest_list_title": "📤 <b>Destination Chat Chunein</b>\n\nList se chat pick karein, ya desired chat se koi bhi message forward karein, ya public username/ID type karein.",
         "chat_page": "Page {page} / {pages}",
         "no_chats_found": "⚠️ Aapke account par abhi koi chat nahi mili. Koi message forward karein ya public @username type karein.",
@@ -240,7 +253,7 @@ TRANSLATIONS = {
         "updates_intro": "📢 <b>Updates Channel</b>\n\nIs channel par milta hai:\n• Naye features\n• Important updates\n• Saare DealsKoti bots ki announcements\n\nBot use karne ke liye joined rehna zaroori hai.",
         "cycle_explainer": "🗓️ <b>Billing Cycles</b>\n\n• <b>Weekly</b>: 7 din\n• <b>Monthly</b>: 30 din\n• <b>Yearly</b>: 365 din aur 20% off\n\nFinal payable amount server-side calculate hoke payment se pehle dikhaya jata hai.",
         "next_scheduled_plan": "📅 <b>Scheduled:</b> {plan} {date} se shuru",
-        "expired_notice": "  Aapka {plan} plan expire ho gaya. /plans se renew karein.",
+        "expired_notice": "⏳ Aapka {plan} plan expire ho gaya. /plans se renew karein.",
         "downgrade_scheduled_notice": "📅 Aapka current plan {date} tak active rahega. Phir {scheduled} par switch hoga.",
         "validation_invalid": "⚠️ Galat input. Kripya dobara try karein ya /back bhejein.",
         "disconnect_confirm": "⚠️ <b>Telegram Disconnect Karein?</b>\n\nAapka session remove ho jayega aur tasks pause ho jayenge. Subscription aur data safe hain.",
@@ -252,7 +265,8 @@ TRANSLATIONS = {
         # ===== PHASE 1 NEW KEYS =====
         "already_connected": "ℹ️ Aap already connected ho. Dobara connect karne se purana session replace ho jayega.",
         "reconnect_anyway": "🔄 Phir Se Connect Karo",
-        "invalid_phone": "⚠️ Phone number ka format galat hai.\n\nCountry code ke sath, bina space number bhejein:\n• India: `+919876543210`\n• Format: `+<country code><number>`\n\nDobara try karein:",
+        "invalid_phone": "⚠️ Phone number ka format galat hai.\n\nCountry code ke sath, bina space number bhejein:\n• India: <code>+919876543210</code>\n• Format: <code>+&lt;country code&gt;&lt;number&gt;</code>\n\nDobara try karein:",
+        "picker_bad_number": "⚠️ Upar diye gaye buttons me se koi tap karein, ya list me se number bhejein (jaise <code>3</code>).",
         "help_intro": "📖 <b>Help</b> — Neeche di gayi commands try karo:\n\n{commands}\n\nKisi command par tap karo ya command bhejo, uske features dikhenge.",
         "help_cat_setting": "General bot settings",
         "help_cat_forwarding": "Forwarding se related sab settings",
@@ -266,12 +280,24 @@ TRANSLATIONS = {
         # ===== PHASE 2-5 NEW KEYS =====
         "tier_limit_reached": "⚠️ Aapke paas <b>{plan}</b> plan hai — aap maximum <b>{limit}</b> {field} hi select kar sakte ho.\n\nZyada ke liye plan upgrade karo.",
         "invalid_channel_format": "⚠️ Format galat hai. Channel in formats me bhejein:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
-        "picker_title_src": "📥 <b>Source Chats Chuno</b>\n\nMax {limit} select kar sakte ho. Aap desired chat se koi message FORWARD bhi kar sakte ho, ya @username / t.me link type kar sakte ho.\n\n💡 Tip: Telegram me chat ko pin karo taaki wo list me sabse upar dikhe.",
-        "picker_title_dst": "📤 <b>Destination Chats Chuno</b>\n\nMax {limit} select kar sakte ho. Aap desired chat se koi message FORWARD bhi kar sakte ho, ya @username / t.me link type kar sakte ho.\n\n💡 Tip: Telegram me chat ko pin karo taaki wo list me sabse upar dikhe.",
+        "picker_title_src": "📥 <b>Neeche se number chuno — ye aapka SOURCE banega</b>\nMax {limit} select kar sakte ho.\n\n💡 Tip: Telegram me chat ko pin karo taaki wo list me sabse upar dikhe.",
+        "picker_title_dst": "📤 <b>Neeche se number chuno — ye aapka DESTINATION banega</b>\nMax {limit} select kar sakte ho.\n\n💡 Tip: Telegram me chat ko pin karo taaki wo list me sabse upar dikhe.",
         "picker_done": "✅ Done",
         "picker_refresh": "🔄 List Refresh Karo",
-        "picker_selected_marker": "<----",
-        "picker_instructions": "🔢 Chat ke NUMBER bhejo usse select/deselect karne ke liye\n✅ /done - confirm\n↩️ /back - cancel",
+        "picker_cancel": "✖️ Cancel",
+        "picker_refreshed": "List refresh ho gayi",
+        "picker_expired": "Ye list purani ho gayi hai. 🔄 List Refresh Karo dabao ya dobara shuru karo.",
+        "picker_limit_reached": "⚠️ Aapke plan ki limit {limit} poori ho gayi. Aage badhne ke liye ✅ Done dabao, ya /plans se upgrade karo.",
+        "picker_already_added": "ℹ️ Ye chat pehle se selected hai.",
+        "picker_need_source": "⚠️ Pehle kam se kam ek source chat chuno — upar number button par tap karo.",
+        "picker_need_source_toast": "Pehle ek source chuno",
+        "picker_need_destination": "⚠️ Pehle kam se kam ek destination chat chuno — upar number button par tap karo.",
+        "picker_need_destination_toast": "Pehle ek destination chuno",
+        "sources_updated": "✅ Sources update ho gaye.",
+        "destinations_updated": "✅ Destinations update ho gaye.",
+        "generic_error": "⚠️ Kuch galat ho gaya. Dobara try karein.",
+        "picker_selected_marker": "⬅️ selected",
+        "picker_instructions": "👆 Neeche number button par tap karke chat select/deselect karo\n✅ Ho jaye to <b>Done</b> dabao\n✍️ List me nahi hai? Us chat se koi message forward karo, ya uska @username bhejo",
         "picker_empty": "⚠️ Koi recent chat nahi mila. @username manually type karo ya chat se koi message forward karo.",
         "min_one_source": "⚠️ Pehle kam se kam ek source select karo.",
         "min_one_dest": "⚠️ Pehle kam se kam ek destination select karo.",
@@ -305,12 +331,35 @@ def language_for(pref: str | None) -> str:
         return pref.lower()
     return "en"
 
+
+class _LenientDict(dict):
+    """Leaves unknown placeholders visible instead of raising, so one forgotten
+    format argument can never turn a whole screen into an error message."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
 def t(lang: str, key: str, **kwargs) -> str:
-    """Retrieves and formats a translated string. Raises KeyError if missing (caught by safe_t in main.py)."""
-    text = TRANSLATIONS[lang][key]
-    if kwargs:
-        return text.format(**kwargs)
-    return text
+    """Retrieves and formats a translated string.
+
+    Falls back to English when a key is only present in one language, and never
+    raises on formatting problems — a partially formatted string is far better
+    than an exception mid-conversation.
+    """
+    table = TRANSLATIONS.get(language_for(lang), TRANSLATIONS["en"])
+    text = table.get(key)
+    if text is None:
+        text = TRANSLATIONS["en"].get(key)
+    if text is None:
+        raise KeyError(key)
+    if not kwargs:
+        return text
+    try:
+        return text.format_map(_LenientDict(kwargs))
+    except (IndexError, ValueError, TypeError, AttributeError):
+        # Unbalanced braces in the source string — show it unformatted.
+        return text
 
 def command_help(lang: str) -> str:
     """Generates the localized command help list for normal users."""
