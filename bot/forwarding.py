@@ -427,7 +427,9 @@ class ForwardingEngine:
 
             # --- PLATINUM STORED FILE (auto-attached to every message) ---
             stored_file = None
-            if plan_name == "platinum":
+            # Default ON (matches main.py's toggle default) so existing platinum
+            # tasks keep working until the admin/user explicitly turns it off.
+            if plan_name == "platinum" and settings.get("attach_stored_file", True):
                 with suppress(Exception):
                     stored_file = await self.db.get_stored_file(user_id)
                 if stored_file is not None:
@@ -482,9 +484,10 @@ class ForwardingEngine:
                     else:
                         # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
                         base_text = message.message or ""
-                        if plan_name == "platinum" and watermark_text and media_file is None:
-                            # text watermark only when there's no image watermark to draw
-                            base_text = self._apply_text_watermark(base_text, watermark_text)
+                        # NOTE: text watermarking was removed here — it used to fire
+                        # whenever media_file was None, which also covers plain
+                        # text-only messages (no image at all). Watermark should
+                        # only ever appear ON an image, never appended to text.
                         new_text = self._clean_text(base_text, settings, plan_name)
                         if not new_text and media_file is None:
                             # Nothing to send (e.g. service message) — skip quietly.
@@ -591,9 +594,8 @@ class ForwardingEngine:
         }
 
         base_text = message.text or message.message or ""
-        if settings.get("watermark", False):
-            watermark_text = settings.get("watermark_text") or "Forwarded via DealsKoti"
-            base_text = self._apply_text_watermark(base_text, watermark_text)
+        # Text watermarking removed (see _on_new_message) — watermark only ever
+        # applies to images, never appended to plain text.
         new_text = self._clean_text(base_text, settings, "platinum")
         if not new_text:
             return
@@ -618,12 +620,8 @@ class ForwardingEngine:
                 await client.delete_messages(chat_id, message_id)
 
     # --- WATERMARK ENGINE (Platinum only) ---
-
-    def _apply_text_watermark(self, text: str, watermark_text: str) -> str:
-        """Append a subtle watermark line to text content. Platinum-only feature."""
-        if not text:
-            return watermark_text
-        return f"{text}\n\n— {watermark_text}"
+    # NOTE: text watermarking (_apply_text_watermark) was intentionally removed —
+    # watermark is now an IMAGE-only feature, never appended to text messages.
 
     async def _apply_image_watermark(
         self,
@@ -661,8 +659,10 @@ class ForwardingEngine:
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        # Choose font size proportional to image height (capped)
-        font_size = max(14, min(48, img.size[1] // 20))
+        # Choose font size proportional to image height (capped).
+        # Was max(14, min(48, h//20)) — too small on typical phone-camera photos.
+        # Bigger floor/cap + a larger divisor makes it clearly legible.
+        font_size = max(22, min(72, img.size[1] // 14))
         font = None
         for font_path in (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
