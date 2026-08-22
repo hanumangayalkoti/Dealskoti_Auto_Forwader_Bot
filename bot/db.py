@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_plan VARCHAR(50);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_days INTEGER;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_notified BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS task_reminder_sent BOOLEAN DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS tasks (
     id SERIAL PRIMARY KEY,
@@ -184,6 +185,34 @@ class Database:
             if val: return False
             await conn.execute("UPDATE users SET is_new_notified = TRUE WHERE telegram_user_id = $1", user_id)
             return True
+
+    async def list_users_due_task_reminder(self, hours: int = 24) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT u.*
+                   FROM users u
+                   WHERE u.is_blocked = FALSE
+                     AND u.task_reminder_sent = FALSE
+                     AND u.created_at <= CURRENT_TIMESTAMP - ($1 * INTERVAL '1 hour')
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks t WHERE t.user_id = u.telegram_user_id
+                     )
+                   ORDER BY u.created_at ASC""",
+                hours,
+            )
+
+    async def mark_task_reminder_sent(self, user_id: int) -> bool:
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE users
+                   SET task_reminder_sent = TRUE
+                   WHERE telegram_user_id = $1 AND task_reminder_sent = FALSE
+                   RETURNING telegram_user_id""",
+                user_id,
+            )
+            return row is not None
 
     async def get_user(self, user_id: int) -> asyncpg.Record | None:
         if self.pool is None: return None
@@ -419,6 +448,14 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM stored_files WHERE user_id = $1 ORDER BY id DESC LIMIT 1", user_id)
 
+    async def update_stored_file_path(self, user_id: int, local_path: str) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE stored_files SET local_path = $1 WHERE user_id = $2",
+                local_path, user_id,
+            )
+
     async def delete_stored_file(self, user_id: int) -> bool:
         if self.pool is None: return False
         async with self.pool.acquire() as conn:
@@ -457,9 +494,21 @@ class Database:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                payment = await conn.fetchrow("SELECT user_id, status FROM payments WHERE order_id = $1 FOR UPDATE", order_id)
+                payment = await conn.fetchrow(
+                    """SELECT user_id, status, payable_amount_paise, amount_paise,
+                              plan, cycle
+                       FROM payments WHERE order_id = $1 FOR UPDATE""",
+                    order_id,
+                )
                 if not payment or payment["status"] == "captured":
                     return None  # idempotent: already activated
+                expected_amount = int(payment["payable_amount_paise"] or payment["amount_paise"])
+                if int(amount_paise) != expected_amount:
+                    logger.warning(
+                        "Payment amount mismatch for order %s: expected %s, received %s",
+                        order_id, expected_amount, amount_paise,
+                    )
+                    raise ValueError("Payment amount does not match the order")
 
                 user_id = payment["user_id"]
                 await conn.execute("UPDATE payments SET payment_id = $1, status = 'captured' WHERE order_id = $2", payment_id, order_id)
