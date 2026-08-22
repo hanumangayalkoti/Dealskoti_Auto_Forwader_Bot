@@ -394,7 +394,14 @@ async def start(message: Message, command: CommandObject, db: Database, settings
     if is_new and await db.mark_new_user_notified(message.from_user.id):
         await _notify_admins(
             message.bot, settings,
-            f"🆕 New Dealskoti user\nName: {safe_html(message.from_user.full_name)}\nUsername: @{message.from_user.username or '—'}\nID: <code>{message.from_user.id}</code>"
+            f"🆕 <b>New user started the bot</b>\n"
+            f"Name: {safe_html(message.from_user.full_name)}\n"
+            f"Username: @{safe_html(message.from_user.username or '—')}\n"
+            f"ID: <code>{message.from_user.id}</code>\n"
+            f"Membership: {'✅ Joined' if user['updates_channel_member'] else '❌ Not joined'}\n"
+            f"Plan: {safe_html(str(user['plan']).title())}\n"
+            f"Plan expiry: {user['plan_expiry'] or '—'}\n"
+            f"Telegram account: {'✅ Connected' if await db.has_active_session(message.from_user.id) else '❌ Not connected'}"
         )
     args = (command.args if command else "") or ""
     if args.startswith("ref_"):
@@ -1195,11 +1202,16 @@ async def _start_upload(message_obj, db: Database, settings: Settings, user_id: 
 @router.message(Command("upload_file"))
 async def upload_file_cmd(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
+    user = await db.get_user(message.from_user.id)
+    # This command is Platinum-only. Check the plan before requiring a
+    # connected Telegram account, otherwise lower-tier users see the wrong
+    # "connect your account" flow instead of the upgrade message.
+    if not _is_platinum_file_ready(str(user["plan"]) if user else "free"):
+        return await _start_upload(message, db, settings, message.from_user.id, language)
     connect_msg = await _require_connected(db, message.from_user.id, language)
     if connect_msg:
         return await message.answer(connect_msg, reply_markup=_connect_required_keyboard())
-    user = await db.get_user(message.from_user.id)
-    if _is_platinum_file_ready(str(user["plan"]) if user else "free") and settings.file_storage_channel_id:
+    if settings.file_storage_channel_id:
         await state.set_state(UploadStates.waiting_file)
     await _start_upload(message, db, settings, message.from_user.id, language)
 
@@ -1207,12 +1219,15 @@ async def upload_file_cmd(message: Message, state: FSMContext, db: Database, set
 async def menu_upload(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_platinum_file_ready(str(user["plan"]) if user else "free"):
+        await _start_upload(callback.message, db, settings, callback.from_user.id, language)
+        return await callback.answer()
     connect_msg = await _require_connected(db, callback.from_user.id, language)
     if connect_msg:
         await callback.message.edit_text(connect_msg, reply_markup=_connect_required_keyboard())
         return await callback.answer()
-    user = await db.get_user(callback.from_user.id)
-    if _is_platinum_file_ready(str(user["plan"]) if user else "free") and settings.file_storage_channel_id:
+    if settings.file_storage_channel_id:
         await state.set_state(UploadStates.waiting_file)
     await _start_upload(callback.message, db, settings, callback.from_user.id, language)
     await callback.answer()
@@ -1224,7 +1239,8 @@ async def _do_store_upload(bot: Bot, db: Database, telethon: TelethonService, se
     Shared by the direct-upload path (no existing file) and the replace-confirm path."""
     uploads_dir = Path("uploads")
     uploads_dir.mkdir(exist_ok=True)
-    local_path = uploads_dir / f"{user_id}_{uuid4().hex[:8]}_{file_name}"
+    safe_file_name = os.path.basename(file_name).replace("\x00", "_")
+    local_path = uploads_dir / f"{user_id}_{uuid4().hex[:8]}_{safe_file_name}"
 
     BOT_API_LIMIT = 20 * 1024 * 1024
     try:
@@ -1275,6 +1291,12 @@ async def _do_store_upload(bot: Bot, db: Database, telethon: TelethonService, se
 @router.message(UploadStates.waiting_file)
 async def upload_receive(message: Message, state: FSMContext, db: Database, telethon: TelethonService, settings: Settings) -> None:
     language = await _language_for_message(db, message)
+    user = await db.get_user(message.from_user.id)
+    # Re-check at submission time too: a user may have downgraded while the
+    # upload FSM state was still active.
+    if not _is_platinum_file_ready(str(user["plan"]) if user else "free"):
+        await state.clear()
+        return await message.answer(safe_t(language, "upload_not_platinum"), reply_markup=_nav_keyboard())
     if message.text and message.text.strip() == "/back":
         await state.clear()
         return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
@@ -1318,6 +1340,11 @@ async def upload_receive(message: Message, state: FSMContext, db: Database, tele
 async def upload_replace_cb(callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService, settings: Settings) -> None:
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
+    user = await db.get_user(callback.from_user.id)
+    if not _is_platinum_file_ready(str(user["plan"]) if user else "free"):
+        await state.clear()
+        await callback.message.edit_text(safe_t(language, "upload_not_platinum"), reply_markup=_nav_keyboard())
+        return await callback.answer()
     decision = callback.data.rsplit(":", 1)[1]
     data = await state.get_data()
     pending = data.get("pending_upload")
@@ -1412,7 +1439,7 @@ def _text_or_forwarded_chat_id(message: Message) -> str | None:
 
 CHANNEL_INPUT_RE = re.compile(r"^(?:@[\w]{2,64}|https?://t\.me/\S+|t\.me/\S+|-?\d{5,})$", re.IGNORECASE)
 
-PICKER_DIALOG_LIMIT = 30
+PICKER_DIALOG_LIMIT = 15
 PICKER_BUTTONS_PER_ROW = 5
 
 def _picker_field_state(data: dict, field: str) -> tuple[list, list]:
@@ -1593,8 +1620,33 @@ async def _finish_destinations(message_obj, state: FSMContext, db: Database, tel
                                         list(data.get("sources") or []), destinations)
     await state.clear()
     await forwarding.refresh_task(task_id)
-    # Admins still get the internal task id for support/debugging purposes.
-    await _notify_admins(message_obj.bot, settings, f"➕ New task\nID: {task_id}\nUser: {user_id}")
+    # Send admins a complete task snapshot, not just the internal task id.
+    user = await db.get_user(user_id)
+    source_text = ", ".join(
+        safe_html(str(item.get("title") or item.get("username") or item.get("id")))
+        for item in data.get("sources", []) if isinstance(item, dict)
+    ) or "—"
+    destination_text = ", ".join(
+        safe_html(str(item.get("title") or item.get("username") or item.get("id")))
+        for item in destinations if isinstance(item, dict)
+    ) or "—"
+    session_connected = await db.has_active_session(user_id)
+    await _notify_admins(
+        message_obj.bot, settings,
+        f"➕ <b>New forwarding task created</b>\n"
+        f"Task ID: <code>{task_id}</code>\n"
+        f"Task name: {safe_html(str(data.get('task_name') or 'Task'))}\n"
+        f"User: {safe_html((user['first_name'] if user else None) or '—')}\n"
+        f"Username: @{safe_html((user['username'] if user else None) or '—')}\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Membership: {'✅ Joined' if user and user['updates_channel_member'] else '❌ Not joined'}\n"
+        f"Plan: {safe_html(str(user['plan']).title() if user else 'Free')}\n"
+        f"Plan expiry: {user['plan_expiry'] if user else '—'}\n"
+        f"Telegram account: {'✅ Connected' if session_connected else '❌ Not connected'}\n"
+        f"Sources ({len(data.get('sources', []))}): {source_text}\n"
+        f"Destinations ({len(destinations)}): {destination_text}\n"
+        f"Status: ▶️ Active"
+    )
     # The user themself should never see the raw internal task id — just the
     # confirmation and the name they picked.
     await _reply_or_edit(message_obj, safe_t(language, "task_created", task_name=safe_html(str(data.get("task_name") or "Task"))),
@@ -2262,7 +2314,7 @@ async def weekly_report_callback(callback: CallbackQuery, db: Database, settings
 @router.callback_query(F.data == "admin:users")
 async def recent_users_callback(callback: CallbackQuery, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
-    users = await db.list_users(15)
+    users = await db.list_recent_active_users(6)
     lines = ["👥 <b>Recent Users</b>\n"]
     for u in users: lines.append(f"{u['telegram_user_id']} — {safe_html(u['first_name'] or u['username'] or 'No name')} — {str(u['plan']).title()}")
     await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=admin_keyboard())
@@ -2408,11 +2460,29 @@ async def admin_grant_picker_cb(callback: CallbackQuery, db: Database, settings:
     if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
     await _recent_users_picker_edit(callback, db, "grant", "🎁 <b>Grant days to:</b>")
 
-def _user_info_card(u) -> tuple[str, InlineKeyboardMarkup]:
+async def _full_user_info_card(db: Database, u) -> tuple[str, InlineKeyboardMarkup]:
     label = safe_html(u["first_name"] or u["username"] or "No name")
     block_label = "✅ Unblock" if u["is_blocked"] else "⛔ Block"
     block_action = "unblock" if u["is_blocked"] else "block"
-    text = f"👤 {label}\nID: {u['telegram_user_id']}\nPlan: {u['plan']}\nExpiry: {u['plan_expiry']}\nBlocked: {'Yes' if u['is_blocked'] else 'No'}"
+    task_count = await db.count_tasks(int(u["telegram_user_id"]))
+    connected = await db.has_active_session(int(u["telegram_user_id"]))
+    expiry = u["plan_expiry"] or "—"
+    text = (
+        f"👤 <b>{label}</b>\n"
+        f"Username: @{safe_html(u['username'] or '—')}\n"
+        f"Telegram ID: <code>{u['telegram_user_id']}</code>\n"
+        f"Language: {safe_html(u['preferred_language'] or '—')}\n"
+        f"Membership: {'✅ Joined' if u['updates_channel_member'] else '❌ Not joined'}\n"
+        f"Telegram account: {'✅ Connected' if connected else '❌ Not connected'}\n\n"
+        f"💎 <b>Subscription</b>\n"
+        f"Plan: {safe_html(str(u['plan']).title())}\n"
+        f"Plan expiry: {expiry}\n"
+        f"Scheduled plan: {safe_html(str(u['scheduled_plan']).title()) if u['scheduled_plan'] else '—'}\n\n"
+        f"📋 Tasks: {task_count}\n"
+        f"Blocked: {'Yes' if u['is_blocked'] else 'No'}\n"
+        f"Joined bot: {u['created_at']}\n"
+        f"Last active: {u['last_seen_at']}"
+    )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Grant Days", callback_data=f"admin:grant:{u['telegram_user_id']}"),
          InlineKeyboardButton(text=block_label, callback_data=f"admin:{block_action}:{u['telegram_user_id']}")],
@@ -2434,7 +2504,7 @@ async def admin_userinfo_show_cb(callback: CallbackQuery, db: Database, settings
     if not user:
         await callback.message.edit_text("⚠️ Not found.", reply_markup=admin_keyboard())
         return await callback.answer()
-    text, keyboard = _user_info_card(user)
+    text, keyboard = await _full_user_info_card(db, user)
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
@@ -2483,10 +2553,10 @@ async def grant_days_command(message: Message, db: Database, settings: Settings)
 @router.message(Command("listusers"))
 async def list_users_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
-    users = await db.list_users(15)
+    users = await db.list_recent_active_users(6)
     if not users: return await message.answer("No users found.")
     for u in users:
-        text, keyboard = _user_info_card(u)
+        text, keyboard = await _full_user_info_card(db, u)
         await message.answer(text, reply_markup=keyboard)
 
 @router.callback_query(F.data.startswith("admin:grant:"))
@@ -2547,7 +2617,7 @@ async def user_info_command(message: Message, db: Database, settings: Settings) 
     user_id = await _resolve_target_user(db, parts[1])
     user = await db.get_user(user_id) if user_id else None
     if not user: return await message.answer("⚠️ Not found.")
-    text, keyboard = _user_info_card(user)
+    text, keyboard = await _full_user_info_card(db, user)
     await message.answer(text, reply_markup=keyboard)
 
 @router.message()
@@ -2660,6 +2730,27 @@ async def _membership_monitor(bot: Bot, db: Database, settings: Settings, forwar
         except Exception: logger.exception("Membership monitor iteration failed")
         await asyncio.sleep(300)
 
+async def _send_task_creation_reminders(bot: Bot, db: Database, settings: Settings) -> None:
+    """Nudge users once, 24 hours after signup, when they still have no task."""
+    for user in await db.list_users_due_task_reminder(24):
+        user_id = int(user["telegram_user_id"])
+        support = settings.support_bot_link or "/support"
+        try:
+            await bot.send_message(
+                user_id,
+                "👋 <b>Apna forwarding task banayein</b>\n\n"
+                "Aapne bot start kiya tha, lekin abhi tak koi task nahi banaya. "
+                "Task banakar forwarding start karein.\n\n"
+                f"Kuch samajh na aaye to Support bot se poochhein: {safe_html(support)}",
+                parse_mode="HTML",
+            )
+            await db.mark_task_reminder_sent(user_id)
+        except TelegramForbiddenError:
+            await db.mark_task_reminder_sent(user_id)
+            await db.mark_user_inactive(user_id)
+        except Exception:
+            logger.exception("Could not send task reminder to user %s", user_id)
+
 async def _run(settings: Settings) -> None:
     logging.basicConfig(level=getattr(logging, settings.log_level, logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     db = Database(settings.database_url)
@@ -2668,7 +2759,13 @@ async def _run(settings: Settings) -> None:
     bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     telethon = TelethonService(settings, db)
     billing = RazorpayBilling(settings)
-    forwarding = ForwardingEngine(db, telethon, settings.max_concurrent_forward_tasks)
+    forwarding = ForwardingEngine(
+        db,
+        telethon,
+        settings.max_concurrent_forward_tasks,
+        settings.telegram_bot_token,
+        settings.file_storage_channel_id,
+    )
     
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
@@ -2699,10 +2796,13 @@ async def _run(settings: Settings) -> None:
         downgraded = await db.downgrade_expired_users()
         for row in downgraded:
             with suppress(Exception): await bot.send_message(int(row["telegram_user_id"]), "❌ Your plan has expired and you've been downgraded to Free. Use /plans to resubscribe.")
+    async def send_task_creation_reminders():
+        await _send_task_creation_reminders(bot, db, settings)
 
     scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=timezone), replace_existing=True)
     scheduler.add_job(send_expiry_reminders, CronTrigger(hour=10, minute=0, timezone=timezone), replace_existing=True)
     scheduler.add_job(downgrade_expired_plans, CronTrigger(hour="*", minute=5, timezone=timezone), replace_existing=True)
+    scheduler.add_job(send_task_creation_reminders, CronTrigger(minute=15, timezone=timezone), replace_existing=True)
     scheduler.start()
     
     try:
