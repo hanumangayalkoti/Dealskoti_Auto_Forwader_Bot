@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -118,6 +119,21 @@ async def _notify_admins(bot: Bot, settings: Settings, text: str) -> None:
         except (TelegramForbiddenError, TelegramBadRequest):
             logger.warning("Could not notify admin %s", admin_id)
 
+async def _require_connected(db: Database, user_id: int, language: str) -> str | None:
+    """Returns None if the user has a connected account (may proceed), otherwise
+    returns a 'please connect first' message the caller should show instead of
+    the action they attempted. Menus stay browsable without a connection —
+    only forwarding-related actions (create task, upload file, buy a plan) call this."""
+    if await db.has_active_session(user_id):
+        return None
+    return safe_t(language, "connect_required")
+
+def _connect_required_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+
 def safe_html(text: str) -> str:
     """Safely escape text for HTML parsing to prevent UI breaks."""
     return html.escape(str(text))
@@ -182,6 +198,7 @@ def plans_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🥇 Gold", callback_data="plan:gold"),
                 InlineKeyboardButton(text="💎 Platinum", callback_data="plan:platinum"),
             ],
+            [InlineKeyboardButton(text="📊 Compare All Plans", callback_data="plans:compare")],
             [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]
     )
@@ -292,6 +309,36 @@ def _plan_features(plan_name: str) -> str:
         f"Forwarding: {'Priority' if plan_name in {'gold', 'platinum'} else 'Standard'}\n"
         f"Messages: {daily}"
     )
+
+def _plans_comparison_text(user: dict | None, language: str) -> str:
+    """Full side-by-side breakdown of every plan-specific behaviour — not just
+    limits, but what actually changes about how forwarding works on each tier."""
+    current_plan = str(user["plan"]) if user else "free"
+    on, off = "✅", "❌"
+
+    def row(label: str, values: dict[str, str]) -> str:
+        return f"<b>{label}:</b>\n   🆓 {values['free']} | 🥈 {values['silver']} | 🥇 {values['gold']} | 💎 {values['platinum']}\n"
+
+    lines = ["📊 <b>Compare All Plans</b>\n"]
+    lines.append(row("Forward style", {
+        "free": "Native (keeps 'Forwarded from' tag)", "silver": "Clean copy", "gold": "Clean copy", "platinum": "Clean copy",
+    }))
+    lines.append(row("Header / Footer", {"free": off, "silver": on, "gold": on, "platinum": on}))
+    lines.append(row("Delay / Antiban speed control", {"free": off, "silver": on, "gold": on, "platinum": on}))
+    lines.append(row("Blacklist / Whitelist filter", {"free": off, "silver": off, "gold": on, "platinum": on}))
+    lines.append(row("Replace username/link/word", {"free": off, "silver": off, "gold": off, "platinum": on}))
+    lines.append(row("Sender filter", {"free": off, "silver": off, "gold": off, "platinum": on}))
+    lines.append(row("Watermark (on images only)", {"free": off, "silver": off, "gold": off, "platinum": on}))
+    lines.append(row("Auto-delete timer", {"free": off, "silver": off, "gold": off, "platinum": on}))
+    lines.append(row("Attach uploaded file", {"free": off, "silver": off, "gold": off, "platinum": on}))
+    lines.append("")
+    for key in ("free", "silver", "gold", "platinum"):
+        plan = PLANS[key]
+        daily = f"{plan.daily_messages}/day" if plan.daily_messages else "Unlimited"
+        marker = " 👈 <i>your plan</i>" if key == current_plan else ""
+        icon = {"free": "🆓", "silver": "🥈", "gold": "🥇", "platinum": "💎"}[key]
+        lines.append(f"{icon} <b>{plan.name}</b>{marker} — {plan.tasks} tasks, {plan.sources_per_task} sources, {plan.destinations_per_task} destinations, {daily}")
+    return "\n".join(lines)
 
 def _format_name(user) -> str:
     return safe_html(user["first_name"] or user["username"] or user["telegram_user_id"])
@@ -886,6 +933,18 @@ async def menu_plans(callback: CallbackQuery, db: Database) -> None:
     await callback.message.edit_text(_render_plans_prefix(user, language) + safe_t(language, "choose_plan"), reply_markup=plans_keyboard())
     await callback.answer()
 
+@router.callback_query(F.data == "plans:compare")
+async def plans_compare_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None: return
+    language = await _language_for_callback(db, callback)
+    user = await db.get_user(callback.from_user.id)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Back to Plans", callback_data="menu:plans")],
+        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+    await callback.message.edit_text(_plans_comparison_text(user, language), reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
 @router.callback_query(F.data.startswith("plan:"))
 async def plan_details(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None: return
@@ -927,13 +986,24 @@ async def confirm_payment(callback: CallbackQuery, db: Database, billing: Razorp
     if plan_name not in PLANS or plan_name == "free" or cycle not in {"weekly", "monthly", "yearly"}:
         return await callback.answer("Invalid option", show_alert=True)
     if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language): return
+    connect_msg = await _require_connected(db, callback.from_user.id, language)
+    if connect_msg:
+        await callback.message.edit_text(connect_msg, reply_markup=_connect_required_keyboard())
+        return await callback.answer()
     first_order = not await db.has_paid_order(callback.from_user.id)
     original, discount, payable = payable_amount_paise(plan_name, cycle, first_paid_order=first_order)
     if payable <= 0:
         return await callback.answer("Invalid option", show_alert=True)
-    unique_suffix = uuid4().hex[:10]
+    # Razorpay's reference_id has a strict 40-character limit. Using the full
+    # plan/cycle words + a 10-char suffix could exceed that (e.g. "platinum"
+    # + "monthly" pushed it to 41 chars and Razorpay rejected the link).
+    # Single-letter codes + a shorter suffix keep this comfortably under 40.
+    plan_code = plan_name[0]
+    cycle_code = cycle[0]
+    unique_suffix = uuid4().hex[:12]
+    receipt = f"dk_{callback.from_user.id}_{plan_code}{cycle_code}_{unique_suffix}"
     try:
-        link = await billing.create_payment_link(amount_paise=payable, receipt=f"dk_{callback.from_user.id}_{plan_name}_{cycle}_{unique_suffix}", plan=plan_name, cycle=cycle, user_id=callback.from_user.id)
+        link = await billing.create_payment_link(amount_paise=payable, receipt=receipt, plan=plan_name, cycle=cycle, user_id=callback.from_user.id)
         await db.save_payment(callback.from_user.id, link.link_id, plan_name, cycle, original, discount, payable)
     except BillingError as exc:
         logger.warning("Payment link creation failed for %s: %s", callback.from_user.id, exc)
@@ -966,6 +1036,10 @@ async def payusdt_start(callback: CallbackQuery, db: Database, settings: Setting
     language = await _language_for_callback(db, callback)
     if not settings.usdt_wallet_address:
         return await callback.answer(safe_t(language, "usdt_unavailable"), show_alert=True)
+    connect_msg = await _require_connected(db, callback.from_user.id, language)
+    if connect_msg:
+        await callback.message.edit_text(connect_msg, reply_markup=_connect_required_keyboard())
+        return await callback.answer()
     amount = usdt_amount_usd(plan_name, cycle)
     await _safe_edit(
         callback.message,
@@ -1121,6 +1195,9 @@ async def _start_upload(message_obj, db: Database, settings: Settings, user_id: 
 @router.message(Command("upload_file"))
 async def upload_file_cmd(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
+    connect_msg = await _require_connected(db, message.from_user.id, language)
+    if connect_msg:
+        return await message.answer(connect_msg, reply_markup=_connect_required_keyboard())
     user = await db.get_user(message.from_user.id)
     if _is_platinum_file_ready(str(user["plan"]) if user else "free") and settings.file_storage_channel_id:
         await state.set_state(UploadStates.waiting_file)
@@ -1130,11 +1207,70 @@ async def upload_file_cmd(message: Message, state: FSMContext, db: Database, set
 async def menu_upload(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
+    connect_msg = await _require_connected(db, callback.from_user.id, language)
+    if connect_msg:
+        await callback.message.edit_text(connect_msg, reply_markup=_connect_required_keyboard())
+        return await callback.answer()
     user = await db.get_user(callback.from_user.id)
     if _is_platinum_file_ready(str(user["plan"]) if user else "free") and settings.file_storage_channel_id:
         await state.set_state(UploadStates.waiting_file)
     await _start_upload(callback.message, db, settings, callback.from_user.id, language)
     await callback.answer()
+
+async def _do_store_upload(bot: Bot, db: Database, telethon: TelethonService, settings: Settings,
+                            user_id: int, file_name: str, ext: str, size: int, file_id: str | None,
+                            src_chat_id: int, src_message_id: int, language: str, reply_chat_id: int) -> None:
+    """Downloads + stores the file, then reports success/failure to reply_chat_id.
+    Shared by the direct-upload path (no existing file) and the replace-confirm path."""
+    uploads_dir = Path("uploads")
+    uploads_dir.mkdir(exist_ok=True)
+    local_path = uploads_dir / f"{user_id}_{uuid4().hex[:8]}_{file_name}"
+
+    BOT_API_LIMIT = 20 * 1024 * 1024
+    try:
+        if size <= BOT_API_LIMIT and file_id:
+            tg_file = await bot.get_file(file_id)
+            await bot.download_file(tg_file.file_path, destination=str(local_path))
+        else:
+            ok = await telethon.download_media_big(
+                settings.telegram_bot_token, src_chat_id, src_message_id, str(local_path)
+            )
+            if not ok:
+                raise RuntimeError("MTProto download returned no media")
+    except Exception as exc:
+        logger.error(f"upload download failed: {exc}")
+        await _notify_admins(bot, settings, f"⚠️ Upload download failed for {user_id}: {exc}")
+        await bot.send_message(
+            reply_chat_id,
+            "⚠️ Download failed. Please try again.\n"
+            "If it keeps failing, make sure the file is sent as a Document (File) and not compressed.",
+        )
+        return
+
+    channel_msg_id = None
+    try:
+        sent = await bot.send_document(
+            settings.file_storage_channel_id,
+            document=FSInputFile(str(local_path)),
+            caption=f"storage:{user_id}",
+        )
+        channel_msg_id = sent.message_id
+    except Exception as exc:
+        logger.warning(f"storage-channel copy failed (file kept locally): {exc}")
+        await _notify_admins(bot, settings,
+                             f"⚠️ Storage channel copy failed for user {user_id}: {exc}\n"
+                             f"Check that the bot is an ADMIN in the storage channel ({settings.file_storage_channel_id}).")
+
+    # save_stored_file() replaces any existing row for this user AND deletes the old
+    # physical file from disk — a user can only ever have one stored file at a time.
+    await db.save_stored_file(user_id, file_name, ext, size, str(local_path), channel_msg_id, file_id)
+    size_str = f"{size / (1024*1024):.1f} MB" if size >= 1024*1024 else f"{max(1, size // 1024)} KB"
+    await bot.send_message(
+        reply_chat_id,
+        safe_t(language, "upload_success", name=safe_html(file_name), size=size_str),
+        reply_markup=_nav_keyboard(),
+        parse_mode="HTML",
+    )
 
 @router.message(UploadStates.waiting_file)
 async def upload_receive(message: Message, state: FSMContext, db: Database, telethon: TelethonService, settings: Settings) -> None:
@@ -1153,55 +1289,50 @@ async def upload_receive(message: Message, state: FSMContext, db: Database, tele
     if size > max_bytes:
         return await message.answer(safe_t(language, "upload_too_big", max=settings.max_file_size_mb), parse_mode="HTML")
 
-    uploads_dir = Path("uploads")
-    uploads_dir.mkdir(exist_ok=True)
-    local_path = uploads_dir / f"{message.from_user.id}_{uuid4().hex[:8]}_{file_name}"
-
-    BOT_API_LIMIT = 20 * 1024 * 1024
-    try:
-        if size <= BOT_API_LIMIT:
-            tg_file = await message.bot.get_file(doc.file_id)
-            await message.bot.download_file(tg_file.file_path, destination=str(local_path))
-        else:
-            ok = await telethon.download_media_big(
-                settings.telegram_bot_token, message.chat.id, message.message_id, str(local_path)
-            )
-            if not ok:
-                raise RuntimeError("MTProto download returned no media")
-    except Exception as exc:
-        logger.error(f"upload_receive download failed: {exc}")
-        await _notify_admins(message.bot, settings,
-                             f"⚠️ Upload download failed for {message.from_user.id}: {exc}")
+    # A user can only have ONE stored file. If they already have one, confirm
+    # before replacing it instead of silently overwriting.
+    existing = await db.get_stored_file(message.from_user.id)
+    if existing is not None:
+        await state.update_data(pending_upload={
+            "file_name": file_name, "ext": ext, "size": size,
+            "file_id": getattr(doc, "file_id", None),
+            "chat_id": message.chat.id, "message_id": message.message_id,
+        })
         return await message.answer(
-            "⚠️ Download failed. Please try again.\n"
-            "If it keeps failing, make sure the file is sent as a Document (File) and not compressed."
+            safe_t(language, "upload_replace_confirm", old_name=safe_html(existing["file_name"]), new_name=safe_html(file_name)),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Yes, Replace", callback_data="upload:replace:yes")],
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="upload:replace:no")],
+            ]),
+            parse_mode="HTML",
         )
 
-    channel_msg_id = None
-    try:
-        sent = await message.bot.send_document(
-            settings.file_storage_channel_id,
-            document=FSInputFile(str(local_path)),
-            caption=f"storage:{message.from_user.id}",
-        )
-        channel_msg_id = sent.message_id
-    except Exception as exc:
-        logger.warning(f"storage-channel copy failed (file kept locally): {exc}")
-        await _notify_admins(message.bot, settings,
-                             f"⚠️ Storage channel copy failed for user {message.from_user.id}: {exc}\n"
-                             f"Check that the bot is an ADMIN in the storage channel ({settings.file_storage_channel_id}).")
-
-    await db.save_stored_file(
-        message.from_user.id, file_name, ext, size,
-        str(local_path), channel_msg_id, getattr(doc, "file_id", None),
-    )
     await state.clear()
-    size_str = f"{size / (1024*1024):.1f} MB" if size >= 1024*1024 else f"{max(1, size // 1024)} KB"
-    await message.answer(
-        safe_t(language, "upload_success", name=safe_html(file_name), size=size_str),
-        reply_markup=_nav_keyboard(),
-        parse_mode="HTML",
+    await _do_store_upload(
+        message.bot, db, telethon, settings, message.from_user.id,
+        file_name, ext, size, getattr(doc, "file_id", None),
+        message.chat.id, message.message_id, language, message.chat.id,
     )
+
+@router.callback_query(F.data.startswith("upload:replace:"))
+async def upload_replace_cb(callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService, settings: Settings) -> None:
+    if callback.message is None: return
+    language = await _language_for_callback(db, callback)
+    decision = callback.data.rsplit(":", 1)[1]
+    data = await state.get_data()
+    pending = data.get("pending_upload")
+    await state.clear()
+    if decision != "yes" or not pending:
+        await callback.message.edit_text("↩️ Cancelled.", reply_markup=_nav_keyboard())
+        return await callback.answer()
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_text("⏳ Uploading…", reply_markup=None)
+    await _do_store_upload(
+        callback.bot, db, telethon, settings, callback.from_user.id,
+        pending["file_name"], pending["ext"], pending["size"], pending.get("file_id"),
+        pending["chat_id"], pending["message_id"], language, callback.message.chat.id,
+    )
+    await callback.answer()
 
 # ==========================================
 # TASKS
@@ -1223,6 +1354,9 @@ async def menu_tasks(callback: CallbackQuery, db: Database, settings: Settings) 
 async def new_task_cmd(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
     if not await enforce_gate(message.bot, db, settings, message.from_user.id, language): return
+    connect_msg = await _require_connected(db, message.from_user.id, language)
+    if connect_msg:
+        return await message.answer(connect_msg, reply_markup=_connect_required_keyboard())
     user = await db.get_user(message.from_user.id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
     if await db.count_tasks(message.from_user.id) >= plan.tasks:
@@ -1239,6 +1373,10 @@ async def task_create_cb(callback: CallbackQuery, db: Database, settings: Settin
     if callback.message is None: return
     language = await _language_for_callback(db, callback)
     if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language): return
+    connect_msg = await _require_connected(db, callback.from_user.id, language)
+    if connect_msg:
+        await callback.message.edit_text(connect_msg, reply_markup=_connect_required_keyboard())
+        return await callback.answer()
     user = await db.get_user(callback.from_user.id)
     plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
     if await db.count_tasks(callback.from_user.id) >= plan.tasks:
@@ -1410,10 +1548,17 @@ async def _finish_sources(message_obj, state: FSMContext, db: Database, telethon
         await state.clear()
         if changed:
             await forwarding.refresh_task(int(edit_task_id))
+        # Offer a quick shortcut into editing destinations too, instead of making
+        # the user navigate back to task settings and tap in again.
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Edit Destinations", callback_data=f"task:edit-dest:{edit_task_id}")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data=f"set:task:{edit_task_id}")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ])
         await _reply_or_edit(
             message_obj,
             safe_t(language, "sources_updated") if changed else safe_t(language, "generic_error"),
-            _nav_keyboard(back=f"set:task:{edit_task_id}"), edit,
+            keyboard, edit,
         )
         return None
     await state.update_data(sources=sources, destinations=[], picker_dialogs=None)
@@ -1448,8 +1593,11 @@ async def _finish_destinations(message_obj, state: FSMContext, db: Database, tel
                                         list(data.get("sources") or []), destinations)
     await state.clear()
     await forwarding.refresh_task(task_id)
-    await _notify_admins(message_obj.bot, settings, f"➕ New task\nID: {task_id}")
-    await _reply_or_edit(message_obj, safe_t(language, "task_created", task_id=task_id),
+    # Admins still get the internal task id for support/debugging purposes.
+    await _notify_admins(message_obj.bot, settings, f"➕ New task\nID: {task_id}\nUser: {user_id}")
+    # The user themself should never see the raw internal task id — just the
+    # confirmation and the name they picked.
+    await _reply_or_edit(message_obj, safe_t(language, "task_created", task_name=safe_html(str(data.get("task_name") or "Task"))),
                          _nav_keyboard(), edit)
     return None
 
@@ -1678,7 +1826,11 @@ async def edit_source_cb(callback: CallbackQuery, state: FSMContext, db: Databas
         return await callback.answer("Not found", show_alert=True)
     await state.set_state(TaskStates.waiting_source)
     # Existing channels shown first (pre-selected), then the top-20 recent chats
-    existing = task["sources"] if isinstance(task["sources"], list) else []
+    # BUG FIX: task["sources"] comes back from asyncpg as a raw JSONB *string*,
+    # not a Python list (no type codec registered on the pool) — the old
+    # `isinstance(..., list)` check was always False, silently resetting the
+    # selection to empty every time this screen opened.
+    existing = json.loads(task["sources"]) if isinstance(task["sources"], str) else (task["sources"] or [])
     await state.update_data(edit_task_id=task_id, edit_field="sources", sources=list(existing), picker_dialogs=None)
     language = await _language_for_callback(db, callback)
     await _render_chat_picker(callback.message, db, telethon, state, callback.from_user.id, "src", language, edit=True)
@@ -1692,7 +1844,7 @@ async def edit_dest_cb(callback: CallbackQuery, state: FSMContext, db: Database,
     if not task or int(task["user_id"]) != callback.from_user.id:
         return await callback.answer("Not found", show_alert=True)
     await state.set_state(TaskStates.waiting_destination)
-    existing = task["destinations"] if isinstance(task["destinations"], list) else []
+    existing = json.loads(task["destinations"]) if isinstance(task["destinations"], str) else (task["destinations"] or [])
     await state.update_data(edit_task_id=task_id, edit_field="destinations", destinations=list(existing), picker_dialogs=None)
     language = await _language_for_callback(db, callback)
     await _render_chat_picker(callback.message, db, telethon, state, callback.from_user.id, "dst", language, edit=True)
@@ -1708,7 +1860,7 @@ TIER_FEATURES: dict[str, set[str]] = {
     "gold": {"header", "footer", "blacklist", "whitelist"},
     "platinum": {"header", "footer", "blacklist", "whitelist",
                  "replace_usernames", "replace_links", "replace_words",
-                 "watermark", "auto_delete_seconds", "user_filter"},
+                 "watermark", "auto_delete_seconds", "user_filter", "attach_stored_file"},
 }
 
 # Feature -> (category callback suffix, required plan display name)
@@ -1717,6 +1869,7 @@ FEATURE_META: dict[str, tuple[str, str]] = {
     "watermark":           ("fwd",  "Platinum"),
     "auto_delete_seconds": ("fwd",  "Platinum"),
     "user_filter":         ("fwd",  "Platinum"),
+    "attach_stored_file":  ("fwd",  "Platinum"),
     # Filters & Replacements
     "header":              ("flt",  "Free"),
     "footer":              ("flt",  "Free"),
@@ -1740,6 +1893,7 @@ FEATURE_DISPLAY = {
     "watermark_text": "Watermark Text",
     "auto_delete_seconds": "Auto Delete",
     "user_filter": "Sender Filter",
+    "attach_stored_file": "Attach Uploaded File",
 }
 
 @router.message(Command("setting", "settings"))
@@ -1768,14 +1922,29 @@ async def setting_task_menu(callback: CallbackQuery, db: Database) -> None:
     task_id = int(callback.data.split(":")[2])
     task = await db.get_task(task_id)
     if not task or int(task["user_id"]) != callback.from_user.id: return await callback.answer("Not found", show_alert=True)
-    
+
+    sources = json.loads(task["sources"]) if isinstance(task["sources"], str) else (task["sources"] or [])
+    destinations = json.loads(task["destinations"]) if isinstance(task["destinations"], str) else (task["destinations"] or [])
+    src_names = ", ".join(safe_html(s.get("title") or s.get("id") or "?") for s in sources) or "—"
+    dst_names = ", ".join(safe_html(d.get("title") or d.get("id") or "?") for d in destinations) or "—"
+    status_line = "⏸️ Paused" if task["is_paused"] else "▶️ Active"
+
     rows = [
         [InlineKeyboardButton(text="🔀 Forwarding Controls", callback_data=f"set:cat:{task_id}:fwd")],
         [InlineKeyboardButton(text="🧹 Filters & Replacements", callback_data=f"set:cat:{task_id}:flt")],
         [InlineKeyboardButton(text="📥 Source/Target Channels", callback_data=f"set:cat:{task_id}:ch")],
+        [InlineKeyboardButton(text="▶️ Resume" if task["is_paused"] else "⏸️ Pause",
+                               callback_data=f"task:{'resume' if task['is_paused'] else 'pause'}:{task_id}")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:settings"), InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")]
     ]
-    await callback.message.edit_text(f"⚙️ <b>Settings for:</b> {safe_html(task['task_name'])}\nChoose a category:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    text = (
+        f"⚙️ <b>Settings for:</b> {safe_html(task['task_name'])}\n"
+        f"Status: {status_line}\n\n"
+        f"📥 <b>Sources:</b> {src_names}\n"
+        f"📤 <b>Destinations:</b> {dst_names}\n\n"
+        f"Choose a category:"
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await callback.answer()
 
 def _get_setting_btn(label: str, feature: str, task_id: int, plan_name: str) -> InlineKeyboardButton:
@@ -1810,6 +1979,11 @@ async def _render_settings_category(message_obj, db: Database, user_id: int, tas
         rows.append([_get_setting_btn("🗑️ Auto Delete (secs)", "auto_delete_seconds", task_id, plan_name)])
         rows.append([_get_setting_btn("👤 Sender Filter", "user_filter", task_id, plan_name)])
         if plan_name == "platinum":
+            # Default ON so existing platinum users keep their current behaviour
+            # until they explicitly turn it off.
+            st_with_default = dict(st)
+            st_with_default.setdefault("attach_stored_file", True)
+            rows.append([_get_toggle_btn("📎 Attach Uploaded File", "attach_stored_file", task_id, plan_name, st_with_default)])
             rows.append([InlineKeyboardButton(text="📤 Upload File", callback_data="menu:upload")])
     elif cat == "flt":
         text = "🧹 <b>Filters &amp; Replacements</b>"
@@ -2047,6 +2221,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats"), InlineKeyboardButton(text="📣 Broadcast", callback_data="admin:broadcast:start")],
         [InlineKeyboardButton(text="📅 Weekly Report", callback_data="admin:weekly"), InlineKeyboardButton(text="👥 Recent Users", callback_data="admin:users")],
+        [InlineKeyboardButton(text="👤 User Info", callback_data="admin:userinfo:start"), InlineKeyboardButton(text="🎁 Grant Days", callback_data="admin:grantpicker")],
         [InlineKeyboardButton(text="🏠 User Menu", callback_data="menu:home")],
     ])
 
@@ -2112,22 +2287,17 @@ async def broadcast_message(message: Message, state: FSMContext, settings: Setti
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="All users", callback_data="admin:broadcast:all"), InlineKeyboardButton(text="Active users", callback_data="admin:broadcast:active")],
             [InlineKeyboardButton(text="Paid users", callback_data="admin:broadcast:paid"), InlineKeyboardButton(text="English", callback_data="admin:broadcast:english")],
-            [InlineKeyboardButton(text="Hinglish", callback_data="admin:broadcast:hinglish"), InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")]
+            [InlineKeyboardButton(text="Hinglish", callback_data="admin:broadcast:hinglish"), InlineKeyboardButton(text="👥 Select Users", callback_data="admin:broadcast:selectusers")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")]
         ])
     )
 
-@router.callback_query(F.data.startswith("admin:broadcast:"))
-async def broadcast_send(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
-    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
-    audience = callback.data.rsplit(":", 1)[1]
-    if audience == "start":
-        await state.set_state(AdminBroadcastStates.waiting_message)
-        await callback.message.edit_text("📣 Send broadcast message. /back to cancel.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")]]))
-        return await callback.answer()
+async def _run_broadcast(callback: CallbackQuery, state: FSMContext, db: Database, audience: str, users: list) -> None:
+    """Shared send loop for both the audience-based and the manually-picked-users
+    broadcast paths."""
     data = await state.get_data()
     text = str(data.get("broadcast_text", "")).strip()
     if not text: return await callback.answer("Missing text", show_alert=True)
-    users = await db.list_broadcast_users(audience)
     broadcast_id = await db.create_broadcast(callback.from_user.id, audience, text, len(users))
     sent = failed = blocked = 0
     await callback.message.edit_text(f"📣 Sending to {len(users)} users…", reply_markup=None)
@@ -2145,6 +2315,66 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext, db: Databas
     await callback.message.edit_text(f"✅ Complete\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}", reply_markup=admin_keyboard())
     await callback.answer()
 
+@router.callback_query(F.data.startswith("admin:broadcast:"))
+async def broadcast_send(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
+    audience = callback.data.rsplit(":", 1)[1]
+    if audience == "start":
+        await state.set_state(AdminBroadcastStates.waiting_message)
+        await callback.message.edit_text("📣 Send broadcast message. /back to cancel.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")]]))
+        return await callback.answer()
+    if audience == "selectusers":
+        return await _render_broadcast_user_picker(callback, db, state)
+    users = await db.list_broadcast_users(audience)
+    await _run_broadcast(callback, state, db, audience, users)
+
+async def _render_broadcast_user_picker(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    """Recent active users shown as a toggle-able multi-select list for
+    'Select Users' broadcasts — same tap-to-toggle pattern as the chat picker."""
+    if callback.message is None: return
+    data = await state.get_data()
+    selected: list[int] = list(data.get("broadcast_selected_ids") or [])
+    users = await db.list_recent_active_users(6)
+    if not users:
+        await callback.message.edit_text("No recent active users found.", reply_markup=admin_keyboard())
+        return await callback.answer()
+    rows = []
+    for u in users:
+        uid = int(u["telegram_user_id"])
+        label = safe_html(u["first_name"] or u["username"] or str(uid))
+        mark = "✅ " if uid in selected else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}{label} ({u['plan']})", callback_data=f"admin:selu:toggle:{uid}")])
+    rows.append([InlineKeyboardButton(text=f"✅ Send to {len(selected)} selected", callback_data="admin:selu:done")])
+    rows.append([InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")])
+    await callback.message.edit_text(
+        f"👥 <b>Select users ({len(selected)} picked):</b>\nTap a name to select/deselect.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML",
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:selu:toggle:"))
+async def broadcast_select_user_toggle(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
+    uid = int(callback.data.rsplit(":", 1)[1])
+    data = await state.get_data()
+    selected: list[int] = list(data.get("broadcast_selected_ids") or [])
+    if uid in selected:
+        selected.remove(uid)
+    else:
+        selected.append(uid)
+    await state.update_data(broadcast_selected_ids=selected)
+    await _render_broadcast_user_picker(callback, db, state)
+
+@router.callback_query(F.data == "admin:selu:done")
+async def broadcast_select_user_done(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
+    data = await state.get_data()
+    selected: list[int] = list(data.get("broadcast_selected_ids") or [])
+    if not selected:
+        return await callback.answer("Select at least one user first.", show_alert=True)
+    users = await db.list_users_by_ids(selected)
+    await _run_broadcast(callback, state, db, "selected", users)
+
 async def _recent_users_picker(message: Message, db: Database, action: str, title: str) -> None:
     """Shows the 6 most recently active users as inline buttons for an admin action."""
     users = await db.list_recent_active_users(6)
@@ -2156,6 +2386,57 @@ async def _recent_users_picker(message: Message, db: Database, action: str, titl
         rows.append([InlineKeyboardButton(text=f"👤 {label} ({u['plan']})", callback_data=f"admin:{action}:{u['telegram_user_id']}")])
     rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
     await message.answer(title, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+async def _recent_users_picker_edit(callback: CallbackQuery, db: Database, action: str, title: str) -> None:
+    """Same as _recent_users_picker but edits the existing admin-panel message
+    in place, for use from inline admin-panel buttons."""
+    users = await db.list_recent_active_users(6)
+    if callback.message is None: return
+    if not users:
+        await callback.message.edit_text("No users found.", reply_markup=admin_keyboard())
+        return await callback.answer()
+    rows = []
+    for u in users:
+        label = safe_html(u["first_name"] or u["username"] or str(u["telegram_user_id"]))
+        rows.append([InlineKeyboardButton(text=f"👤 {label} ({u['plan']})", callback_data=f"admin:{action}:{u['telegram_user_id']}")])
+    rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
+    await callback.message.edit_text(title, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+@router.callback_query(F.data == "admin:grantpicker")
+async def admin_grant_picker_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
+    await _recent_users_picker_edit(callback, db, "grant", "🎁 <b>Grant days to:</b>")
+
+def _user_info_card(u) -> tuple[str, InlineKeyboardMarkup]:
+    label = safe_html(u["first_name"] or u["username"] or "No name")
+    block_label = "✅ Unblock" if u["is_blocked"] else "⛔ Block"
+    block_action = "unblock" if u["is_blocked"] else "block"
+    text = f"👤 {label}\nID: {u['telegram_user_id']}\nPlan: {u['plan']}\nExpiry: {u['plan_expiry']}\nBlocked: {'Yes' if u['is_blocked'] else 'No'}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Grant Days", callback_data=f"admin:grant:{u['telegram_user_id']}"),
+         InlineKeyboardButton(text=block_label, callback_data=f"admin:{block_action}:{u['telegram_user_id']}")],
+        [InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")],
+    ])
+    return text, keyboard
+
+@router.callback_query(F.data == "admin:userinfo:start")
+async def admin_userinfo_picker_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
+    await _recent_users_picker_edit(callback, db, "uinfo", "👤 <b>View info for:</b>")
+
+@router.callback_query(F.data.startswith("admin:uinfo:"))
+async def admin_userinfo_show_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id): return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None: return
+    target_user_id = int(callback.data.rsplit(":", 1)[1])
+    user = await db.get_user(target_user_id)
+    if not user:
+        await callback.message.edit_text("⚠️ Not found.", reply_markup=admin_keyboard())
+        return await callback.answer()
+    text, keyboard = _user_info_card(user)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
 
 @router.message(Command("block", "unblock"))
 async def block_user_command(message: Message, db: Database, settings: Settings, forwarding: ForwardingEngine) -> None:
@@ -2195,15 +2476,9 @@ async def grant_days_command(message: Message, db: Database, settings: Settings)
     changed = await db.set_plan(user_id, plan_key, int(parts[2]))
     await message.answer(f"✅ {plan_key} granted." if changed else "⚠️ Not found.")
 
-@router.message(Command("setplan"))
-async def set_plan_command(message: Message, db: Database, settings: Settings) -> None:
-    if not _is_admin(settings, message.from_user.id): return
-    parts = (message.text or "").split()
-    if len(parts) != 4 or parts[2].lower() not in PLANS or not parts[3].isdigit(): return await message.answer("Usage: /setplan &lt;user&gt; &lt;plan&gt; &lt;days&gt;")
-    user_id = await _resolve_target_user(db, parts[1])
-    if user_id is None: return await message.answer("⚠️ Not found.")
-    changed = await db.set_plan(user_id, parts[2].lower(), int(parts[3]))
-    await message.answer("✅ Updated." if changed else "⚠️ Not found.")
+# NOTE: /setplan was removed — it duplicated /grantdays (both set plan+days on a
+# user). /grantdays with an explicit plan argument covers the same case:
+# "/grantdays <user> <days> <plan>".
 
 @router.message(Command("listusers"))
 async def list_users_command(message: Message, db: Database, settings: Settings) -> None:
@@ -2211,16 +2486,8 @@ async def list_users_command(message: Message, db: Database, settings: Settings)
     users = await db.list_users(15)
     if not users: return await message.answer("No users found.")
     for u in users:
-        label = safe_html(u["first_name"] or u["username"] or "No name")
-        block_label = "✅ Unblock" if u["is_blocked"] else "⛔ Block"
-        block_action = "unblock" if u["is_blocked"] else "block"
-        await message.answer(
-            f"👤 {label}\nID: {u['telegram_user_id']}\nPlan: {u['plan']}\nBlocked: {'Yes' if u['is_blocked'] else 'No'}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🎁 Grant Days", callback_data=f"admin:grant:{u['telegram_user_id']}"),
-                InlineKeyboardButton(text=block_label, callback_data=f"admin:{block_action}:{u['telegram_user_id']}")
-            ]]), parse_mode="HTML"
-        )
+        text, keyboard = _user_info_card(u)
+        await message.answer(text, reply_markup=keyboard)
 
 @router.callback_query(F.data.startswith("admin:grant:"))
 async def admin_grant_pick_plan(callback: CallbackQuery, settings: Settings) -> None:
@@ -2274,11 +2541,14 @@ async def referral_payout_command(message: Message, db: Database, settings: Sett
 async def user_info_command(message: Message, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, message.from_user.id): return
     parts = (message.text or "").split()
-    if len(parts) != 2: return await message.answer("Usage: /userinfo &lt;user&gt;")
+    if len(parts) == 1:
+        return await _recent_users_picker(message, db, "uinfo", "👤 <b>View info for:</b>")
+    if len(parts) != 2: return await message.answer("Usage: /userinfo &lt;user&gt;\nOr send /userinfo without args to pick from buttons.", parse_mode="HTML")
     user_id = await _resolve_target_user(db, parts[1])
     user = await db.get_user(user_id) if user_id else None
     if not user: return await message.answer("⚠️ Not found.")
-    await message.answer(f"👤 {user['telegram_user_id']}\nPlan: {user['plan']}\nExpiry: {user['plan_expiry']}\nBlocked: {user['is_blocked']}")
+    text, keyboard = _user_info_card(user)
+    await message.answer(text, reply_markup=keyboard)
 
 @router.message()
 async def fallback(message: Message, db: Database) -> None:
