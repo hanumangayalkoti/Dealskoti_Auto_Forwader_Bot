@@ -254,7 +254,9 @@ class TelethonService:
 
     async def get_top_dialogs(self, user_id: int, limit: int = 20) -> list[dict]:
         """Returns the user's most recent chats/channels (pinned chats come first,
-        matching Telegram's own dialog order)."""
+        matching Telegram's own dialog order). Includes bots, groups, channels and
+        private chats alike — the only things ever left out are chats Telegram
+        itself won't let this account see (e.g. it isn't a member)."""
         session_string = await self._get_session_string(user_id)
         if not session_string:
             return []
@@ -263,12 +265,13 @@ class TelethonService:
         try:
             await client.connect()
             if not await client.is_user_authorized():
+                logger.warning(f"get_top_dialogs: session for user {user_id} is not authorized")
                 return []
             async for dialog in client.iter_dialogs(limit=limit):
                 entity = dialog.entity
-                # Skip the bot itself and saved-messages
-                if getattr(entity, "bot", False):
-                    continue
+                # NOTE: bots used to be skipped here — they're included now, so
+                # bots the user's account talks to also show up as pickable
+                # sources/destinations, same as groups/channels/private chats.
                 results.append({
                     "id": entity.id,
                     "title": dialog.title or getattr(entity, "username", "") or str(entity.id),
@@ -277,7 +280,10 @@ class TelethonService:
                     "type": type(entity).__name__,
                 })
         except Exception as e:
-            logger.error(f"Error fetching dialogs for user {user_id}: {e}")
+            # Logged with the full traceback (exc_info) so a genuinely empty
+            # picker (as opposed to "just no chats yet") is diagnosable from
+            # the Railway logs instead of silently returning [].
+            logger.error(f"Error fetching dialogs for user {user_id}: {e}", exc_info=True)
         finally:
             if client.is_connected():
                 await client.disconnect()
