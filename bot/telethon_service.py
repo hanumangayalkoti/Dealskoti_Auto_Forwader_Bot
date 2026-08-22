@@ -23,16 +23,21 @@ class TelethonService:
         self.login_clients: dict[int, dict] = {}
         # Optional at-rest encryption for session strings.
         self._crypto: SessionCrypto | None = None
+        self._encryption_key_configured = bool(settings.session_encryption_key)
         if settings.session_encryption_key:
             try:
                 self._crypto = SessionCrypto(settings.session_encryption_key)
             except ValueError as exc:
-                logger.error("Session encryption disabled: %s", exc)
+                # Never silently fall back to writing a new Telegram session
+                # in plaintext when an encryption key was configured.
+                logger.error("Invalid session encryption key: %s", exc)
 
     # --- DATABASE SESSION HELPERS ---
 
     def _encode_session(self, session_string: str) -> str:
         if self._crypto is None:
+            if self._encryption_key_configured:
+                raise RuntimeError("SESSION_ENCRYPTION_KEY is invalid; refusing to save plaintext session")
             return session_string
         return f"enc:{self._crypto.encrypt(session_string)}"
 
