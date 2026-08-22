@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
+    InputPeerChannel,
+    InputPeerChat,
+    InputPeerUser,
     Message,
     MessageMediaPhoto,
     MessageMediaWebPage,
@@ -63,14 +66,24 @@ def raw_peer_id(value) -> int | None:
     return abs(number)
 
 class ForwardingEngine:
-    def __init__(self, db: Database, telethon: TelethonService, max_concurrent_tasks: int = 100):
+    def __init__(
+        self,
+        db: Database,
+        telethon: TelethonService,
+        max_concurrent_tasks: int = 100,
+        bot_token: str = "",
+        storage_channel_id: int | None = None,
+    ):
         self.db = db
         self.telethon = telethon
         self.max_concurrent = max_concurrent_tasks
+        self.bot_token = bot_token
+        self.storage_channel_id = storage_channel_id
         
         # In-memory stores
         self.clients: dict[int, TelegramClient] = {}  # user_id -> TelegramClient
         self._running = False
+        self._message_semaphore = asyncio.Semaphore(max(1, max_concurrent_tasks))
         # "user_id:raw_source_chat:msg_id" -> {"task_id": int, "dests": [(dest_id, msg_id)]}
         self.edit_map: dict[str, dict] = {}
         # Messages this engine just produced, so we never re-forward our own output
@@ -223,10 +236,19 @@ class ForwardingEngine:
 
         username = (ref.get("username") or "").strip().lstrip("@")
         kind = str(ref.get("type") or "")
-        if kind in ("Channel", "ChannelForbidden"):
-            peer = PeerChannel(raw)
+        access_hash = ref.get("access_hash")
+        if kind in ("Channel", "ChannelForbidden") and access_hash is not None:
+            try:
+                peer = InputPeerChannel(channel_id=raw, access_hash=int(access_hash))
+            except (TypeError, ValueError):
+                peer = PeerChannel(raw)
         elif kind in ("Chat", "ChatForbidden"):
-            peer = PeerChat(raw)
+            peer = InputPeerChat(chat_id=raw)
+        elif kind == "User" and access_hash is not None:
+            try:
+                peer = InputPeerUser(user_id=raw, access_hash=int(access_hash))
+            except (TypeError, ValueError):
+                peer = PeerUser(raw)
         elif kind == "User":
             peer = PeerUser(raw)
         else:
@@ -320,6 +342,10 @@ class ForwardingEngine:
         return text
 
     async def _on_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
+        async with self._message_semaphore:
+            await self._process_new_message(event, user_id)
+
+    async def _process_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         """Triggered when the user's account receives a new message in any chat."""
         message: Message = event.message
         source_raw = raw_peer_id(event.chat_id)
@@ -434,10 +460,32 @@ class ForwardingEngine:
                     stored_file = await self.db.get_stored_file(user_id)
                 if stored_file is not None:
                     local_path = stored_file["local_path"]
-                    # Only a file still present on disk can be re-attached; a bare
-                    # storage-channel message id is not a file reference.
                     if not (local_path and os.path.exists(str(local_path))):
-                        stored_file = None
+                        # Railway's local filesystem is ephemeral. Restore the
+                        # file from the configured Telegram storage channel after
+                        # a restart, then cache the restored path in the DB.
+                        channel_msg_id = stored_file["channel_message_id"]
+                        if self.bot_token and self.storage_channel_id and channel_msg_id:
+                            restored_path = os.path.join(
+                                "uploads",
+                                f"stored_{user_id}_{stored_file['id']}_"
+                                f"{os.path.basename(str(stored_file['file_name'] or 'file.bin')).replace(chr(0), '_')}",
+                            )
+                            os.makedirs("uploads", exist_ok=True)
+                            restored = await self.telethon.download_media_big(
+                                self.bot_token,
+                                self.storage_channel_id,
+                                int(channel_msg_id),
+                                restored_path,
+                            )
+                            if restored:
+                                await self.db.update_stored_file_path(user_id, restored_path)
+                                stored_file = dict(stored_file)
+                                stored_file["local_path"] = restored_path
+                            else:
+                                stored_file = None
+                        else:
+                            stored_file = None
 
             # --- WATERMARK (Platinum) — build media file if enabled ---
             watermark_text = ""
