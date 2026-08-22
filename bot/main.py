@@ -2738,10 +2738,11 @@ async def _send_task_creation_reminders(bot: Bot, db: Database, settings: Settin
         try:
             await bot.send_message(
                 user_id,
-                "👋 <b>Apna forwarding task banayein</b>\n\n"
-                "Aapne bot start kiya tha, lekin abhi tak koi task nahi banaya. "
-                "Task banakar forwarding start karein.\n\n"
-                f"Kuch samajh na aaye to Support bot se poochhein: {safe_html(support)}",
+                safe_t(
+                    language_for(user["preferred_language"]),
+                    "task_creation_reminder",
+                    support=safe_html(support),
+                ),
                 parse_mode="HTML",
             )
             await db.mark_task_reminder_sent(user_id)
@@ -2759,13 +2760,12 @@ async def _run(settings: Settings) -> None:
     bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     telethon = TelethonService(settings, db)
     billing = RazorpayBilling(settings)
-    forwarding = ForwardingEngine(
-        db,
-        telethon,
-        settings.max_concurrent_forward_tasks,
-        settings.telegram_bot_token,
-        settings.file_storage_channel_id,
-    )
+    # Keep startup compatible with older forwarding.py deployments. The
+    # optional storage settings are attached after construction so a partial
+    # file upload cannot prevent the whole bot from booting.
+    forwarding = ForwardingEngine(db, telethon, settings.max_concurrent_forward_tasks)
+    forwarding.bot_token = settings.telegram_bot_token
+    forwarding.storage_channel_id = settings.file_storage_channel_id
     
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
