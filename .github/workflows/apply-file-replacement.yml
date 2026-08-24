@@ -1,0 +1,57 @@
+name: Apply Platinum File Replacement
+
+on:
+  push:
+    branches:
+      - feature/platinum-file-extension-replacement
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Apply extension-based file replacement
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("bot/forwarding.py")
+          text = path.read_text(encoding="utf-8")
+
+          marker = '''def raw_peer_id(value) -> int | None:\n'''
+          helper = '''def _normalise_extension(value) -> str:\n    """Returns a lowercase file extension with a leading dot."""\n    value = str(value or "").strip().lower()\n    if not value:\n        return ""\n    if not value.startswith("."):\n        value = f".{value}"\n    return value\n\n\ndef _message_extension(message: Message) -> str:\n    """Gets the original Telegram message media extension, if available."""\n    file_obj = getattr(message, "file", None)\n    if file_obj is None:\n        return ""\n\n    name = getattr(file_obj, "name", None)\n    if name:\n        ext = os.path.splitext(str(name))[1]\n        if ext:\n            return _normalise_extension(ext)\n\n    return _normalise_extension(getattr(file_obj, "ext", None))\n\n\n'''
+          if marker not in text:
+              raise SystemExit("Could not find raw_peer_id marker")
+          if "def _message_extension(message: Message) -> str:" not in text:
+              text = text.replace(marker, helper + marker, 1)
+
+          old_block = '''            # --- WATERMARK (Platinum) — build media file if enabled\n            watermark_text = ""\n            media_file = message.media\n            if isinstance(media_file, MessageMediaWebPage):\n                # Link previews are not sendable media; the URL lives in the text.\n                media_file = None\n            if plan_name == "platinum" and settings.get("watermark", False):\n                watermark_text = settings.get("watermark_text") or "Forwarded via DealsKoti"\n                if isinstance(message.media, MessageMediaPhoto):\n                    watermarked = await self._apply_image_watermark(\n                        client, message, watermark_text, max_image_bytes=10 * 1024 * 1024\n                    )\n                    if watermarked:\n                        buffer = io.BytesIO(watermarked)\n                        buffer.name = "photo.png"  # Telethon needs a name to infer type\n                        media_file = buffer\n'''
+          new_block = '''            # --- WATERMARK (Platinum) — build media file if enabled\n            watermark_text = ""\n            media_file = message.media\n            if isinstance(media_file, MessageMediaWebPage):\n                # Link previews are not sendable media; the URL lives in the text.\n                media_file = None\n            if plan_name == "platinum" and settings.get("watermark", False):\n                watermark_text = settings.get("watermark_text") or "Forwarded via DealsKoti"\n                if isinstance(message.media, MessageMediaPhoto):\n                    watermarked = await self._apply_image_watermark(\n                        client, message, watermark_text, max_image_bytes=10 * 1024 * 1024\n                    )\n                    if watermarked:\n                        buffer = io.BytesIO(watermarked)\n                        buffer.name = "photo.png"  # Telethon needs a name to infer type\n                        media_file = buffer\n\n            # --- PLATINUM STORED FILE REPLACEMENT ---\n            # The uploaded file is used only when the original message already\n            # contains media and its file extension matches the uploaded file's\n            # extension. This replaces the original media in the same forwarded\n            # message; it is never sent as a separate follow-up message.\n            if stored_file is not None and media_file is not None:\n                original_ext = _message_extension(message)\n                stored_ext = _normalise_extension(stored_file["extension"])\n                if original_ext and stored_ext and original_ext == stored_ext:\n                    replacement_path = stored_file["local_path"]\n                    if replacement_path and os.path.exists(str(replacement_path)):\n                        media_file = str(replacement_path)\n'''
+          if old_block not in text:
+              raise SystemExit("Could not find watermark block")
+          text = text.replace(old_block, new_block, 1)
+
+          old_attach = '''                    # Platinum stored file: auto-attached to every forwarded message\n                    if stored_file is not None:\n                        with suppress(Exception):\n                            extra = await client.send_file(dest_peer, str(stored_file["local_path"]))\n                            if extra is not None:\n                                extra_msg = extra[0] if isinstance(extra, list) else extra\n                                self._remember_send(dest_raw, extra_msg.id)\n\n'''
+          if old_attach not in text:
+              raise SystemExit("Could not find old stored-file attachment block")
+          text = text.replace(old_attach, "", 1)
+
+          path.write_text(text, encoding="utf-8")
+          print("Patched forwarding.py successfully")
+
+      - name: Validate Python syntax
+        run: python -m py_compile bot/forwarding.py
+
+      - name: Commit and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/workflows/apply-file-replacement.yml
+          git add bot/forwarding.py .github/workflows/apply-file-replacement.yml
+          git commit -m "feat: replace stored file by matching extension"
+          git push origin HEAD:feature/platinum-file-extension-replacement
