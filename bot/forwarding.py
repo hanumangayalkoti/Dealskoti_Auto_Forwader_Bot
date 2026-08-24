@@ -6,6 +6,7 @@ import os
 import re
 from contextlib import suppress
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -351,6 +352,13 @@ class ForwardingEngine:
         source_raw = raw_peer_id(event.chat_id)
         if source_raw is None:
             return
+        # A Message received from an event may only contain a bare peer ID.
+        # Native forwarding needs the source entity/access hash explicitly;
+        # otherwise Telethon tries to resolve the source again and can fail
+        # with "Could not find the input entity for PeerUser(...)".
+        source_entity = None
+        with suppress(Exception):
+            source_entity = await event.get_chat()
 
         # Never re-forward something this engine itself just delivered, otherwise
         # A -> B and B -> A task pairs ping-pong forever.
@@ -453,39 +461,38 @@ class ForwardingEngine:
 
             # --- PLATINUM STORED FILE (auto-attached to every message) ---
             stored_file = None
+            stored_file_cleanup_path = None
             # Default ON (matches main.py's toggle default) so existing platinum
             # tasks keep working until the admin/user explicitly turns it off.
             if plan_name == "platinum" and settings.get("attach_stored_file", True):
                 with suppress(Exception):
                     stored_file = await self.db.get_stored_file(user_id)
                 if stored_file is not None:
-                    local_path = stored_file["local_path"]
-                    if not (local_path and os.path.exists(str(local_path))):
-                        # Railway's local filesystem is ephemeral. Restore the
-                        # file from the configured Telegram storage channel after
-                        # a restart, then cache the restored path in the DB.
-                        channel_msg_id = stored_file["channel_message_id"]
-                        if self.bot_token and self.storage_channel_id and channel_msg_id:
-                            restored_path = os.path.join(
-                                "uploads",
-                                f"stored_{user_id}_{stored_file['id']}_"
-                                f"{os.path.basename(str(stored_file['file_name'] or 'file.bin')).replace(chr(0), '_')}",
-                            )
-                            os.makedirs("uploads", exist_ok=True)
-                            restored = await self.telethon.download_media_big(
-                                self.bot_token,
-                                self.storage_channel_id,
-                                int(channel_msg_id),
-                                restored_path,
-                            )
-                            if restored:
-                                await self.db.update_stored_file_path(user_id, restored_path)
-                                stored_file = dict(stored_file)
-                                stored_file["local_path"] = restored_path
-                            else:
-                                stored_file = None
+                    # Always restore from Telegram, rather than trusting a local
+                    # cache. This makes deleting the storage-channel message
+                    # immediately disable the attachment on future forwards.
+                    channel_msg_id = stored_file["channel_message_id"]
+                    if self.bot_token and self.storage_channel_id and channel_msg_id:
+                        restored_path = os.path.join(
+                            "uploads",
+                            f"stored_{user_id}_{stored_file['id']}_{uuid4().hex[:8]}_"
+                            f"{os.path.basename(str(stored_file['file_name'] or 'file.bin')).replace(chr(0), '_')}",
+                        )
+                        os.makedirs("uploads", exist_ok=True)
+                        restored = await self.telethon.download_media_big(
+                            self.bot_token,
+                            self.storage_channel_id,
+                            int(channel_msg_id),
+                            restored_path,
+                        )
+                        if restored:
+                            stored_file = dict(stored_file)
+                            stored_file["local_path"] = restored_path
+                            stored_file_cleanup_path = restored_path
                         else:
                             stored_file = None
+                    else:
+                        stored_file = None
 
             # --- WATERMARK (Platinum) — build media file if enabled ---
             watermark_text = ""
@@ -528,7 +535,10 @@ class ForwardingEngine:
                 try:
                     # FREE PLAN: Native Forward (Keeps 'Forwarded from' tag)
                     if plan_name == "free":
-                        sent_msg = await client.forward_messages(dest_peer, message)
+                        forward_kwargs = {}
+                        if source_entity is not None:
+                            forward_kwargs["from_peer"] = source_entity
+                        sent_msg = await client.forward_messages(dest_peer, message, **forward_kwargs)
                     else:
                         # PREMIUM PLANS: Clean Copy (No tag, allows formatting)
                         base_text = message.message or ""
@@ -579,6 +589,10 @@ class ForwardingEngine:
 
                     if plan.daily_messages and usage >= plan.daily_messages:
                         break
+
+            if stored_file_cleanup_path:
+                with suppress(Exception):
+                    os.remove(stored_file_cleanup_path)
 
             # Save to Edit Sync Map — AUTOMATIC for Platinum (no toggle needed)
             if plan_name == "platinum" and sent_tracking:
