@@ -44,6 +44,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_plan VARCHAR(50);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS scheduled_days INTEGER;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_new_notified BOOLEAN DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS task_reminder_sent BOOLEAN DEFAULT FALSE;
+-- Existing users must not receive the new-user onboarding reminder. New rows
+-- are explicitly opted into this flow in ensure_user_with_status().
+ALTER TABLE users ADD COLUMN IF NOT EXISTS task_reminder_eligible BOOLEAN DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS tasks (
     id SERIAL PRIMARY KEY,
@@ -173,8 +176,10 @@ class Database:
                 return await conn.fetchrow("SELECT * FROM users WHERE telegram_user_id = $1", user_id), False
             else:
                 await conn.execute(
-                    "INSERT INTO users (telegram_user_id, username, first_name) VALUES ($1, $2, $3)",
-                    user_id, username, first_name
+                    """INSERT INTO users
+                       (telegram_user_id, username, first_name, task_reminder_eligible)
+                       VALUES ($1, $2, $3, TRUE)""",
+                    user_id, username, first_name,
                 )
                 return await conn.fetchrow("SELECT * FROM users WHERE telegram_user_id = $1", user_id), True
 
@@ -186,13 +191,14 @@ class Database:
             await conn.execute("UPDATE users SET is_new_notified = TRUE WHERE telegram_user_id = $1", user_id)
             return True
 
-    async def list_users_due_task_reminder(self, hours: int = 24) -> list[asyncpg.Record]:
+    async def list_users_due_task_reminder(self, hours: int = 12) -> list[asyncpg.Record]:
         if self.pool is None: return []
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """SELECT u.*
                    FROM users u
                    WHERE u.is_blocked = FALSE
+                     AND u.task_reminder_eligible = TRUE
                      AND u.task_reminder_sent = FALSE
                      AND u.created_at <= CURRENT_TIMESTAMP - ($1 * INTERVAL '1 hour')
                      AND NOT EXISTS (
