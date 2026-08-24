@@ -454,7 +454,7 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM stored_files WHERE user_id = $1 ORDER BY id DESC LIMIT 1", user_id)
 
-    async def update_stored_file_path(self, user_id: int, local_path: str) -> None:
+    async def update_stored_file_path(self, user_id: int, local_path: str | None) -> None:
         if self.pool is None: return
         async with self.pool.acquire() as conn:
             await conn.execute(
