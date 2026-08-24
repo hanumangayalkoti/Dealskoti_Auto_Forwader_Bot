@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -157,6 +157,18 @@ async def _menu_text(db: Database, user_id: int, language: str) -> str:
 
 @router.errors()
 async def global_error_handler(event: ErrorEvent, settings: Settings) -> bool:
+    # Telegram can drop the HTTP connection after a callback action has
+    # already completed (commonly during deploys/restarts). Retry the harmless
+    # callback acknowledgement once instead of treating it as a bot failure.
+    if isinstance(event.exception, TelegramNetworkError):
+        callback_query = event.update.callback_query
+        if callback_query is not None:
+            with suppress(Exception):
+                await asyncio.sleep(0.5)
+                await callback_query.answer()
+        logger.warning("Transient Telegram network error while processing update: %s", event.exception)
+        return True
+
     logger.exception("Unhandled error while processing update", exc_info=event.exception)
     update = event.update
     chat_bot: Bot | None = None
