@@ -1272,14 +1272,32 @@ async def _do_store_upload(bot: Bot, db: Database, telethon: TelethonService, se
         )
         channel_msg_id = sent.message_id
     except Exception as exc:
-        logger.warning(f"storage-channel copy failed (file kept locally): {exc}")
+        logger.warning(f"storage-channel copy failed: {exc}")
         await _notify_admins(bot, settings,
                              f"⚠️ Storage channel copy failed for user {user_id}: {exc}\n"
                              f"Check that the bot is an ADMIN in the storage channel ({settings.file_storage_channel_id}).")
+        with suppress(Exception):
+            local_path.unlink(missing_ok=True)
+        await bot.send_message(
+            reply_chat_id,
+            "⚠️ File could not be saved to the storage channel, so it was not activated. "
+            "Please try again after checking the storage channel.",
+        )
+        return
 
-    # save_stored_file() replaces any existing row for this user AND deletes the old
-    # physical file from disk — a user can only ever have one stored file at a time.
-    await db.save_stored_file(user_id, file_name, ext, size, str(local_path), channel_msg_id, file_id)
+    # The storage channel is the source of truth. Keep only the Telegram message
+    # reference in the DB; a local copy would keep forwarding even after the
+    # user deletes the stored file from the private channel.
+    old_stored = await db.get_stored_file(user_id)
+    if old_stored and old_stored["channel_message_id"]:
+        with suppress(Exception):
+            await bot.delete_message(
+                settings.file_storage_channel_id,
+                int(old_stored["channel_message_id"]),
+            )
+    with suppress(Exception):
+        local_path.unlink(missing_ok=True)
+    await db.save_stored_file(user_id, file_name, ext, size, None, channel_msg_id, file_id)
     size_str = f"{size / (1024*1024):.1f} MB" if size >= 1024*1024 else f"{max(1, size // 1024)} KB"
     await bot.send_message(
         reply_chat_id,
@@ -2731,8 +2749,8 @@ async def _membership_monitor(bot: Bot, db: Database, settings: Settings, forwar
         await asyncio.sleep(300)
 
 async def _send_task_creation_reminders(bot: Bot, db: Database, settings: Settings) -> None:
-    """Nudge users once, 24 hours after signup, when they still have no task."""
-    for user in await db.list_users_due_task_reminder(24):
+    """Nudge eligible new users once, 12 hours after signup, when they have no task."""
+    for user in await db.list_users_due_task_reminder(12):
         user_id = int(user["telegram_user_id"])
         support = settings.support_bot_link or "/support"
         try:
