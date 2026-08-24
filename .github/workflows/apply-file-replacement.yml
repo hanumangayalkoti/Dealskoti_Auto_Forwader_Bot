@@ -1,9 +1,8 @@
 name: Apply Platinum File Replacement
 
 on:
-  push:
-    branches:
-      - feature/platinum-file-extension-replacement
+  pull_request:
+    types: [opened, synchronize]
 
 permissions:
   contents: write
