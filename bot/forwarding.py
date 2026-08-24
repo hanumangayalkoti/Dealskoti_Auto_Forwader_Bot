@@ -6,7 +6,6 @@ import os
 import re
 from contextlib import suppress
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -95,6 +94,8 @@ class ForwardingEngine:
         self._peer_cache: dict[int, dict[int, object]] = {}
         # Users whose dialog list we already pulled once to warm the entity cache
         self._dialogs_synced: set[int] = set()
+        # user_id -> (stored_file_id, monotonic_check_time, exists)
+        self._stored_file_checks: dict[int, tuple[int, float, bool]] = {}
 
     def _remember_send(self, chat_id: int, message_id: int) -> None:
         raw = raw_peer_id(chat_id)
@@ -461,38 +462,71 @@ class ForwardingEngine:
 
             # --- PLATINUM STORED FILE (auto-attached to every message) ---
             stored_file = None
-            stored_file_cleanup_path = None
             # Default ON (matches main.py's toggle default) so existing platinum
             # tasks keep working until the admin/user explicitly turns it off.
             if plan_name == "platinum" and settings.get("attach_stored_file", True):
                 with suppress(Exception):
                     stored_file = await self.db.get_stored_file(user_id)
                 if stored_file is not None:
-                    # Always restore from Telegram, rather than trusting a local
-                    # cache. This makes deleting the storage-channel message
-                    # immediately disable the attachment on future forwards.
-                    channel_msg_id = stored_file["channel_message_id"]
-                    if self.bot_token and self.storage_channel_id and channel_msg_id:
-                        restored_path = os.path.join(
-                            "uploads",
-                            f"stored_{user_id}_{stored_file['id']}_{uuid4().hex[:8]}_"
-                            f"{os.path.basename(str(stored_file['file_name'] or 'file.bin')).replace(chr(0), '_')}",
-                        )
-                        os.makedirs("uploads", exist_ok=True)
-                        restored = await self.telethon.download_media_big(
-                            self.bot_token,
-                            self.storage_channel_id,
-                            int(channel_msg_id),
-                            restored_path,
-                        )
-                        if restored:
-                            stored_file = dict(stored_file)
-                            stored_file["local_path"] = restored_path
-                            stored_file_cleanup_path = restored_path
+                    local_path = stored_file["local_path"]
+                    if local_path and os.path.exists(str(local_path)):
+                        # Validate periodically, not for every message. This
+                        # keeps forwarding fast while making a deleted
+                        # storage-channel file stop attaching shortly after.
+                        check = self._stored_file_checks.get(user_id)
+                        now_mono = asyncio.get_running_loop().time()
+                        if (
+                            check is None
+                            or check[0] != int(stored_file["id"])
+                            or now_mono - check[1] >= 60
+                        ):
+                            exists = False
+                            if self.bot_token and self.storage_channel_id and stored_file["channel_message_id"]:
+                                exists = await self.telethon.media_exists_big(
+                                    self.bot_token,
+                                    self.storage_channel_id,
+                                    int(stored_file["channel_message_id"]),
+                                )
+                            self._stored_file_checks[user_id] = (
+                                int(stored_file["id"]), now_mono, exists
+                            )
+                            if not exists:
+                                with suppress(Exception):
+                                    os.remove(str(local_path))
+                                await self.db.update_stored_file_path(user_id, None)
+                                stored_file = None
+                    if stored_file is not None and not (
+                        stored_file["local_path"] and os.path.exists(str(stored_file["local_path"]))
+                    ):
+                        # Railway's local filesystem is ephemeral. Restore only
+                        # when the local cache is missing.
+                        channel_msg_id = stored_file["channel_message_id"]
+                        if self.bot_token and self.storage_channel_id and channel_msg_id:
+                            restored_path = os.path.join(
+                                "uploads",
+                                f"stored_{user_id}_{stored_file['id']}_"
+                                f"{os.path.basename(str(stored_file['file_name'] or 'file.bin')).replace(chr(0), '_')}",
+                            )
+                            os.makedirs("uploads", exist_ok=True)
+                            restored = await self.telethon.download_media_big(
+                                self.bot_token,
+                                self.storage_channel_id,
+                                int(channel_msg_id),
+                                restored_path,
+                            )
+                            if restored:
+                                await self.db.update_stored_file_path(user_id, restored_path)
+                                stored_file = dict(stored_file)
+                                stored_file["local_path"] = restored_path
+                                self._stored_file_checks[user_id] = (
+                                    int(stored_file["id"]),
+                                    asyncio.get_running_loop().time(),
+                                    True,
+                                )
+                            else:
+                                stored_file = None
                         else:
                             stored_file = None
-                    else:
-                        stored_file = None
 
             # --- WATERMARK (Platinum) — build media file if enabled ---
             watermark_text = ""
@@ -589,10 +623,6 @@ class ForwardingEngine:
 
                     if plan.daily_messages and usage >= plan.daily_messages:
                         break
-
-            if stored_file_cleanup_path:
-                with suppress(Exception):
-                    os.remove(stored_file_cleanup_path)
 
             # Save to Edit Sync Map — AUTOMATIC for Platinum (no toggle needed)
             if plan_name == "platinum" and sent_tracking:
