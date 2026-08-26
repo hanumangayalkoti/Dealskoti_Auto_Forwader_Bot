@@ -30,7 +30,7 @@ PLANS: dict[str, Plan] = {
         sources_per_task=5,
         destinations_per_task=5,
         daily_messages=200,
-        monthly_rupees=149,
+        monthly_rupees=100,
         usdt_monthly_usd=1.5,
     ),
     "gold": Plan(
@@ -39,7 +39,7 @@ PLANS: dict[str, Plan] = {
         sources_per_task=10,
         destinations_per_task=10,
         daily_messages=1000,
-        monthly_rupees=500,
+        monthly_rupees=499,
         usdt_monthly_usd=5.0,
     ),
     "platinum": Plan(
@@ -48,7 +48,7 @@ PLANS: dict[str, Plan] = {
         sources_per_task=15,
         destinations_per_task=15,
         daily_messages=None,  # None means unlimited forwards/day
-        monthly_rupees=1000,
+        monthly_rupees=999,
         usdt_monthly_usd=10.0,
     ),
 }
