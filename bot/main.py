@@ -888,13 +888,18 @@ async def login_phone(message: Message, state: FSMContext, telethon: TelethonSer
 async def login_pin(message: Message, state: FSMContext, telethon: TelethonService, db: Database, forwarding: ForwardingEngine, settings: Settings) -> None:
     if not message.text: return
     language = await _language_for_message(db, message)
-    if message.text.strip() == "/back":
+    raw_pin = message.text.strip()
+    if raw_pin == "/back":
         await telethon.cancel_login(message.from_user.id)
         await state.clear()
         await message.answer(safe_t(language, "login_cancelled"), reply_markup=_nav_keyboard())
         return
+    # The user is asked to type the OTP as "PIN12345" (anti-phishing: the raw
+    # code alone is what Telegram's own login notification shows). Strip that
+    # prefix before handing the code to Telethon, which only wants the digits.
+    pin = raw_pin[3:].strip() if raw_pin.upper().startswith("PIN") else raw_pin
     try:
-        result = await telethon.submit_pin(message.from_user.id, message.text.strip())
+        result = await telethon.submit_pin(message.from_user.id, pin)
     except ValueError as exc:
         await message.answer(f"⚠️ {safe_html(exc)}")
         return
