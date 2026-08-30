@@ -25,6 +25,7 @@ import html
 import json
 import logging
 import re
+from contextlib import suppress
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -36,8 +37,10 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from .db import Database
 from .forwarding import (
     ANTIBAN_PRESETS,
+    CODE_FILTER_MODES,
     DEFAULT_REACTION_EMOJI,
     DELAY_PRESETS,
+    code_filter_mode,
     ForwardingEngine,
     WATERMARK_OPACITIES,
     WATERMARK_POSITIONS,
@@ -215,8 +218,6 @@ _spec("remove_usernames", "🙈 Remove Usernames", CAT_CLEANUP, "toggle", F_REMO
       "remove_usernames_prompt", False)
 _spec("remove_links", "🚫 Remove Links", CAT_CLEANUP, "toggle", F_REMOVE_LINKS,
       "remove_links_prompt", False)
-_spec("mono_text", "🔠 Mono Text", CAT_CLEANUP, "toggle", F_MONO_TEXT,
-      "mono_text_prompt", False)
 _spec("disable_hidden_links", "🕵️ Disable Hidden Links", CAT_CLEANUP, "toggle",
       F_HIDDEN_LINKS, "hidden_links_prompt", False)
 _spec("trim_words", "✂️ Trim Words/Lines", CAT_CLEANUP, "list", F_TRIM_WORDS,
@@ -229,6 +230,10 @@ _spec("whitelist", "✅ Whitelist Keywords", CAT_FILTERS, "list", F_WHITELIST,
       "whitelist_prompt", [])
 _spec("user_filter", "👤 Sender Filter", CAT_FILTERS, "senders", F_SENDER_FILTER,
       "userfilter_prompt", [])
+# Code Filter lives with the other filters because it decides WHICH messages get
+# forwarded, not how their text is styled.
+_spec("mono_text", "🎁 Code Filter", CAT_FILTERS, "choice", F_MONO_TEXT,
+      "mono_text_prompt", "off", tuple(CODE_FILTER_MODES), display="Code Filter")
 
 # --- Replacements ---
 _spec("replace_words", "🔤 Replace Words", CAT_REPLACE, "map", F_REPLACE_WORDS,
@@ -287,6 +292,7 @@ CHOICE_LABELS = {
     "bottom_right": "Bottom Right", "bottom_left": "Bottom Left",
     "top_right": "Top Right", "top_left": "Top Left", "center": "Center",
     "small": "Small", "medium": "Medium", "large": "Large",
+    "mono": "🔠 Monospace only", "spoiler": "🫥 Spoiler only", "both": "🔠+🫥 Both",
     "30": "30%", "50": "50%", "70": "70%", "100": "100%",
 }
 
@@ -308,6 +314,10 @@ def _current_value(settings: dict, spec: Spec):
         style = style if isinstance(style, dict) else {}
         part = {"wm_position": "position", "wm_size": "size", "wm_opacity": "opacity"}[spec.key]
         return str(style.get(part, spec.default))
+    if spec.key == "mono_text":
+        # Stored as a boolean on older tasks; normalise so the picker shows a
+        # tick against the right option instead of nothing.
+        return code_filter_mode(settings)
     value = settings.get(spec.key)
     return spec.default if value is None else value
 
@@ -430,10 +440,13 @@ async def settings_task_menu(callback: CallbackQuery, db: Database) -> None:
                 callback_data=f"st:lock:{task_id}:{specs[0].key}" if specs else "menu:plans",
             )])
 
-    rows.append([InlineKeyboardButton(
-        text="▶️ Resume" if task["is_paused"] else "⏸️ Pause",
-        callback_data=f"task:{'resume' if task['is_paused'] else 'pause'}:{task_id}",
-    )])
+    rows.append([
+        InlineKeyboardButton(
+            text="▶️ Resume" if task["is_paused"] else "⏸️ Pause",
+            callback_data=f"task:{'resume' if task['is_paused'] else 'pause'}:{task_id}",
+        ),
+        InlineKeyboardButton(text="🗑️ Delete Task", callback_data=f"task:delete:{task_id}"),
+    ])
     rows.append([
         InlineKeyboardButton(text="◀️ Back", callback_data="menu:settings"),
         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
@@ -751,6 +764,11 @@ async def _render_topics(
     source_index = max(0, min(source_index, len(forum_sources) - 1))
     source = forum_sources[source_index]
     source_raw = raw_peer_id(source.get("id"))
+
+    # Reading topics goes out to Telegram and can take a few seconds, so show
+    # something immediately rather than leaving the screen looking frozen.
+    with suppress(Exception):
+        await _show(message_obj, "⏳ <b>Loading topics…</b>", None)
 
     topics = await telethon.get_forum_topics(user_id, source)
     if not topics:
