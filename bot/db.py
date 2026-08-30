@@ -19,7 +19,7 @@ from typing import Any
 
 import asyncpg
 
-from .plans import PLANS
+from .plans import PLANS, referral_commission_paise
 
 logger = logging.getLogger("dealskoti.db")
 
@@ -531,7 +531,102 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchval("SELECT COUNT(*) FROM referrals WHERE referrer_id = $1", user_id) or 0
 
+    async def credit_referral_commission(self, referred_id: int, amount_paise: int) -> asyncpg.Record | None:
+        """Adds the referrer's cut of a payment made by `referred_id`.
+
+        Called on EVERY successful payment (card, USDT or Stars), so a referrer
+        keeps earning as long as their referral keeps paying — not just on the
+        first purchase. Returns the updated row (with referrer_id) so the caller
+        can notify them, or None if this user was never referred.
+        """
+        if self.pool is None or amount_paise <= 0:
+            return None
+        commission = referral_commission_paise(amount_paise)
+        if commission <= 0:
+            return None
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """SELECT id, referrer_id FROM referrals
+                       WHERE referred_id = $1 ORDER BY id ASC LIMIT 1 FOR UPDATE""",
+                    referred_id,
+                )
+                if not row:
+                    return None
+                return await conn.fetchrow(
+                    """UPDATE referrals
+                       SET commission_amount_paise = commission_amount_paise + $1,
+                           is_paid = FALSE
+                       WHERE id = $2
+                       RETURNING id, referrer_id, referred_id, commission_amount_paise""",
+                    commission, int(row["id"]),
+                )
+
+    async def referral_summary(self, referrer_id: int) -> dict:
+        """Totals for the /refer screen: how many joined and what is owed."""
+        if self.pool is None:
+            return {"joined": 0, "unpaid_paise": 0, "paid_paise": 0}
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT COUNT(*) AS joined,
+                          COALESCE(SUM(CASE WHEN is_paid = FALSE THEN commission_amount_paise ELSE 0 END), 0) AS unpaid,
+                          COALESCE(SUM(CASE WHEN is_paid = TRUE  THEN commission_amount_paise ELSE 0 END), 0) AS paid
+                   FROM referrals WHERE referrer_id = $1""",
+                referrer_id,
+            )
+        return {
+            "joined": int(row["joined"] or 0),
+            "unpaid_paise": int(row["unpaid"] or 0),
+            "paid_paise": int(row["paid"] or 0),
+        }
+
+    async def payout_referrals(self, referrer_id: int) -> int:
+        """Marks every unpaid commission for a referrer as paid.
+
+        Returns the total paid out in paise, or 0 if there was nothing owed —
+        which lets the admin command tell the difference instead of silently
+        reporting success.
+        """
+        if self.pool is None:
+            return 0
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                total = await conn.fetchval(
+                    """SELECT COALESCE(SUM(commission_amount_paise), 0) FROM referrals
+                       WHERE referrer_id = $1 AND is_paid = FALSE AND commission_amount_paise > 0
+                       FOR UPDATE""",
+                    referrer_id,
+                )
+                total = int(total or 0)
+                if total <= 0:
+                    return 0
+                await conn.execute(
+                    """UPDATE referrals SET is_paid = TRUE
+                       WHERE referrer_id = $1 AND is_paid = FALSE""",
+                    referrer_id,
+                )
+                return total
+
+    async def list_pending_payouts(self, limit: int = 20) -> list[asyncpg.Record]:
+        """Referrers who are owed money — the admin payout queue."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT r.referrer_id,
+                          SUM(r.commission_amount_paise) AS owed,
+                          COUNT(*) AS refs,
+                          u.username, u.first_name
+                   FROM referrals r
+                   LEFT JOIN users u ON u.telegram_user_id = r.referrer_id
+                   WHERE r.is_paid = FALSE AND r.commission_amount_paise > 0
+                   GROUP BY r.referrer_id, u.username, u.first_name
+                   ORDER BY owed DESC
+                   LIMIT $1""",
+                limit,
+            )
+
     async def mark_referral_paid(self, user_id: int) -> asyncpg.Record | None:
+        """Legacy single-row payout, kept so older call sites keep working."""
         if self.pool is None: return None
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT id, referrer_id, commission_amount_paise FROM referrals WHERE referred_id = $1 AND is_paid = FALSE LIMIT 1 FOR UPDATE", user_id)
@@ -547,6 +642,23 @@ class Database:
                 "SELECT * FROM users WHERE is_blocked = FALSE ORDER BY last_seen_at DESC LIMIT $1",
                 limit,
             )
+
+    async def list_users_page(self, offset: int = 0, limit: int = 10) -> list[asyncpg.Record]:
+        """One page of users, most recently active first — what the admin
+        pickers page through."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT * FROM users
+                   ORDER BY last_seen_at DESC NULLS LAST, created_at DESC
+                   OFFSET $1 LIMIT $2""",
+                max(0, offset), max(1, limit),
+            )
+
+    async def count_all_users(self) -> int:
+        if self.pool is None: return 0
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
 
     async def list_users_by_ids(self, user_ids: list[int]) -> list[asyncpg.Record]:
         """Used by the admin 'Select Users' broadcast flow to resolve the final
