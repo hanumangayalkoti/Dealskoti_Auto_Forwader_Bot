@@ -439,6 +439,18 @@ def stars_amount(plan_name: str, cycle: str) -> int:
     return max(1, int(net + 0.999))
 
 
+# Referral commission: the referrer earns this share of every payment their
+# referred user makes, for as long as that user keeps paying.
+REFERRAL_RATE = 0.20
+
+
+def referral_commission_paise(amount_paise: int) -> int:
+    """The referrer's cut of a payment, rounded down to whole paise."""
+    if amount_paise <= 0:
+        return 0
+    return int(amount_paise * REFERRAL_RATE)
+
+
 def format_paise(amount_paise: int) -> str:
     """Formats paise into a readable INR string."""
     return f"₹{amount_paise / 100:.2f}"
