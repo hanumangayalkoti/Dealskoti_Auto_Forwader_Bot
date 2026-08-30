@@ -33,6 +33,8 @@ from telethon.tl.types import (
     InputPeerChat,
     InputPeerUser,
     Message,
+    MessageEntityCode,
+    MessageEntityPre,
     MessageMediaPhoto,
     MessageMediaWebPage,
     PeerChannel,
@@ -143,6 +145,30 @@ def message_topic_id(message: Message) -> int | None:
     if not getattr(reply_to, "forum_topic", False):
         return None
     return getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
+
+
+def extract_mono_spans(text: str, entities) -> list[str]:
+    """Returns every monospace run in a message, in order.
+
+    Covers both inline `code` and ```pre``` blocks. Telegram entity offsets
+    count UTF-16 code units rather than Python characters, so the text is
+    sliced in UTF-16 space — slicing by character index corrupts any message
+    containing an emoji, which deals posts are full of.
+    """
+    if not text or not entities:
+        return []
+    buf = text.encode("utf-16-le")
+    spans: list[str] = []
+    for ent in entities:
+        if not isinstance(ent, (MessageEntityCode, MessageEntityPre)):
+            continue
+        start, end = int(ent.offset) * 2, (int(ent.offset) + int(ent.length)) * 2
+        if start < 0 or end > len(buf) or end <= start:
+            continue
+        piece = buf[start:end].decode("utf-16-le", errors="ignore").strip()
+        if piece:
+            spans.append(piece)
+    return spans
 
 
 def _as_list(value) -> list:
@@ -512,6 +538,22 @@ class ForwardingEngine:
                     footer = str(per_target.get("footer") or "")
         return header, footer
 
+    def mono_enabled(self, settings: dict, plan_name: str) -> bool:
+        return bool(settings.get("mono_text")) and plan_has(plan_name, F_MONO_TEXT)
+
+    def mono_body(self, message: Message | None) -> str:
+        """The monospace-only body of a message, or "" when it has none.
+
+        Mono Text is a FILTER, not a formatter: when it is on, only the parts
+        the source author wrote in monospace (coupon codes, referral codes)
+        are forwarded and all surrounding chatter is dropped. Multiple runs are
+        joined with newlines so a post with several codes keeps all of them.
+        """
+        if message is None:
+            return ""
+        spans = extract_mono_spans(message.message or "", getattr(message, "entities", None))
+        return "\n".join(spans)
+
     def build_text(
         self,
         message: Message | None,
@@ -526,36 +568,48 @@ class ForwardingEngine:
         on, because that is the one case where we inject markup ourselves.
 
         Order matters and is deliberate:
-          1. reveal hidden links   (needs the original entities)
-          2. replacements          (the user's explicit swaps win first)
-          3. trim words/lines
-          4. blanket removals
-          5. mono wrap             (body only)
+          1. mono filter           (keep ONLY the source's monospace parts)
+          2. reveal hidden links   (needs the original entities)
+          3. replacements          (the user's explicit swaps win first)
+          4. trim words/lines
+          5. blanket removals
           6. header / footer       (added last so they are never stripped)
-        """
-        text = base_text or ""
 
-        if text and plan_has(plan_name, F_HIDDEN_LINKS) and settings.get("disable_hidden_links"):
-            entities = getattr(message, "entities", None) if message is not None else None
-            text = self._reveal_hidden_links(text, entities)
+        When Mono Text is on and the source has no monospace content this
+        returns "", and the caller MUST skip the message rather than sending
+        an empty one. Use mono_enabled()/mono_body() to check that up front.
+        """
+        mono = self.mono_enabled(settings, plan_name)
+
+        if mono:
+            text = self.mono_body(message)
+            if not text:
+                return "", None  # nothing monospace in the source — skip it
+        else:
+            text = base_text or ""
+            if text and plan_has(plan_name, F_HIDDEN_LINKS) and settings.get("disable_hidden_links"):
+                entities = getattr(message, "entities", None) if message is not None else None
+                text = self._reveal_hidden_links(text, entities)
 
         if text:
             text = self._apply_replacements(text, settings, plan_name)
             text = self._apply_trim(text, settings, plan_name)
             text = self._apply_removals(text, settings, plan_name)
 
-        mono = bool(settings.get("mono_text")) and plan_has(plan_name, F_MONO_TEXT)
+        if mono and not text.strip():
+            # The cleanup rules stripped the extracted code away entirely.
+            return "", None
+
         header, footer = self._header_footer_for(settings, plan_name, dest_raw)
 
         if mono:
-            # Everything is escaped because we are switching to HTML parse mode.
-            # Only the body becomes monospace — a mono header/footer would make
-            # the user's own branding and links unreadable.
+            # Re-sent as monospace so it stays tap-to-copy in the destination.
+            # Header/footer stay plain, otherwise the user's own branding and
+            # links would become unreadable and unclickable.
             parts = []
             if header:
                 parts.append(html_lib.escape(header))
-            if text.strip():
-                parts.append(f"<code>{html_lib.escape(text)}</code>")
+            parts.append(f"<code>{html_lib.escape(text)}</code>")
             if footer:
                 parts.append(html_lib.escape(footer))
             return "\n\n".join(parts), "html"
@@ -729,8 +783,20 @@ class ForwardingEngine:
             if not destinations:
                 continue
 
+            # MONO TEXT FILTER: forward ONLY what the source wrote in monospace.
+            # A message with no monospace content is skipped entirely — nothing
+            # is sent and no quota is consumed.
+            mono_on = self.mono_enabled(settings, plan_name)
+            if mono_on and not self.mono_body(message):
+                continue
+
             stored_file = await self._resolve_stored_file(user_id, settings, plan_name)
-            media_file = await self._prepare_media(client, message, settings, plan_name)
+            # With the mono filter on the user wants the code only, so media is
+            # deliberately dropped rather than sent alongside it.
+            media_file = (
+                None if mono_on
+                else await self._prepare_media(client, message, settings, plan_name)
+            )
 
             # Speed controls
             dest_delay = (
@@ -926,6 +992,9 @@ class ForwardingEngine:
                     new_text, parse_mode = self.build_text(
                         message, message.message or "", settings, plan_name, dest_raw
                     )
+                    # Empty means the mono filter found nothing in the edited
+                    # version; leave the existing copy alone rather than
+                    # blanking it out.
                     if not new_text:
                         continue
                     try:
