@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import re
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -111,6 +111,32 @@ class AdminBroadcastStates(StatesGroup):
 # ==========================================
 # SMALL HELPERS
 # ==========================================
+
+@asynccontextmanager
+async def _busy(bot: Bot, chat_id: int):
+    """Shows Telegram's native "typing…" indicator while a slow job runs.
+
+    Used only around genuinely slow work (Telegram round-trips: reading the
+    dialog list, validating a chat, uploading a file). Telegram clears the
+    indicator after ~5s, so it is refreshed on a loop until the job finishes.
+    """
+    async def _loop():
+        try:
+            while True:
+                with suppress(Exception):
+                    await bot.send_chat_action(chat_id, "typing")
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            pass
+
+    task = asyncio.create_task(_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
 
 def _is_admin(settings: Settings, user_id: int) -> bool:
     return user_id in settings.admin_telegram_ids
@@ -1054,11 +1080,15 @@ async def upload_receive(
         )
 
     await state.clear()
-    await _do_store_upload(
-        message.bot, db, telethon, settings, message.from_user.id,
-        file_name, ext, size, getattr(doc, "file_id", None),
-        message.chat.id, message.message_id, language, message.chat.id,
-    )
+    progress = await message.answer("⏳ <b>Uploading your file…</b>", parse_mode="HTML")
+    async with _busy(message.bot, message.chat.id):
+        await _do_store_upload(
+            message.bot, db, telethon, settings, message.from_user.id,
+            file_name, ext, size, getattr(doc, "file_id", None),
+            message.chat.id, message.message_id, language, message.chat.id,
+        )
+    with suppress(Exception):
+        await progress.delete()
 
 
 @router.callback_query(F.data.startswith("upload:replace:"))
@@ -1084,12 +1114,13 @@ async def upload_replace_cb(
         return await callback.answer()
 
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text("⏳ Uploading…", reply_markup=None)
-    await _do_store_upload(
-        callback.bot, db, telethon, settings, callback.from_user.id,
-        pending["file_name"], pending["ext"], pending["size"], pending.get("file_id"),
-        pending["chat_id"], pending["message_id"], language, callback.message.chat.id,
-    )
+        await callback.message.edit_text("⏳ <b>Uploading your file…</b>", reply_markup=None)
+    async with _busy(callback.bot, callback.message.chat.id):
+        await _do_store_upload(
+            callback.bot, db, telethon, settings, callback.from_user.id,
+            pending["file_name"], pending["ext"], pending["size"], pending.get("file_id"),
+            pending["chat_id"], pending["message_id"], language, callback.message.chat.id,
+        )
     await callback.answer()
 
 
@@ -1292,7 +1323,13 @@ async def _render_chat_picker(
     data = await state.get_data()
     selected, dialogs = _picker_field_state(data, field)
     if refresh or not dialogs:
-        dialogs = await telethon.get_top_dialogs(user_id, limit=PICKER_DIALOG_LIMIT)
+        # Reading the dialog list is a Telegram round-trip and can take a few
+        # seconds; show a spinner so the screen never looks frozen.
+        if edit and hasattr(message_obj, "edit_text"):
+            with suppress(Exception):
+                await _safe_edit(message_obj, "⏳ <b>Loading your chats…</b>", None)
+        async with _busy(message_obj.bot, message_obj.chat.id):
+            dialogs = await telethon.get_top_dialogs(user_id, limit=PICKER_DIALOG_LIMIT)
         await state.update_data(picker_dialogs=dialogs)
 
     user = await db.get_user(user_id)
@@ -1575,7 +1612,8 @@ async def task_source(
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
     try:
-        entity = await telethon.validate_for_user(message.from_user.id, text)
+        async with _busy(message.bot, message.chat.id):
+            entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         return await message.answer(f"⚠️ {safe_html(exc)}")
     if any(int(e.get("id", 0)) == int(entity.get("id", 0)) for e in sources):
@@ -1627,7 +1665,8 @@ async def task_destination(
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
     try:
-        destination = await telethon.validate_for_user(message.from_user.id, text)
+        async with _busy(message.bot, message.chat.id):
+            destination = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         return await message.answer(f"⚠️ {safe_html(exc)}")
     if any(int(e.get("id", 0)) == int(destination.get("id", 0)) for e in destinations):
@@ -1800,6 +1839,191 @@ async def edit_dest_cb(
     await _render_chat_picker(
         callback.message, db, telethon, state, callback.from_user.id, "dst", language, edit=True,
     )
+    await callback.answer()
+
+
+# ==========================================
+# /config — READ-ONLY CONFIGURATION SUMMARY
+# ==========================================
+# Deliberately shows ONLY features that actually exist in /settings. Listing a
+# toggle here that has no matching control would send users hunting for it.
+
+def _dot(value: bool) -> str:
+    return "🟢 ON" if value else "🔴 OFF"
+
+
+def _filled(value) -> str:
+    """Shows how many entries a filter holds, or that it is empty."""
+    if isinstance(value, dict):
+        return f"✅ [{len(value)} set]" if value else "❌ [Empty]"
+    if isinstance(value, (list, tuple)):
+        return f"✅ [{len(value)} set]" if value else "❌ [Empty]"
+    text = str(value or "").strip()
+    return f"✅ [{text[:24]}]" if text else "❌ [Empty]"
+
+
+def _config_text(task, plan_name: str, language: str) -> str:
+    from .forwarding import CODE_FILTER_OFF, code_filter_mode
+    from .plans import (
+        F_ANTIBAN, F_ATTACH_FILE, F_AUTO_DELETE, F_AUTO_REACTION, F_BLACKLIST,
+        F_DELAY_TIMER, F_FOOTER, F_HEADER, F_HIDDEN_LINKS, F_LINK_PREVIEW,
+        F_MONO_TEXT, F_POST_EDIT_SYNC, F_REMOVE_LINKS, F_REMOVE_USERNAMES,
+        F_REPLACE_LINKS, F_REPLACE_USERNAMES, F_REPLACE_WORDS, F_SENDER_FILTER,
+        F_TOPICS, F_TRIM_WORDS, F_WATERMARK_IMAGE, F_WHITELIST, plan_has,
+    )
+
+    settings = _json_field(task["settings"], {})
+    sources = [s for s in _json_field(task["sources"], []) if isinstance(s, dict)]
+    destinations = [d for d in _json_field(task["destinations"], []) if isinstance(d, dict)]
+
+    def line(label: str, ok: bool, feature: str, extra: str = "") -> str:
+        if not plan_has(plan_name, feature):
+            return f"{label}: 🔒 Locked"
+        return f"{label}: {_dot(ok)}{extra}"
+
+    out: list[str] = []
+    out.append(f"🛠️ <b>Your Current Configuration for {safe_html(task['task_name'])}</b>")
+    out.append("━━━━━━━━━━━━━━━━━━━")
+    out.append("")
+
+    out.append("📥 <b>Source Channels for Copy Post</b>")
+    if sources:
+        for s in sources:
+            out.append(f"   └─ • {safe_html(s.get('title') or s.get('username') or s.get('id'))}")
+    else:
+        out.append("   └─ • ❌ No Source Channels Configured.")
+    out.append("")
+
+    out.append("🎯 <b>Target Channels for Forwarding</b>")
+    if destinations:
+        for d in destinations:
+            out.append(f"   └─ • {safe_html(d.get('title') or d.get('username') or d.get('id'))}")
+    else:
+        out.append("   └─ • ❌ No Target Channels Configured.")
+    out.append("")
+
+    code_mode = code_filter_mode(settings)
+    code_label = {
+        "mono": " [Monospace]", "spoiler": " [Spoiler]", "both": " [Mono + Spoiler]",
+    }.get(code_mode, "")
+    try:
+        auto_delete = int(settings.get("auto_delete_seconds") or 0)
+    except (TypeError, ValueError):
+        auto_delete = 0
+    reaction = settings.get("auto_reaction")
+    reaction = reaction if isinstance(reaction, dict) else {}
+    topics_cfg = settings.get("topics")
+    topics_cfg = topics_cfg if isinstance(topics_cfg, dict) else {}
+    topic_count = sum(len(v) for v in topics_cfg.values() if isinstance(v, list))
+
+    out.append("⚙️ <b>General Settings</b>")
+    out.append(f"  ┌─ Forwarding Status: {_dot(not task['is_paused'])}")
+    out.append(f"  ├─ {line('Header', bool(settings.get('header')), F_HEADER)}")
+    out.append(f"  ├─ {line('Footer', bool(settings.get('footer')), F_FOOTER)}")
+    out.append(f"  ├─ Media Forwarding: {_dot(code_mode == CODE_FILTER_OFF)}"
+               + ("" if code_mode == CODE_FILTER_OFF else " [Off — Code Filter active]"))
+    out.append(f"  ├─ {line('URL Preview', bool(settings.get('link_preview', True)), F_LINK_PREVIEW)}")
+    out.append(f"  ├─ {line('Remove Links', bool(settings.get('remove_links')), F_REMOVE_LINKS)}")
+    out.append(f"  ├─ {line('Remove Usernames', bool(settings.get('remove_usernames')), F_REMOVE_USERNAMES)}")
+    out.append(f"  ├─ {line('Disable Hidden Links', bool(settings.get('disable_hidden_links')), F_HIDDEN_LINKS)}")
+    out.append(f"  ├─ {line('Auto Delete Messages', auto_delete > 0, F_AUTO_DELETE, f' [{auto_delete}s]' if auto_delete else '')}")
+    out.append(f"  ├─ {line('Post Edit Sync', bool(settings.get('post_edit_sync')), F_POST_EDIT_SYNC)}")
+    out.append(f"  ├─ {line('Code Filter', code_mode != CODE_FILTER_OFF, F_MONO_TEXT, code_label)}")
+    out.append(f"  ├─ {line('Topics Forwarding', topic_count > 0, F_TOPICS, f' [{topic_count} topics]' if topic_count else ' [All topics]')}")
+    out.append(f"  ├─ {line('Image Watermark', bool(settings.get('watermark')), F_WATERMARK_IMAGE)}")
+    out.append(f"  ├─ {line('Attach Custom File', bool(settings.get('attach_stored_file', True)), F_ATTACH_FILE)}")
+    out.append(f"  └─ {line('Auto Reaction', bool(reaction.get('enabled')), F_AUTO_REACTION, f" [{reaction.get('emoji')}]" if reaction.get('enabled') else '')}")
+    out.append("")
+
+    def frow(mark: str, label: str, key: str, feature: str) -> str:
+        if not plan_has(plan_name, feature):
+            return f"{mark} {label}: 🔒 Locked"
+        return f"{mark} {label}: {_filled(settings.get(key))}"
+
+    delay = settings.get("delay_timer") or "off"
+    antiban = settings.get("antiban_speed") or "off"
+
+    out.append("🧹 <b>Filters &amp; Replacements</b>")
+    out.append(f"  ┌─ {frow('🚫', 'Blacklist Keywords', 'blacklist', F_BLACKLIST)}")
+    out.append(f"  ├─ {frow('✅', 'Whitelist Keywords', 'whitelist', F_WHITELIST)}")
+    out.append(f"  ├─ {frow('👤', 'Sender Filter', 'user_filter', F_SENDER_FILTER)}")
+    out.append(f"  ├─ {frow('✨', 'Trim Words', 'trim_words', F_TRIM_WORDS)}")
+    out.append(f"  ├─ {frow('🔗', 'Replace Links', 'replace_links', F_REPLACE_LINKS)}")
+    out.append(f"  ├─ {frow('👥', 'Replace Usernames', 'replace_usernames', F_REPLACE_USERNAMES)}")
+    out.append(f"  ├─ {frow('📝', 'Replace Words', 'replace_words', F_REPLACE_WORDS)}")
+    out.append(f"  ├─ {frow('🔼', 'Add Header', 'header', F_HEADER)}")
+    out.append(f"  ├─ {frow('🔽', 'Add Footer', 'footer', F_FOOTER)}")
+    out.append(f"  ├─ ⏳ Target Delay Timer: [{str(delay).title()}]"
+               if plan_has(plan_name, F_DELAY_TIMER) else "  ├─ ⏳ Target Delay Timer: 🔒 Locked")
+    out.append(f"  └─ 🛡️ Anti-Ban Speed: [{str(antiban).title()}]"
+               if plan_has(plan_name, F_ANTIBAN) else "  └─ 🛡️ Anti-Ban Speed: 🔒 Locked")
+    out.append("━━━━━━━━━━━━━━━━━━━")
+    out.append(safe_t(language, "config_footer"))
+    return "\n".join(out)
+
+
+async def _config_task_picker(db: Database, user_id: int) -> InlineKeyboardMarkup | None:
+    tasks = await db.list_tasks(user_id)
+    if not tasks:
+        return None
+    rows = [
+        [InlineKeyboardButton(text=f"🛠️ {t_['task_name'][:28]}", callback_data=f"cfg:show:{t_['id']}")]
+        for t_ in tasks
+    ]
+    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("config"))
+async def config_command(message: Message, db: Database) -> None:
+    language = await _language_for_message(db, message)
+    markup = await _config_task_picker(db, message.from_user.id)
+    if markup is None:
+        return await message.answer(
+            safe_t(language, "config_no_tasks"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+    await message.answer(safe_t(language, "config_select_task"), reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("cfg:show:"))
+async def config_show_cb(callback: CallbackQuery, db: Database) -> None:
+    """Read-only view. Nothing here changes a setting — that is what /settings
+    is for, and the footer says so."""
+    if callback.message is None:
+        return
+    task_id = int(callback.data.rsplit(":", 1)[1])
+    task = await db.get_task(task_id)
+    if not task or int(task["user_id"]) != callback.from_user.id:
+        return await callback.answer("Not found", show_alert=True)
+    user = await db.get_user(callback.from_user.id)
+    plan_name = str(user["plan"]) if user else "free"
+    language = language_for(user["preferred_language"]) if user else "en"
+    await _safe_edit(
+        callback.message,
+        _config_text(task, plan_name, language),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Change Settings", callback_data=f"st:task:{task_id}")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="cfg:list")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg:list")
+async def config_list_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    markup = await _config_task_picker(db, callback.from_user.id)
+    if markup is None:
+        await _safe_edit(callback.message, safe_t(language, "config_no_tasks"), _nav_keyboard())
+        return await callback.answer()
+    await _safe_edit(callback.message, safe_t(language, "config_select_task"), markup)
     await callback.answer()
 
 
