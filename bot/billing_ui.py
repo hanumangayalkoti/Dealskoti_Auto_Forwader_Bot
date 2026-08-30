@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import logging
+from contextlib import suppress
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -40,6 +41,7 @@ from .plans import (
     PLANS,
     duration_days,
     format_paise,
+    payable_amount_paise as _payable,
     payable_amount_paise,
     plan_details_text,
     stars_amount,
@@ -522,6 +524,21 @@ async def proof_submit(
 # ADMIN REVIEW
 # ==========================================
 
+async def _notify_referrer(bot: Bot, db: Database, credited) -> None:
+    """Tells a referrer they just earned. Best-effort — a blocked referrer must
+    never stop a payment from being applied."""
+    referrer_id = int(credited["referrer_id"])
+    language = await _lang(db, referrer_id)
+    with suppress(Exception):
+        await bot.send_message(
+            referrer_id,
+            f"🎁 <b>You earned a referral commission!</b>\n\n"
+            f"Your total unpaid earnings: <b>{format_paise(int(credited['commission_amount_paise']))}</b>\n\n"
+            f"Contact support to request a payout.",
+            parse_mode="HTML",
+        )
+
+
 def _review_markup(request_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Approve", callback_data=f"mp:ok:{request_id}"),
@@ -663,6 +680,14 @@ async def manual_payment_review_cb(
             await forwarding.refresh_user(user_id)
         except Exception as exc:
             logger.warning("Could not hot-reload forwarding for %s: %s", user_id, exc)
+
+    # Referral commission — the referrer earns on EVERY payment, not just the
+    # first, so this runs for manual approvals exactly as it does for cards.
+    with suppress(Exception):
+        _o, _d, payable = _payable(plan_name, cycle)
+        credited = await db.credit_referral_commission(user_id, payable)
+        if credited is not None:
+            await _notify_referrer(callback.bot, db, credited)
 
     user = await db.get_user(user_id)
     expiry = (
