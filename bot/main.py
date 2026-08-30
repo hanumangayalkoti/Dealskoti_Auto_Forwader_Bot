@@ -70,7 +70,7 @@ from .locales import (
     language_for,
     t,
 )
-from .plans import PLANS, duration_days, format_paise, plan_details_text
+from .plans import PLANS, REFERRAL_RATE, duration_days, format_paise
 from .settings_ui import router as settings_router
 from .telethon_service import TelethonService
 
@@ -604,12 +604,14 @@ async def menu_refer(callback: CallbackQuery, db: Database) -> None:
     language = await _language_for_callback(db, callback)
     me = await callback.bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{callback.from_user.id}"
-    count = await db.count_referrals(callback.from_user.id)
-    await _safe_edit(
-        callback.message,
-        safe_t(language, "refer_intro", link=safe_html(link), count=count),
-        _nav_keyboard(),
+    summary = await db.referral_summary(callback.from_user.id)
+    text = (
+        safe_t(language, "refer_intro", link=safe_html(link), count=summary["joined"])
+        + f"\n\n💰 <b>Earnings ({int(REFERRAL_RATE * 100)}% of every payment)</b>\n"
+        + f"Unpaid: <b>{format_paise(summary['unpaid_paise'])}</b>\n"
+        + f"Already paid: {format_paise(summary['paid_paise'])}"
     )
+    await _safe_edit(callback.message, text, _nav_keyboard())
     await callback.answer()
 
 
@@ -2207,7 +2209,10 @@ async def _recent_users_picker_edit(
 async def admin_userinfo_picker_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
-    await _recent_users_picker_edit(callback, db, "uinfo", "👤 <b>View info for:</b>")
+    if callback.message is None:
+        return
+    await _render_user_picker(callback.message, db, "uinfo", ADMIN_PICKER_TITLES["uinfo"], 0)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin:uinfo:"))
@@ -2232,7 +2237,7 @@ async def user_info_command(message: Message, db: Database, settings: Settings) 
         return
     parts = (message.text or "").split()
     if len(parts) == 1:
-        return await _recent_users_picker(message, db, "uinfo", "👤 <b>View info for:</b>")
+        return await _render_user_picker(message, db, "uinfo", ADMIN_PICKER_TITLES["uinfo"], 0)
     if len(parts) != 2:
         return await message.answer(
             "Usage: /userinfo &lt;user&gt;\nOr send /userinfo with no arguments to pick from buttons.",
@@ -2266,9 +2271,7 @@ async def block_user_command(
         return
     parts = (message.text or "").split()
     if len(parts) == 1:
-        cmd = parts[0].lstrip("/").lower()
-        action = "unblock" if cmd == "unblock" else "block"
-        return await _recent_users_picker(message, db, action, f"👥 <b>Select user to {action}:</b>")
+        return await _render_user_picker(message, db, "block", ADMIN_PICKER_TITLES["block"], 0)
     if len(parts) != 2:
         return await message.answer(
             "Usage: /block &lt;telegram_user_id or @username&gt;\n"
@@ -2308,7 +2311,10 @@ async def admin_block_toggle(
 async def admin_grant_picker_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
-    await _recent_users_picker_edit(callback, db, "grant", "🎁 <b>Grant days to:</b>")
+    if callback.message is None:
+        return
+    await _render_user_picker(callback.message, db, "grant", ADMIN_PICKER_TITLES["grant"], 0)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin:grant:"))
@@ -2372,7 +2378,7 @@ async def grant_days_command(
         return
     parts = (message.text or "").split()
     if len(parts) == 1:
-        return await _recent_users_picker(message, db, "grant", "🎁 <b>Grant days to:</b>")
+        return await _render_user_picker(message, db, "grant", ADMIN_PICKER_TITLES["grant"], 0)
     if len(parts) not in (3, 4) or not parts[2].isdigit():
         return await message.answer(
             "Usage: /grantdays &lt;user&gt; &lt;days&gt; [plan]\n"
@@ -2396,21 +2402,289 @@ async def grant_days_command(
     await message.answer(f"✅ {plan_key} granted." if changed else "⚠️ Not found.")
 
 
-@router.message(Command("referralpayout"))
+# ==========================================
+# ADMIN USER PICKER (numbered list, paginated)
+# ==========================================
+# Same shape as the source/destination picker: numbered buttons so nothing has
+# to be typed. Ordered by most recently active, 10 per page.
+
+ADMIN_PAGE_SIZE = 10
+
+
+async def _render_user_picker(
+    message_obj, db: Database, action: str, title: str, page: int = 0,
+) -> None:
+    total = await db.count_all_users()
+    pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    users = await db.list_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
+
+    if not users:
+        text, markup = "No users found.", admin_keyboard()
+    else:
+        lines = [title, ""]
+        number_row: list[InlineKeyboardButton] = []
+        rows: list[list[InlineKeyboardButton]] = []
+        for idx, u in enumerate(users):
+            number = idx + 1
+            uid = int(u["telegram_user_id"])
+            label = safe_html(u["first_name"] or u["username"] or uid)[:26]
+            plan = str(u["plan"] or "free").title()
+            flag = " ⛔" if u["is_blocked"] else ""
+            lines.append(f"{number}. {label} — {plan}{flag}")
+            number_row.append(InlineKeyboardButton(
+                text=str(number), callback_data=f"apick:{action}:{page}:{uid}",
+            ))
+            if len(number_row) == 5:
+                rows.append(number_row)
+                number_row = []
+        if number_row:
+            rows.append(number_row)
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"apage:{action}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"apage:{action}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
+
+        lines.append("")
+        lines.append(f"Page {page + 1} of {pages} · {total} users total")
+        lines.append("👆 Tap a number to select that user")
+        text, markup = "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
+        with suppress(TelegramBadRequest):
+            await message_obj.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            return
+    await message_obj.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+ADMIN_PICKER_TITLES = {
+    "grant": "🎁 <b>Grant days — select a user</b>",
+    "uinfo": "👤 <b>User info — select a user</b>",
+    "block": "⛔ <b>Block / unblock — select a user</b>",
+    "payout": "💰 <b>Referral payout — select a user</b>",
+}
+
+
+@router.callback_query(F.data.startswith("apage:"))
+async def admin_picker_page_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, action, page = callback.data.split(":")
+    await _render_user_picker(
+        callback.message, db, action,
+        ADMIN_PICKER_TITLES.get(action, "👥 <b>Select a user</b>"), int(page),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("apick:"))
+async def admin_picker_select_cb(
+    callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, action, page, uid_str = callback.data.split(":")
+    target_user_id, page = int(uid_str), int(page)
+
+    user = await db.get_user(target_user_id)
+    if user is None:
+        return await callback.answer("User not found", show_alert=True)
+    label = safe_html(user["first_name"] or user["username"] or target_user_id)
+
+    if action == "uinfo":
+        text, keyboard = await _full_user_info_card(db, user)
+        await _safe_edit(callback.message, text, keyboard)
+        return await callback.answer()
+
+    if action == "block":
+        blocked = not user["is_blocked"]
+        await db.set_blocked(target_user_id, blocked)
+        if blocked:
+            await forwarding.remove_user(target_user_id)
+        else:
+            await forwarding.refresh_user(target_user_id)
+        await _render_user_picker(
+            callback.message, db, "block", ADMIN_PICKER_TITLES["block"], page,
+        )
+        return await callback.answer(f"{label} {'blocked' if blocked else 'unblocked'}")
+
+    if action == "payout":
+        total = await db.payout_referrals(target_user_id)
+        if total <= 0:
+            return await callback.answer("Nothing owed to that user", show_alert=True)
+        with suppress(Exception):
+            await callback.bot.send_message(
+                target_user_id,
+                f"💸 <b>Referral payout sent!</b>\n\nAmount: <b>{format_paise(total)}</b>",
+                parse_mode="HTML",
+            )
+        await callback.answer(f"Paid {format_paise(total)}", show_alert=True)
+        return await _render_user_picker(
+            callback.message, db, "payout", ADMIN_PICKER_TITLES["payout"], page,
+        )
+
+    if action == "grant":
+        current = str(user["plan"] or "free").title()
+        expiry = user["plan_expiry"].astimezone(IST).strftime("%d %b %Y") if user["plan_expiry"] else "—"
+        rows = [[InlineKeyboardButton(text=f"💎 {plan.name}", callback_data=f"agrant:{target_user_id}:{key}")]
+                for key, plan in PLANS.items() if key != "free"]
+        rows.append([InlineKeyboardButton(text="◀️ Back", callback_data=f"apage:grant:{page}")])
+        await _safe_edit(
+            callback.message,
+            f"🎁 <b>Grant plan to {label}</b>\n"
+            f"ID: <code>{target_user_id}</code>\n"
+            f"Current: {current} (expires {expiry})\n\n"
+            f"Which plan?",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        return await callback.answer()
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("agrant:"))
+async def admin_grant_days_cb(callback: CallbackQuery, settings: Settings) -> None:
+    """Day presets, so the common cases need no typing at all."""
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, uid_str, plan_key = callback.data.split(":")
+    if plan_key not in PLANS or plan_key == "free":
+        return await callback.answer("Invalid plan", show_alert=True)
+    rows = [
+        [InlineKeyboardButton(text="7 days", callback_data=f"agdays:{uid_str}:{plan_key}:7"),
+         InlineKeyboardButton(text="30 days", callback_data=f"agdays:{uid_str}:{plan_key}:30")],
+        [InlineKeyboardButton(text="90 days", callback_data=f"agdays:{uid_str}:{plan_key}:90"),
+         InlineKeyboardButton(text="365 days", callback_data=f"agdays:{uid_str}:{plan_key}:365")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="apage:grant:0")],
+    ]
+    await _safe_edit(
+        callback.message,
+        f"🎁 Granting <b>{PLANS[plan_key].name}</b> to <code>{uid_str}</code>\n\nFor how long?",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("agdays:"))
+async def admin_grant_apply_cb(
+    callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, uid_str, plan_key, days_str = callback.data.split(":")
+    target_user_id, days = int(uid_str), int(days_str)
+    if plan_key not in PLANS or plan_key == "free" or days <= 0:
+        return await callback.answer("Invalid option", show_alert=True)
+
+    if not await db.set_plan(target_user_id, plan_key, days):
+        return await callback.answer("User not found", show_alert=True)
+    with suppress(Exception):
+        await forwarding.refresh_user(target_user_id)
+
+    user = await db.get_user(target_user_id)
+    expiry = (
+        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        if user and user["plan_expiry"] else "—"
+    )
+    with suppress(Exception):
+        await callback.bot.send_message(
+            target_user_id,
+            f"🎁 <b>Your plan has been upgraded!</b>\n\n"
+            f"Plan: <b>{PLANS[plan_key].name}</b>\n"
+            f"Days added: {days}\n"
+            f"Valid until: {expiry}\n\n"
+            f"Use /tasks to get started.",
+            parse_mode="HTML",
+        )
+    await _safe_edit(
+        callback.message,
+        f"✅ <b>Granted</b>\n\n"
+        f"User: <code>{target_user_id}</code>\n"
+        f"Plan: {PLANS[plan_key].name}\n"
+        f"Days: {days}\n"
+        f"New expiry: {expiry}",
+        admin_keyboard(),
+    )
+    await callback.answer("Granted")
+
+
+@router.message(Command("referralpayout", "payouts"))
 async def referral_payout_command(message: Message, db: Database, settings: Settings) -> None:
+    """With no argument, shows who is owed money. With a user, pays them out."""
     if not _is_admin(settings, message.from_user.id):
         return
     parts = (message.text or "").split()
-    if len(parts) != 2:
-        return await message.answer("Usage: /referralpayout &lt;user&gt;", parse_mode="HTML")
+
+    if len(parts) == 1:
+        rows = await db.list_pending_payouts()
+        if not rows:
+            return await message.answer("✅ No pending referral payouts.")
+        lines = ["💰 <b>Pending Referral Payouts</b>\n"]
+        buttons = []
+        for r in rows:
+            label = safe_html(r["first_name"] or r["username"] or r["referrer_id"])
+            owed = format_paise(int(r["owed"]))
+            lines.append(f"{label} (<code>{r['referrer_id']}</code>) — {owed} from {r['refs']} refs")
+            buttons.append([InlineKeyboardButton(
+                text=f"✅ Pay {label} — {owed}",
+                callback_data=f"admin:payout:{r['referrer_id']}",
+            )])
+        buttons.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
+        return await message.answer(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML",
+        )
+
     user_id = await _resolve_target_user(db, parts[1])
-    result = await db.mark_referral_paid(user_id) if user_id else None
-    if not result:
-        return await message.answer("⚠️ No unpaid commission.")
-    await message.answer(
-        f"✅ Marked paid.\nReferrer: {result['referrer_id']}\n"
-        f"Amount: {format_paise(int(result['commission_amount_paise']))}"
-    )
+    if user_id is None:
+        return await message.answer("⚠️ User not found.")
+    total = await db.payout_referrals(user_id)
+    if total <= 0:
+        return await message.answer("⚠️ Nothing owed to that user.")
+    with suppress(Exception):
+        await message.bot.send_message(
+            user_id,
+            f"💸 <b>Referral payout sent!</b>\n\nAmount: <b>{format_paise(total)}</b>",
+            parse_mode="HTML",
+        )
+    await message.answer(f"✅ Paid out {format_paise(total)} to <code>{user_id}</code>", parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin:payout:"))
+async def referral_payout_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    referrer_id = int(callback.data.rsplit(":", 1)[1])
+    total = await db.payout_referrals(referrer_id)
+    if total <= 0:
+        return await callback.answer("Nothing owed (already paid?)", show_alert=True)
+    with suppress(Exception):
+        await callback.bot.send_message(
+            referrer_id,
+            f"💸 <b>Referral payout sent!</b>\n\nAmount: <b>{format_paise(total)}</b>",
+            parse_mode="HTML",
+        )
+    if callback.message:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(
+                (callback.message.html_text or callback.message.text or "")
+                + f"\n\n✅ Paid {format_paise(total)} to <code>{referrer_id}</code>",
+                parse_mode="HTML",
+            )
+    await callback.answer("Paid")
 
 
 # ==========================================
@@ -2675,6 +2949,20 @@ def build_app(
             # Hot-reload the engine so the new plan's limits apply immediately.
             with suppress(Exception):
                 await forwarding.refresh_user(user_id)
+
+            # Referral commission — credited on EVERY payment, so a referrer
+            # keeps earning for as long as their referral keeps renewing.
+            with suppress(Exception):
+                credited = await db.credit_referral_commission(user_id, captured.amount_paise)
+                if credited is not None:
+                    with suppress(Exception):
+                        await bot.send_message(
+                            int(credited["referrer_id"]),
+                            "🎁 <b>You earned a referral commission!</b>\n\n"
+                            f"Unpaid earnings: <b>{format_paise(int(credited['commission_amount_paise']))}</b>\n\n"
+                            "Contact support to request a payout.",
+                            parse_mode="HTML",
+                        )
             user = await db.get_user(user_id)
             if user is not None:
                 language = language_for(user["preferred_language"])
