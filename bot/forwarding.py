@@ -650,11 +650,17 @@ class ForwardingEngine:
 
         if text:
             text = self._apply_replacements(text, settings, plan_name)
-            text = self._apply_trim(text, settings, plan_name)
-            text = self._apply_removals(text, settings, plan_name)
+            if not mono:
+                # Trim and the blanket Remove Links / Remove Usernames toggles are
+                # deliberately NOT applied to a code the filter just extracted.
+                # A gift code is often a referral link or an @handle, so running
+                # the removals over it would delete the very thing the user asked
+                # for and the message would vanish with no error anywhere.
+                text = self._apply_trim(text, settings, plan_name)
+                text = self._apply_removals(text, settings, plan_name)
 
         if mono and not text.strip():
-            # The cleanup rules stripped the extracted code away entirely.
+            # Extracted code was blank/whitespace only.
             return "", None
 
         header, footer = self._header_footer_for(settings, plan_name, dest_raw)
