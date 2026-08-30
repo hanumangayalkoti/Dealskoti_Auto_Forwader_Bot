@@ -201,7 +201,7 @@ TRANSLATIONS = {
         "link_preview_prompt": "🔗 <b>Link Preview</b>\n\nWhen ON, forwarded messages show the website preview card below the link.\nWhen OFF, only the plain text is sent.",
         "remove_usernames_prompt": "🙈 <b>Remove Usernames</b>\n\nWhen ON, every <code>@handle</code> is stripped out of the forwarded text.\n\n💡 If you want to swap a handle for your own instead of deleting it, use <b>Replace Usernames</b>.",
         "remove_links_prompt": "🚫 <b>Remove Links</b>\n\nWhen ON, every URL is stripped out of the forwarded text.\n\n💡 If you want to swap a link for your own instead of deleting it, use <b>Replace Links</b>.",
-        "mono_text_prompt": "🔠 <b>Mono Text</b>\n\nWhen ON, the whole forwarded message is sent in monospace, so it's easy to tap-and-copy and links stay unclickable.",
+        "mono_text_prompt": "🔠 <b>Mono Text (Code Filter)</b>\n\nWhen ON, only the parts the <b>source</b> wrote in monospace are forwarded — perfect for pulling out coupon codes.\n\n⚠️ Messages with no monospace text are <b>skipped completely</b>, and media is not forwarded.\n\nYour header and footer are still added.",
         "hidden_links_prompt": "🕵️ <b>Disable Hidden Links</b>\n\nSome messages hide the real URL behind clickable words. When ON, the hidden URL is revealed as plain text so nothing is masked.",
         "trim_words_prompt": "✂️ <b>Trim Single Words/Lines</b>\n\nSend the words or whole lines you want removed from every message.\n\nFormat: <code>Promoted, Sponsored, Ad</code>\n\n💡 If a line contains only that word, the whole line is removed.\nSend /clear to remove all.\nSend /back to cancel.",
 
@@ -430,7 +430,7 @@ TRANSLATIONS = {
         "link_preview_prompt": "🔗 <b>Link Preview</b>\n\nON hone par forwarded message me link ke neeche website ka preview card dikhega.\nOFF hone par sirf plain text jayega.",
         "remove_usernames_prompt": "🙈 <b>Remove Usernames</b>\n\nON hone par har <code>@handle</code> forwarded text se hata diya jayega.\n\n💡 Agar handle hatane ki jagah apna handle lagana hai to <b>Replace Usernames</b> use karo.",
         "remove_links_prompt": "🚫 <b>Remove Links</b>\n\nON hone par har URL forwarded text se hata diya jayega.\n\n💡 Agar link hatane ki jagah apna link lagana hai to <b>Replace Links</b> use karo.",
-        "mono_text_prompt": "🔠 <b>Mono Text</b>\n\nON hone par poora message monospace me jayega — tap karke copy karna asaan, aur links clickable nahi rahenge.",
+        "mono_text_prompt": "🔠 <b>Mono Text (Code Filter)</b>\n\nON hone par sirf wahi hissa forward hoga jo <b>source</b> ne monospace me likha hai — coupon code nikalne ke liye best.\n\n⚠️ Jis message me monospace text nahi hoga wo <b>poora skip</b> ho jayega, aur media bhi forward nahi hoga.\n\nAapka header aur footer phir bhi lagega.",
         "hidden_links_prompt": "🕵️ <b>Disable Hidden Links</b>\n\nKuch messages me asli URL clickable words ke peeche chhupa hota hai. ON hone par chhupa hua URL plain text me dikh jayega.",
         "trim_words_prompt": "✂️ <b>Trim Single Words/Lines</b>\n\nWo words ya poori lines bhejein jo har message se hatani hain.\n\nFormat: <code>Promoted, Sponsored, Ad</code>\n\n💡 Agar kisi line me sirf wahi word hai to poori line hat jayegi.\nSab hatane ke liye /clear.\nCancel ke liye /back.",
 
