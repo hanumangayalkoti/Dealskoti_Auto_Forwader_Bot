@@ -35,6 +35,7 @@ from telethon.tl.types import (
     Message,
     MessageEntityCode,
     MessageEntityPre,
+    MessageEntitySpoiler,
     MessageMediaPhoto,
     MessageMediaWebPage,
     PeerChannel,
@@ -147,20 +148,57 @@ def message_topic_id(message: Message) -> int | None:
     return getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
 
 
-def extract_mono_spans(text: str, entities) -> list[str]:
-    """Returns every monospace run in a message, in order.
+# ---- CODE FILTER ----
+# Channels hide gift/coupon codes in one of two Telegram formats, and which one
+# they use varies by channel, so the filter is a choice rather than a toggle.
+CODE_FILTER_OFF = "off"
+CODE_FILTER_MONO = "mono"
+CODE_FILTER_SPOILER = "spoiler"
+CODE_FILTER_BOTH = "both"
+CODE_FILTER_MODES = (CODE_FILTER_OFF, CODE_FILTER_MONO, CODE_FILTER_SPOILER, CODE_FILTER_BOTH)
 
-    Covers both inline `code` and ```pre``` blocks. Telegram entity offsets
-    count UTF-16 code units rather than Python characters, so the text is
-    sliced in UTF-16 space — slicing by character index corrupts any message
-    containing an emoji, which deals posts are full of.
+
+def code_filter_mode(settings: dict) -> str:
+    """Reads the code-filter setting.
+
+    The setting used to be a plain boolean, so existing tasks store True/False.
+    True is read as "mono" to preserve exactly what those tasks already do.
     """
-    if not text or not entities:
+    raw = settings.get("mono_text")
+    if raw is None or raw is False:
+        return CODE_FILTER_OFF
+    if raw is True:
+        return CODE_FILTER_MONO
+    value = str(raw).strip().lower()
+    return value if value in CODE_FILTER_MODES else CODE_FILTER_OFF
+
+
+def extract_code_spans(text: str, entities, mode: str) -> list[str]:
+    """Returns every monospace and/or spoiler run in a message, in order.
+
+    Monospace covers inline `code` and ```pre``` blocks; spoiler is Telegram's
+    tap-to-reveal hidden text (the shimmering-particles style).
+
+    Telegram entity offsets count UTF-16 code units rather than Python
+    characters, so the text is sliced in UTF-16 space — slicing by character
+    index corrupts any message containing an emoji, which deals posts are
+    full of.
+    """
+    if not text or not entities or mode == CODE_FILTER_OFF:
         return []
+
+    wanted: tuple = ()
+    if mode in (CODE_FILTER_MONO, CODE_FILTER_BOTH):
+        wanted += (MessageEntityCode, MessageEntityPre)
+    if mode in (CODE_FILTER_SPOILER, CODE_FILTER_BOTH):
+        wanted += (MessageEntitySpoiler,)
+    if not wanted:
+        return []
+
     buf = text.encode("utf-16-le")
     spans: list[str] = []
     for ent in entities:
-        if not isinstance(ent, (MessageEntityCode, MessageEntityPre)):
+        if not isinstance(ent, wanted):
             continue
         start, end = int(ent.offset) * 2, (int(ent.offset) + int(ent.length)) * 2
         if start < 0 or end > len(buf) or end <= start:
@@ -169,6 +207,11 @@ def extract_mono_spans(text: str, entities) -> list[str]:
         if piece:
             spans.append(piece)
     return spans
+
+
+def extract_mono_spans(text: str, entities) -> list[str]:
+    """Backwards-compatible wrapper for any older call site."""
+    return extract_code_spans(text, entities, CODE_FILTER_MONO)
 
 
 def _as_list(value) -> list:
@@ -538,21 +581,34 @@ class ForwardingEngine:
                     footer = str(per_target.get("footer") or "")
         return header, footer
 
+    def code_filter_for(self, settings: dict, plan_name: str) -> str:
+        """The active code-filter mode, or "off" if the plan cannot use it."""
+        if not plan_has(plan_name, F_MONO_TEXT):
+            return CODE_FILTER_OFF
+        return code_filter_mode(settings)
+
     def mono_enabled(self, settings: dict, plan_name: str) -> bool:
-        return bool(settings.get("mono_text")) and plan_has(plan_name, F_MONO_TEXT)
+        return self.code_filter_for(settings, plan_name) != CODE_FILTER_OFF
+
+    def code_body(self, message: Message | None, mode: str) -> str:
+        """The code-only body of a message, or "" when it has none.
+
+        The Code Filter is a FILTER, not a formatter: when on, only the parts
+        the source author marked as monospace and/or spoiler (gift codes,
+        coupon codes) are forwarded and all surrounding chatter is dropped.
+        Multiple runs are joined with newlines so a post carrying several
+        codes keeps all of them.
+        """
+        if message is None or mode == CODE_FILTER_OFF:
+            return ""
+        spans = extract_code_spans(
+            message.message or "", getattr(message, "entities", None), mode,
+        )
+        return "\n".join(spans)
 
     def mono_body(self, message: Message | None) -> str:
-        """The monospace-only body of a message, or "" when it has none.
-
-        Mono Text is a FILTER, not a formatter: when it is on, only the parts
-        the source author wrote in monospace (coupon codes, referral codes)
-        are forwarded and all surrounding chatter is dropped. Multiple runs are
-        joined with newlines so a post with several codes keeps all of them.
-        """
-        if message is None:
-            return ""
-        spans = extract_mono_spans(message.message or "", getattr(message, "entities", None))
-        return "\n".join(spans)
+        """Backwards-compatible wrapper for any older call site."""
+        return self.code_body(message, CODE_FILTER_MONO)
 
     def build_text(
         self,
@@ -568,23 +624,24 @@ class ForwardingEngine:
         on, because that is the one case where we inject markup ourselves.
 
         Order matters and is deliberate:
-          1. mono filter           (keep ONLY the source's monospace parts)
+          1. code filter           (keep ONLY the source's code/spoiler parts)
           2. reveal hidden links   (needs the original entities)
           3. replacements          (the user's explicit swaps win first)
           4. trim words/lines
           5. blanket removals
           6. header / footer       (added last so they are never stripped)
 
-        When Mono Text is on and the source has no monospace content this
-        returns "", and the caller MUST skip the message rather than sending
-        an empty one. Use mono_enabled()/mono_body() to check that up front.
+        When the Code Filter is on and the source has no matching content this
+        returns "", and the caller MUST skip the message rather than sending an
+        empty one. Use code_filter_for()/code_body() to check that up front.
         """
-        mono = self.mono_enabled(settings, plan_name)
+        mode = self.code_filter_for(settings, plan_name)
+        mono = mode != CODE_FILTER_OFF
 
         if mono:
-            text = self.mono_body(message)
+            text = self.code_body(message, mode)
             if not text:
-                return "", None  # nothing monospace in the source — skip it
+                return "", None  # no code in the source — skip the message
         else:
             text = base_text or ""
             if text and plan_has(plan_name, F_HIDDEN_LINKS) and settings.get("disable_hidden_links"):
@@ -603,7 +660,8 @@ class ForwardingEngine:
         header, footer = self._header_footer_for(settings, plan_name, dest_raw)
 
         if mono:
-            # Re-sent as monospace so it stays tap-to-copy in the destination.
+            # Always re-sent as monospace, whichever format it came from, so
+            # subscribers can tap-to-copy the code in the destination.
             # Header/footer stay plain, otherwise the user's own branding and
             # links would become unreadable and unclickable.
             parts = []
@@ -783,15 +841,16 @@ class ForwardingEngine:
             if not destinations:
                 continue
 
-            # MONO TEXT FILTER: forward ONLY what the source wrote in monospace.
-            # A message with no monospace content is skipped entirely — nothing
-            # is sent and no quota is consumed.
-            mono_on = self.mono_enabled(settings, plan_name)
-            if mono_on and not self.mono_body(message):
+            # CODE FILTER: forward ONLY what the source marked as monospace
+            # and/or spoiler. A message with no matching content is skipped
+            # entirely — nothing is sent and no quota is consumed.
+            code_mode = self.code_filter_for(settings, plan_name)
+            mono_on = code_mode != CODE_FILTER_OFF
+            if mono_on and not self.code_body(message, code_mode):
                 continue
 
             stored_file = await self._resolve_stored_file(user_id, settings, plan_name)
-            # With the mono filter on the user wants the code only, so media is
+            # With the code filter on the user wants the code only, so media is
             # deliberately dropped rather than sent alongside it.
             media_file = (
                 None if mono_on
@@ -992,7 +1051,7 @@ class ForwardingEngine:
                     new_text, parse_mode = self.build_text(
                         message, message.message or "", settings, plan_name, dest_raw
                     )
-                    # Empty means the mono filter found nothing in the edited
+                    # Empty means the code filter found nothing in the edited
                     # version; leave the existing copy alone rather than
                     # blanking it out.
                     if not new_text:
