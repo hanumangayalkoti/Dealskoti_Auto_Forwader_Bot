@@ -27,6 +27,7 @@ USER_COMMANDS = [
     ("/tasks", "View and manage your forwarding tasks", "Apne forwarding tasks dekhein"),
     ("/newtask", "Create a new forwarding task", "Naya forwarding task banayein"),
     ("/settings", "Configure task settings", "Task ki settings set karein"),
+    ("/config", "Check your configuration settings", "Apni configuration settings dekhein"),
     ("/updates", "Join the updates/announcements channel", "Updates channel join karein"),
     ("/support", "Contact customer support", "Support team se baat karein"),
     ("/language", "Change your language preference", "Apni bhasha (language) badlein"),
@@ -168,6 +169,9 @@ TRANSLATIONS = {
         "invalid_channel_format": "⚠️ Invalid format. Please send the channel in one of these formats:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
 
         # ---------- SETTINGS: NAVIGATION ----------
+        "config_no_tasks": "📋 <b>No tasks yet</b>\n\nYou haven't created any forwarding task, so there is nothing to show.\n\nUse /tasks to create your first task.",
+        "config_select_task": "🛠️ <b>Your Configuration</b>\n\nSelect a task to view its current settings:",
+        "config_footer": "🦾 Control All Settings: /settings",
         "settings_select_task": "⚙️ <b>Task Settings</b>\n\nSelect a task to configure:",
         "settings_no_tasks": "📋 You don't have any tasks yet. Create one to unlock settings.",
         "settings_main_title": "⚙️ <b>Settings for:</b> {task_name}\n\nChoose a category:",
@@ -201,7 +205,7 @@ TRANSLATIONS = {
         "link_preview_prompt": "🔗 <b>Link Preview</b>\n\nWhen ON, forwarded messages show the website preview card below the link.\nWhen OFF, only the plain text is sent.",
         "remove_usernames_prompt": "🙈 <b>Remove Usernames</b>\n\nWhen ON, every <code>@handle</code> is stripped out of the forwarded text.\n\n💡 If you want to swap a handle for your own instead of deleting it, use <b>Replace Usernames</b>.",
         "remove_links_prompt": "🚫 <b>Remove Links</b>\n\nWhen ON, every URL is stripped out of the forwarded text.\n\n💡 If you want to swap a link for your own instead of deleting it, use <b>Replace Links</b>.",
-        "mono_text_prompt": "🔠 <b>Mono Text (Code Filter)</b>\n\nWhen ON, only the parts the <b>source</b> wrote in monospace are forwarded — perfect for pulling out coupon codes.\n\n⚠️ Messages with no monospace text are <b>skipped completely</b>, and media is not forwarded.\n\nYour header and footer are still added.",
+        "mono_text_prompt": "🎁 <b>Code Filter</b>\n\nForwards ONLY the gift/coupon code from a post and drops everything else.\n\nChannels hide codes in two different formats, so pick the one your source uses:\n\n🔠 <b>Monospace only</b> — code-style text, tap to copy\n🫥 <b>Spoiler only</b> — hidden text with shimmering dots, tap to reveal\n🔠+🫥 <b>Both</b> — catches either one\n\n⚠️ Posts with no code are <b>skipped completely</b>, and media is not forwarded. Your header and footer are still added.",
         "hidden_links_prompt": "🕵️ <b>Disable Hidden Links</b>\n\nSome messages hide the real URL behind clickable words. When ON, the hidden URL is revealed as plain text so nothing is masked.",
         "trim_words_prompt": "✂️ <b>Trim Single Words/Lines</b>\n\nSend the words or whole lines you want removed from every message.\n\nFormat: <code>Promoted, Sponsored, Ad</code>\n\n💡 If a line contains only that word, the whole line is removed.\nSend /clear to remove all.\nSend /back to cancel.",
 
@@ -397,6 +401,9 @@ TRANSLATIONS = {
         "invalid_channel_format": "⚠️ Format galat hai. Channel in formats me bhejein:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
 
         # ---------- SETTINGS: NAVIGATION ----------
+        "config_no_tasks": "📋 <b>Abhi koi task nahi hai</b>\n\nAapne koi forwarding task nahi banaya, isliye dikhane ko kuch nahi hai.\n\nPehla task banane ke liye /tasks use karein.",
+        "config_select_task": "🛠️ <b>Aapki Configuration</b>\n\nSettings dekhne ke liye task chunein:",
+        "config_footer": "🦾 Saari settings badalne ke liye: /settings",
         "settings_select_task": "⚙️ <b>Task Settings</b>\n\nSettings karne ke liye task chunein:",
         "settings_no_tasks": "📋 Abhi koi task nahi hai. Settings unlock karne ke liye pehle ek task banayein.",
         "settings_main_title": "⚙️ <b>Settings:</b> {task_name}\n\nCategory chunein:",
@@ -430,7 +437,7 @@ TRANSLATIONS = {
         "link_preview_prompt": "🔗 <b>Link Preview</b>\n\nON hone par forwarded message me link ke neeche website ka preview card dikhega.\nOFF hone par sirf plain text jayega.",
         "remove_usernames_prompt": "🙈 <b>Remove Usernames</b>\n\nON hone par har <code>@handle</code> forwarded text se hata diya jayega.\n\n💡 Agar handle hatane ki jagah apna handle lagana hai to <b>Replace Usernames</b> use karo.",
         "remove_links_prompt": "🚫 <b>Remove Links</b>\n\nON hone par har URL forwarded text se hata diya jayega.\n\n💡 Agar link hatane ki jagah apna link lagana hai to <b>Replace Links</b> use karo.",
-        "mono_text_prompt": "🔠 <b>Mono Text (Code Filter)</b>\n\nON hone par sirf wahi hissa forward hoga jo <b>source</b> ne monospace me likha hai — coupon code nikalne ke liye best.\n\n⚠️ Jis message me monospace text nahi hoga wo <b>poora skip</b> ho jayega, aur media bhi forward nahi hoga.\n\nAapka header aur footer phir bhi lagega.",
+        "mono_text_prompt": "🎁 <b>Code Filter</b>\n\nPost me se sirf gift/coupon code forward hoga, baaki sab hat jayega.\n\nChannels code do alag formats me chhupate hain, apne source wala chuno:\n\n🔠 <b>Monospace only</b> — code jaisa text, tap se copy\n🫥 <b>Spoiler only</b> — chhupa hua text, chamakte dots wala, tap se reveal\n🔠+🫥 <b>Both</b> — dono me se koi bhi ho to chalega\n\n⚠️ Jis post me code nahi hoga wo <b>poora skip</b> ho jayega, aur media forward nahi hoga. Aapka header aur footer phir bhi lagega.",
         "hidden_links_prompt": "🕵️ <b>Disable Hidden Links</b>\n\nKuch messages me asli URL clickable words ke peeche chhupa hota hai. ON hone par chhupa hua URL plain text me dikh jayega.",
         "trim_words_prompt": "✂️ <b>Trim Single Words/Lines</b>\n\nWo words ya poori lines bhejein jo har message se hatani hain.\n\nFormat: <code>Promoted, Sponsored, Ad</code>\n\n💡 Agar kisi line me sirf wahi word hai to poori line hat jayegi.\nSab hatane ke liye /clear.\nCancel ke liye /back.",
 
