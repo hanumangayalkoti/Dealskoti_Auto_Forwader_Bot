@@ -29,11 +29,12 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
@@ -102,6 +103,10 @@ class UploadStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_grant_days = State()
+
+
+class AdminGrantStates(StatesGroup):
+    waiting_custom_days = State()
 
 
 class AdminBroadcastStates(StatesGroup):
@@ -260,6 +265,99 @@ def language_keyboard() -> InlineKeyboardMarkup:
 
 
 # ==========================================
+# FLOW INTERRUPTION
+# ==========================================
+# A user halfway through /connect who suddenly sends /plans used to get the
+# plans screen while the bot silently stayed in "waiting for phone number"
+# state — their next ordinary message was then read as a phone number and
+# rejected, with no explanation anywhere. This middleware cancels the pending
+# flow FIRST and says what was cancelled, so nothing is ever ignored silently.
+#
+# Living in one middleware means every flow is covered — including the ones in
+# settings_ui and billing_ui — without touching a single handler.
+
+# Commands that are PART of a flow rather than an escape from it.
+FLOW_INTERNAL_COMMANDS = {"back", "done", "clear", "cancel", "skip"}
+
+FLOW_LABELS: dict[str, str] = {
+    "LoginStates:waiting_phone": "Connect Account",
+    "LoginStates:waiting_pin": "Connect Account",
+    "LoginStates:waiting_2fa": "Connect Account",
+    "TaskStates:waiting_name": "New Task",
+    "TaskStates:waiting_source": "Choosing Sources",
+    "TaskStates:waiting_destination": "Choosing Destinations",
+    "UploadStates:waiting_file": "File Upload",
+    "SettingsFlow:waiting_value": "Editing a Setting",
+    "ManualPayStates:waiting_proof": "Payment Proof",
+    "AdminStates:waiting_grant_days": "Grant Days",
+    "AdminGrantStates:waiting_custom_days": "Grant Days",
+    "AdminBroadcastStates:waiting_message": "Broadcast",
+}
+
+FLOW_STEP_HINTS: dict[str, str] = {
+    "LoginStates:waiting_phone": "You were entering your phone number.",
+    "LoginStates:waiting_pin": "You were entering your login PIN.",
+    "LoginStates:waiting_2fa": "You were entering your 2FA password.",
+    "TaskStates:waiting_name": "You were naming a new task.",
+    "TaskStates:waiting_source": "You were selecting source channels.",
+    "TaskStates:waiting_destination": "You were selecting destination channels.",
+    "UploadStates:waiting_file": "You were uploading a file.",
+    "SettingsFlow:waiting_value": "You were changing a setting.",
+    "ManualPayStates:waiting_proof": "You were submitting payment proof.",
+    "AdminBroadcastStates:waiting_message": "You were writing a broadcast.",
+}
+
+
+class FlowInterruptMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        state: FSMContext | None = data.get("state")
+        if state is None or not isinstance(event, Message) or not event.text:
+            return await handler(event, data)
+
+        text = event.text.strip()
+        if not text.startswith("/"):
+            return await handler(event, data)
+
+        command = text.split()[0].lstrip("/").split("@")[0].lower()
+        if command in FLOW_INTERNAL_COMMANDS:
+            return await handler(event, data)
+
+        current = await state.get_state()
+        if not current:
+            return await handler(event, data)
+
+        label = FLOW_LABELS.get(current)
+        if label is None:
+            return await handler(event, data)
+
+        # A pending Telethon login holds an open client; drop it too, not just
+        # the FSM state, or the half-finished login lingers in memory.
+        if current.startswith("LoginStates:"):
+            telethon = data.get("telethon")
+            if telethon is not None:
+                with suppress(Exception):
+                    await telethon.cancel_login(event.from_user.id)
+
+        await state.clear()
+
+        db = data.get("db")
+        language = "en"
+        if db is not None:
+            with suppress(Exception):
+                user = await db.get_user(event.from_user.id)
+                if user is not None:
+                    language = language_for(user["preferred_language"])
+
+        hint = FLOW_STEP_HINTS.get(current, "")
+        with suppress(Exception):
+            await event.answer(
+                safe_t(language, "flow_cancelled", flow=safe_html(label), hint=safe_html(hint)),
+                parse_mode="HTML",
+            )
+        return await handler(event, data)
+
+
+# ==========================================
 # GLOBAL ERROR HANDLER
 # ==========================================
 
@@ -279,6 +377,185 @@ async def global_error_handler(event: ErrorEvent, settings: Settings) -> bool:
 # ==========================================
 # START / MENU / HELP
 # ==========================================
+# ==========================================
+# HOME SCREEN (state-aware)
+# ==========================================
+# Three different screens depending on where the user actually is. Showing a
+# Connect button to someone already connected, or task buttons to someone who
+# cannot use them yet, is how a new user gets lost on their first screen.
+
+def _ago(when) -> str:
+    """Human-friendly 'last forward' age. This one line tells a user whether
+    their bot is alive, so it is worth getting right."""
+    if when is None:
+        return "never"
+    delta = datetime.now(timezone.utc) - when
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _who(user) -> str:
+    """Username when they have one, otherwise just their first name — never
+    the phone number, which does not belong on a screen they might screenshot."""
+    if user is None:
+        return "You"
+    username = user["username"] if "username" in user.keys() else None
+    if username:
+        return f"@{safe_html(username)}"
+    return safe_html(user["first_name"] or "You")
+
+
+def _days_left(user) -> str:
+    if user is None or not user["plan_expiry"]:
+        return ""
+    remaining = user["plan_expiry"] - datetime.now(timezone.utc)
+    if remaining.total_seconds() <= 0:
+        return " · expired"
+    # Round UP: with 22 days and 23 hours left, .days gives 22 and the user
+    # feels short-changed. Anything part-way into a day counts as that day.
+    days = -(-int(remaining.total_seconds()) // 86400)
+    if days <= 1:
+        return " · expires today"
+    return f" · {days} days left"
+
+
+async def _home_screen(db: Database, user_id: int, language: str, settings: Settings):
+    """Returns (text, keyboard) for /start and /menu."""
+    user = await db.get_user(user_id)
+    connected = await db.has_active_session(user_id)
+
+    if not connected:
+        text = safe_t(language, "home_not_connected")
+        rows = [
+            [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+            [InlineKeyboardButton(text="❓ How it works", callback_data="faq:page:0")],
+        ]
+        if settings.support_bot_link:
+            rows.append([InlineKeyboardButton(text="📞 Support", url=settings.support_bot_link)])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
+    tasks = await db.list_tasks(user_id)
+    plan_line = f"{plan.name}{_days_left(user)}" if plan.monthly_rupees else f"{plan.name} · {plan.daily_messages} msgs/day"
+
+    if not tasks:
+        text = safe_t(
+            language, "home_no_tasks", who=_who(user), plan=plan_line,
+        )
+        rows = [
+            [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create")],
+            [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
+             InlineKeyboardButton(text="👤 Account", callback_data="menu:account")],
+            [InlineKeyboardButton(text="❓ Help", callback_data="faq:page:0")],
+        ]
+        if settings.support_bot_link:
+            rows.append([InlineKeyboardButton(text="📞 Support", url=settings.support_bot_link)])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    active = sum(1 for t_ in tasks if not t_["is_paused"])
+    paused = len(tasks) - active
+    stats = await db.usage_stats(user_id)
+    cap = plan.daily_messages if plan.daily_messages else "∞"
+
+    task_line = f"{active} active"
+    if paused:
+        task_line += f" · {paused} paused"
+
+    text = safe_t(
+        language, "home_ready",
+        who=_who(user), plan=plan_line, tasks=task_line,
+        today=stats["today"], cap=cap, last=_ago(stats["last_forward_at"]),
+    )
+    rows = [
+        [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks"),
+         InlineKeyboardButton(text="📊 Stats", callback_data="menu:stats")],
+        [InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings"),
+         InlineKeyboardButton(text="🛠️ Config", callback_data="cfg:list")],
+        [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
+         InlineKeyboardButton(text="🎁 Refer & Earn", callback_data="menu:refer")],
+        [InlineKeyboardButton(text="👤 Account", callback_data="menu:account"),
+         InlineKeyboardButton(text="❓ Help", callback_data="faq:page:0")],
+    ]
+    if settings.support_bot_link:
+        rows.append([InlineKeyboardButton(text="📞 Support", url=settings.support_bot_link)])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ==========================================
+# STATS
+# ==========================================
+
+async def _stats_screen(db: Database, user_id: int, language: str):
+    user = await db.get_user(user_id)
+    plan = PLANS.get(str(user["plan"]), PLANS["free"]) if user else PLANS["free"]
+    stats = await db.usage_stats(user_id)
+    tasks = await db.list_tasks(user_id)
+
+    cap = plan.daily_messages
+    limit_line = f"{stats['today']} / {cap} used" if cap else f"{stats['today']} used · unlimited"
+
+    lines = [
+        "📊 <b>Your Forwarding Stats</b>",
+        "",
+        f"📅 Today: <b>{stats['today']:,}</b> messages",
+        f"📆 This month: <b>{stats['month']:,}</b> messages",
+        f"🏆 All time: <b>{stats['total']:,}</b> messages",
+        "",
+        f"⚡ Daily limit: {limit_line}",
+        f"🕐 Last forward: <b>{_ago(stats['last_forward_at'])}</b>",
+    ]
+
+    if tasks:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("📋 <b>Per Task</b>")
+        lines.append("")
+        for t_ in tasks:
+            icon = "⏸️" if t_["is_paused"] else "▶️"
+            count = int(t_["forward_count"] or 0)
+            last = _ago(t_["last_forward_at"])
+            lines.append(f"{icon} <b>{safe_html(t_['task_name'])}</b>")
+            lines.append(f"    {count:,} forwarded · last {last}")
+        # A task that has never fired is almost always a misconfiguration, so
+        # point at it rather than leaving the user to work it out.
+        idle = [t_ for t_ in tasks if not t_["is_paused"] and not t_["last_forward_at"]]
+        if idle:
+            lines.append("")
+            lines.append("⚠️ Some tasks have never forwarded anything.")
+            lines.append("Check the source channel is correct in /settings.")
+
+    rows = [
+        [InlineKeyboardButton(text="🔄 Refresh", callback_data="menu:stats")],
+        [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("stats2", "mystats"))
+async def stats_user_command(message: Message, db: Database) -> None:
+    language = await _language_for_message(db, message)
+    text, markup = await _stats_screen(db, message.from_user.id, language)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "menu:stats")
+async def menu_stats_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    text, markup = await _stats_screen(db, callback.from_user.id, language)
+    await _safe_edit(callback.message, text, markup)
+    await callback.answer()
+
+
 
 @router.message(Command("start"))
 async def start(message: Message, command: CommandObject, db: Database, settings: Settings) -> None:
@@ -312,21 +589,19 @@ async def start(message: Message, command: CommandObject, db: Database, settings
     language = language_for(user["preferred_language"])
     if not await enforce_gate(message.bot, db, settings, message.from_user.id, language):
         return
-    await message.answer(
-        await _menu_text(db, message.from_user.id, language),
-        reply_markup=main_menu_keyboard(settings),
-    )
+    text, markup = await _home_screen(db, message.from_user.id, language, settings)
+    if is_new:
+        text = safe_t(language, "home_first_time") + "\n\n" + text
+    await message.answer(text, reply_markup=markup)
 
 
-@router.message(Command("menu"))
+@router.message(Command("menu", "home"))
 async def menu_command(message: Message, db: Database, settings: Settings) -> None:
     language = await _language_for_message(db, message)
     if not await enforce_gate(message.bot, db, settings, message.from_user.id, language):
         return
-    await message.answer(
-        await _menu_text(db, message.from_user.id, language),
-        reply_markup=main_menu_keyboard(settings),
-    )
+    text, markup = await _home_screen(db, message.from_user.id, language, settings)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "menu:home")
@@ -335,11 +610,8 @@ async def menu_home(callback: CallbackQuery, db: Database, settings: Settings, s
         return
     await state.clear()
     language = await _language_for_callback(db, callback)
-    await _safe_edit(
-        callback.message,
-        await _menu_text(db, callback.from_user.id, language),
-        main_menu_keyboard(settings),
-    )
+    text, markup = await _home_screen(db, callback.from_user.id, language, settings)
+    await _safe_edit(callback.message, text, markup)
     await callback.answer()
 
 
@@ -349,11 +621,8 @@ async def cancel_flow(callback: CallbackQuery, state: FSMContext, db: Database, 
         return
     await state.clear()
     language = await _language_for_callback(db, callback)
-    await _safe_edit(
-        callback.message,
-        await _menu_text(db, callback.from_user.id, language),
-        main_menu_keyboard(settings),
-    )
+    text, markup = await _home_screen(db, callback.from_user.id, language, settings)
+    await _safe_edit(callback.message, text, markup)
     await callback.answer("Cancelled")
 
 
@@ -422,11 +691,8 @@ async def choose_language(callback: CallbackQuery, db: Database, settings: Setti
     await callback.answer(safe_t(chosen, "language_saved"))
     if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, chosen):
         return
-    await _safe_edit(
-        callback.message,
-        await _menu_text(db, callback.from_user.id, chosen),
-        main_menu_keyboard(settings),
-    )
+    text, markup = await _home_screen(db, callback.from_user.id, chosen, settings)
+    await _safe_edit(callback.message, text, markup)
 
 
 # ==========================================
@@ -526,11 +792,8 @@ async def gate_check(
     await db.resume_channel_gate_tasks(callback.from_user.id)
     with suppress(Exception):
         await forwarding.refresh_user(callback.from_user.id)
-    await _safe_edit(
-        callback.message,
-        await _menu_text(db, callback.from_user.id, language),
-        main_menu_keyboard(settings),
-    )
+    text, markup = await _home_screen(db, callback.from_user.id, language, settings)
+    await _safe_edit(callback.message, text, markup)
     await callback.answer("✅ Thank you for joining!")
 
 
@@ -595,6 +858,21 @@ async def menu_account(callback: CallbackQuery, db: Database) -> None:
         _account_keyboard(),
     )
     await callback.answer()
+
+
+@router.message(Command("refer", "referral"))
+async def refer_command(message: Message, db: Database) -> None:
+    language = await _language_for_message(db, message)
+    me = await message.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
+    summary = await db.referral_summary(message.from_user.id)
+    text = (
+        safe_t(language, "refer_intro", link=safe_html(link), count=summary["joined"])
+        + f"\n\n💰 <b>Earnings ({int(REFERRAL_RATE * 100)}% of every payment)</b>\n"
+        + f"Unpaid: <b>{format_paise(summary['unpaid_paise'])}</b>\n"
+        + f"Already paid: {format_paise(summary['paid_paise'])}"
+    )
+    await message.answer(text, reply_markup=_nav_keyboard())
 
 
 @router.callback_query(F.data == "menu:refer")
@@ -2566,6 +2844,8 @@ async def admin_grant_days_cb(callback: CallbackQuery, settings: Settings) -> No
          InlineKeyboardButton(text="30 days", callback_data=f"agdays:{uid_str}:{plan_key}:30")],
         [InlineKeyboardButton(text="90 days", callback_data=f"agdays:{uid_str}:{plan_key}:90"),
          InlineKeyboardButton(text="365 days", callback_data=f"agdays:{uid_str}:{plan_key}:365")],
+        # Presets cover the common cases; custom handles the 1-2 day comps.
+        [InlineKeyboardButton(text="✍️ Custom days", callback_data=f"agcust:{uid_str}:{plan_key}")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="apage:grant:0")],
     ]
     await _safe_edit(
@@ -2574,6 +2854,83 @@ async def admin_grant_days_cb(callback: CallbackQuery, settings: Settings) -> No
         InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("agcust:"))
+async def admin_grant_custom_cb(
+    callback: CallbackQuery, state: FSMContext, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, uid_str, plan_key = callback.data.split(":")
+    if plan_key not in PLANS or plan_key == "free":
+        return await callback.answer("Invalid plan", show_alert=True)
+    await state.set_state(AdminGrantStates.waiting_custom_days)
+    await state.update_data(grant_user_id=int(uid_str), grant_plan=plan_key)
+    await _safe_edit(
+        callback.message,
+        f"✍️ <b>Enter number of days</b>\n\n"
+        f"Granting <b>{PLANS[plan_key].name}</b> to <code>{uid_str}</code>\n\n"
+        f"Example: <code>2</code>\n\nSend /back to cancel.",
+        None,
+    )
+    await callback.answer()
+
+
+@router.message(AdminGrantStates.waiting_custom_days)
+async def admin_grant_custom_apply(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+    forwarding: ForwardingEngine,
+) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    if not message.text:
+        return
+    raw = message.text.strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer("↩️ Cancelled.", reply_markup=admin_keyboard())
+    if not raw.isdigit() or int(raw) <= 0:
+        return await message.answer("⚠️ Send a whole number of days, e.g. <code>2</code>", parse_mode="HTML")
+
+    days = int(raw)
+    if days > 3650:
+        return await message.answer("⚠️ That's over 10 years — send a smaller number.")
+
+    data = await state.get_data()
+    target_user_id = int(data.get("grant_user_id", 0))
+    plan_key = str(data.get("grant_plan", ""))
+    await state.clear()
+    if plan_key not in PLANS or plan_key == "free" or not target_user_id:
+        return await message.answer("⚠️ Something went wrong, start again from /grantdays")
+
+    if not await db.set_plan(target_user_id, plan_key, days):
+        return await message.answer("⚠️ User not found.", reply_markup=admin_keyboard())
+    with suppress(Exception):
+        await forwarding.refresh_user(target_user_id)
+
+    user = await db.get_user(target_user_id)
+    expiry = (
+        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        if user and user["plan_expiry"] else "—"
+    )
+    with suppress(Exception):
+        await message.bot.send_message(
+            target_user_id,
+            f"🎁 <b>Your plan has been upgraded!</b>\n\n"
+            f"Plan: <b>{PLANS[plan_key].name}</b>\n"
+            f"Days added: {days}\n"
+            f"Valid until: {expiry}\n\n"
+            f"Use /tasks to get started.",
+            parse_mode="HTML",
+        )
+    await message.answer(
+        f"✅ <b>Granted</b>\n\nUser: <code>{target_user_id}</code>\n"
+        f"Plan: {PLANS[plan_key].name}\nDays: {days}\nNew expiry: {expiry}",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @router.callback_query(F.data.startswith("agdays:"))
@@ -3066,9 +3423,13 @@ async def _run(settings: Settings) -> None:
         db, telethon, settings.max_concurrent_forward_tasks,
         bot_token=settings.telegram_bot_token,
         storage_channel_id=settings.file_storage_channel_id,
+        bot=bot,
     )
 
     dispatcher = Dispatcher()
+    # Outer middleware so it runs BEFORE a handler is chosen — otherwise the
+    # state-specific handler would win and swallow the command.
+    dispatcher.message.outer_middleware(FlowInterruptMiddleware())
     # ORDER MATTERS: the feature routers must come before the main router,
     # whose catch-all message handler would otherwise swallow their input.
     dispatcher.include_router(settings_router)
