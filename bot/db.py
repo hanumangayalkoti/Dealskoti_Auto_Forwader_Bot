@@ -211,6 +211,25 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_forward_at TIMESTAMP WITH TIME Z
 -- Warned-today marker so the daily-limit notice is sent once, not per message.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS limit_notice_date DATE;
 
+-- ===== PAYOUTS =====
+ALTER TABLE users ADD COLUMN IF NOT EXISTS payout_method VARCHAR(32);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS payout_address TEXT;
+
+CREATE TABLE IF NOT EXISTS withdrawals (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+    amount_paise INTEGER NOT NULL,
+    method VARCHAR(32),
+    address TEXT,
+    status VARCHAR(20) DEFAULT 'pending',
+    reviewed_by BIGINT,
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_withdrawals_pending
+    ON withdrawals (status, created_at DESC);
+
 -- ===== REFERRALS =====
 -- Short public referral code, so users share a code instead of their
 -- Telegram user id.
@@ -713,6 +732,80 @@ class Database:
                     referrer_id,
                 )
                 return total
+
+    async def set_payout_method(self, user_id: int, method: str, address: str) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET payout_method = $1, payout_address = $2 WHERE telegram_user_id = $3",
+                method, address, user_id,
+            )
+
+    async def get_payout_method(self, user_id: int) -> tuple[str | None, str | None]:
+        if self.pool is None: return None, None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payout_method, payout_address FROM users WHERE telegram_user_id = $1", user_id,
+            )
+        if not row:
+            return None, None
+        return row["payout_method"], row["payout_address"]
+
+    async def pending_withdrawal(self, user_id: int) -> asyncpg.Record | None:
+        """A user may only have one open request — otherwise they could queue
+        several requests for the same balance and be paid twice."""
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """SELECT * FROM withdrawals
+                   WHERE user_id = $1 AND status = 'pending'
+                   ORDER BY id DESC LIMIT 1""",
+                user_id,
+            )
+
+    async def create_withdrawal(self, user_id: int, amount_paise: int, method: str, address: str) -> int | None:
+        if self.pool is None or amount_paise <= 0: return None
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchval(
+                    "SELECT 1 FROM withdrawals WHERE user_id = $1 AND status = 'pending' FOR UPDATE",
+                    user_id,
+                )
+                if existing:
+                    return None
+                return await conn.fetchval(
+                    """INSERT INTO withdrawals (user_id, amount_paise, method, address)
+                       VALUES ($1, $2, $3, $4) RETURNING id""",
+                    user_id, amount_paise, method, address,
+                )
+
+    async def get_withdrawal(self, request_id: int) -> asyncpg.Record | None:
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM withdrawals WHERE id = $1", request_id)
+
+    async def list_pending_withdrawals(self, limit: int = 20) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT w.*, u.username, u.first_name
+                   FROM withdrawals w
+                   LEFT JOIN users u ON u.telegram_user_id = w.user_id
+                   WHERE w.status = 'pending'
+                   ORDER BY w.created_at ASC LIMIT $1""",
+                limit,
+            )
+
+    async def set_withdrawal_status(self, request_id: int, status: str, reviewed_by: int) -> bool:
+        """Guarded on 'pending' so two admins tapping Approve cannot pay twice."""
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute(
+                """UPDATE withdrawals SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP
+                   WHERE id = $3 AND status = 'pending'""",
+                status, reviewed_by, request_id,
+            )
+            return res == "UPDATE 1"
 
     async def list_pending_payouts(self, limit: int = 20) -> list[asyncpg.Record]:
         """Referrers who are owed money — the admin payout queue."""
