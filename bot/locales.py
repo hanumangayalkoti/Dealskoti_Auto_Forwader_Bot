@@ -50,6 +50,7 @@ ADMIN_COMMANDS = [
     ("/broadcast", "📣 Send a message to users"),
     ("/block", "⛔ Block a user from using the bot"),
     ("/unblock", "✅ Unblock a restricted user"),
+    ("/withdrawals", "💸 Review pending payout requests"),
 ]
 
 # ==========================================
