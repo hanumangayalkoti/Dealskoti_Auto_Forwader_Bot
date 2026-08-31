@@ -1,134 +1,138 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class FAQItem:
     question: str
     answer: str
 
+
 # 15 FAQs per language. main.py paginates them 5 per page automatically.
+# Keep both lists the same length and in the same order — the callback stores
+# the index, so a mismatch would show the wrong answer in the other language.
 FAQS: dict[str, list[FAQItem]] = {
     "en": [
         FAQItem(
-            "What is Dealskoti Auto Forwarder Bot?",
-            "It is a Telegram bot that automatically copies messages from your selected source channels/groups to your destination channels/groups in real time. Connect your account, create a task, pick source and destination — forwarding starts instantly.",
+            "What is DealsKoti Auto Forwarder Bot?",
+            "It copies posts from your chosen source channels to your own channels automatically, in real time. Connect your account, create a task, pick a source and a destination — forwarding starts instantly and runs 24/7.",
         ),
         FAQItem(
-            "How do I connect my Telegram account? Is it safe?",
-            "Tap 'Connect Account' or send /connect, then send your phone number with country code (example for India: +919876543210, no spaces). You will receive an OTP in Telegram — enter it here. Your session is encrypted and stored securely; we never see or store your OTP or 2FA password.",
+            "How do I connect my account? Is it safe?",
+            "Send /connect, then your phone number with country code (example: +919876543210, no spaces). Telegram sends you a code — enter it here as PIN12345. Your session is encrypted before it is stored, and your OTP and 2FA password are never saved. Your 2FA password is deleted from the chat the moment you send it.",
         ),
         FAQItem(
-            "How do I create my first forwarding task?",
-            "Send /newtask, give the task a name, then select a Source chat and Destination chat. You can pick chats from the list of your recent 20 chats, forward any message from the desired chat, or type its @username. Tip: pin a chat in Telegram so it appears at the top of the list.",
+            "How do I create my first task?",
+            "Send /newtask, give it a name, then pick your source channel and your destination channel from the numbered list. If a chat is not in the list, forward any message from it, or type its @username. Forwarding starts as soon as the task is created.",
         ),
         FAQItem(
-            "What plans are available and what do they include?",
-            "Free: 1 task, 1 source + 1 destination, 50 messages/day. Silver (₹149/$1.5): 3 tasks, 5+5, 200/day, clean copy, header/footer, delay timer, anti-ban speed. Gold (₹500/$5): 5 tasks, 10+10, 1000/day, plus blacklist/whitelist and hidden-link removal. Platinum (₹1000/$10): 10 tasks, 15+15, unlimited messages, replace rules, watermark, auto-delete, live edit sync, file attach and VIP support.",
+            "Nothing is being forwarded. What do I check?",
+            "Open /mystats first — it shows when each task last forwarded something. If a task says 'last never', the source is usually wrong or your account is not a member of it. Also check the task is not paused, your daily limit is not used up, and that you can actually post in the destination.",
         ),
         FAQItem(
-            "Which payment methods are supported?",
-            "Two methods: (1) INR via Razorpay — pay by UPI/card/netbanking through the secure checkout link, activation is automatic. (2) USDT (TRC20) — choose USDT at checkout, send the exact amount to the shown wallet, then submit your TXID. An admin verifies it and your plan activates. Weekly/monthly/yearly cycles are available for both methods.",
+            "What is the Code Filter?",
+            "It forwards ONLY the gift or coupon code from a post and drops everything else. Channels hide codes in two formats, so pick the one your source uses: Monospace, Spoiler (the hidden text with shimmering dots), or Both. Posts with no code are skipped completely.",
         ),
         FAQItem(
-            "Why do Free plan messages show a 'Forwarded from' tag?",
-            "Free plan uses Telegram's native forward, so the original source attribution stays visible. Silver and higher plans use clean copy mode — no forwarded tag, no bot watermark — messages look like they were posted directly by you.",
+            "What do Remove Links and Remove Usernames do?",
+            "They strip every URL or every @handle out of the forwarded text. If you want to swap them for your own instead of deleting them, use Replace Links or Replace Usernames. Your header and footer are never touched by these.",
         ),
         FAQItem(
-            "What are Header and Footer text?",
-            "Header is a line added above every forwarded message; Footer is added below it. You can set them per task from Settings → Filters &amp; Replacements. Use them for credits, promo lines, or branding.",
+            "What is Topics Forwarding?",
+            "Some groups are forums split into topics. This lets you forward from only the topics you choose instead of the whole group. Select nothing and every topic is forwarded.",
         ),
         FAQItem(
-            "What do Blacklist and Whitelist filters do?",
-            "Blacklist: messages containing any blacklisted word are skipped. Whitelist: only messages containing at least one whitelisted word are forwarded. Both are Gold &amp; Platinum features, configurable per task from Settings → Filters &amp; Replacements.",
+            "What is Post Edit Sync?",
+            "When the source author edits their post, your copy is updated too. Telegram only allows edits for 48 hours, so older posts stay as they were. It is a toggle on Gold and automatic on Platinum.",
         ),
         FAQItem(
-            "What is the Delay Timer and Anti-Ban Speed?",
-            "Both control forwarding speed so your account stays safe. Delay Timer waits between sending to each destination (Off/Slow/Normal/Fast). Anti-Ban Speed adds a safe gap between every forwarded message (Slow/Normal/Fast). Available from Silver upward.",
+            "What is Auto Reaction?",
+            "Your account automatically reacts with an emoji you choose — either on the source post or on your forwarded copy. If a channel does not allow that emoji, it is skipped quietly and forwarding is unaffected.",
         ),
         FAQItem(
-            "What is Live Edit Sync?",
-            "A Platinum feature that works automatically — no toggle needed. If the source message is edited after forwarding, your destination copies are updated automatically to match.",
+            "How do the daily message limits work?",
+            "Free gives 100 messages a day, Silver 500, Gold 2000, and Platinum is unlimited. The counter resets at midnight. You get one notification the day you hit the limit, and messages resume automatically the next day.",
         ),
         FAQItem(
-            "How does Auto Delete work?",
-            "Platinum feature. Set a number of seconds in Settings → Media; every forwarded message is deleted from the destination automatically after that time. Send 0 or /clear to turn it off.",
+            "How do I pay, and how fast does my plan activate?",
+            "UPI and card payments through Razorpay activate automatically within seconds. USDT and Telegram Stars are verified by an admin first — submit your transaction ID or screenshot and you will be notified once approved.",
         ),
         FAQItem(
-            "What is the File Upload feature (/upload_file)?",
-            "Platinum members can upload a file (like an APK) via /upload_file. Then: (1) attach it to every forwarded message automatically, and/or (2) when a source message contains a file of the same type (.apk etc.), it gets replaced with your uploaded file. Both options have ON/OFF toggles in Settings.",
+            "What happens if I upgrade mid-plan?",
+            "Nothing is lost. The unused value of your current plan is converted into extra days on the new one. Downgrading is different — your current plan runs to its expiry date, then the lower plan starts.",
         ),
         FAQItem(
-            "Why did my forwarding stop working?",
-            "Most common reasons: daily message limit reached (check /account), you left the updates channel (tasks pause automatically — rejoin and resume), plan expired, or all tasks paused. Check /tasks to resume and /account for limits.",
+            "How does Refer & Earn work?",
+            "Share your referral link. When someone joins through it and buys any plan, you earn 20% of every payment they make — not just the first one, for as long as they keep paying. Your earnings are shown on the Refer & Earn screen.",
         ),
         FAQItem(
-            "How does the referral system work?",
-            "Tap 'Refer' in the main menu to get your personal link. When someone starts the bot through your link, they are recorded as your referral. Referral rewards are paid out manually by the admin — contact support for payout status.",
+            "Will my account get banned?",
+            "The bot uses your own account, so normal Telegram limits apply. Anti-Ban Speed and the per-target Delay Timer exist to space out sending and keep it looking natural. Forwarding to a very large number of destinations very fast is the main risk — go slower if you are unsure.",
         ),
         FAQItem(
-            "How do I contact support?",
-            "Tap 'Support' in the main menu or send /support — you will get our support channel link. The team usually replies within 24 hours. For payment issues, keep your TXID or Razorpay payment ID ready.",
+            "What happens if I disconnect my account?",
+            "Your session is removed and all forwarding stops immediately. Your tasks, settings and subscription are kept safely — reconnect with /connect and everything resumes exactly where it was.",
         ),
     ],
     "hinglish": [
         FAQItem(
-            "Dealskoti Auto Forwarder Bot kya hai?",
-            "Ye ek Telegram bot hai jo aapke selected source channels/groups ke messages ko real time me aapke destination channels/groups tak apne aap pahunchata hai. Account connect karo, task banao, source aur destination chuno — forwarding turant shuru.",
+            "DealsKoti Auto Forwarder Bot kya hai?",
+            "Ye aapke chune hue source channels ki posts apne channels me apne aap copy karta hai, real time me. Account connect karo, task banao, source aur destination chuno — forwarding turant shuru ho jaati hai aur 24/7 chalti hai.",
         ),
         FAQItem(
-            "Apna Telegram account kaise connect karu? Kya ye safe hai?",
-            "'Connect Account' dabao ya /connect bhejo, phir apna phone number country code ke sath bhejo (India ka example: +919876543210, bina space). Telegram me OTP aayega — use yahan daalo. Aapka session encrypted aur safe store hota hai; humara bot aapka OTP ya 2FA password kabhi nahi dekhta.",
+            "Account kaise connect karein? Kya ye safe hai?",
+            "/connect bhejein, phir apna phone number country code ke saath (jaise: +919876543210, bina space). Telegram aapko code bhejega — use yahan PIN12345 format me daalein. Aapka session encrypt karke store hota hai, aur OTP ya 2FA password kabhi save nahi hota. 2FA password to bhejte hi chat se delete ho jaata hai.",
         ),
         FAQItem(
-            "Pehla forwarding task kaise banau?",
-            "/newtask bhejo, task ko naam do, phir Source chat aur Destination chat select karo. Aap apke recent 20 chats ki list se chun sakte ho, koi bhi message forward kar sakte ho, ya @username type kar sakte ho. Tip: Telegram me chat ko pin karo taaki wo list me sabse upar dikhe.",
+            "Pehla task kaise banayein?",
+            "/newtask bhejein, naam dein, phir numbered list me se source aur destination channel chunein. Agar koi chat list me na ho to usse koi message forward kar dein, ya uska @username type karein. Task banate hi forwarding shuru ho jaati hai.",
         ),
         FAQItem(
-            "Kaun se plans hain aur unme kya milta hai?",
-            "Free: 1 task, 1 source + 1 destination, 50 msg/day. Silver (₹149/$1.5): 3 tasks, 5+5, 200/day, clean copy, header/footer, delay timer, anti-ban speed. Gold (₹500/$5): 5 tasks, 10+10, 1000/day, plus blacklist/whitelist aur hidden links removal. Platinum (₹1000/$10): 10 tasks, 15+15, unlimited messages, replace rules, watermark, auto-delete, live edit sync, file attach aur VIP support.",
+            "Kuch forward nahi ho raha, kya check karein?",
+            "Pehle /mystats kholein — usme dikhta hai har task ne aakhri baar kab kuch forward kiya. Agar kisi task pe 'last never' likha hai to aksar source galat hai ya aapka account us channel me nahi hai. Ye bhi dekhein ki task paused to nahi, daily limit khatam to nahi, aur destination me post karne ki permission hai ya nahi.",
         ),
         FAQItem(
-            "Payment ke liye kaun se tarike hain?",
-            "Do tarike: (1) INR — Razorpay se UPI/card/netbanking, payment hote hi plan automatic activate. (2) USDT (TRC20) — checkout me USDT chuno, bataye gaye wallet par exact amount bhejo, phir apna TXID submit karo. Admin verify karega aur plan activate ho jayega. Dono me weekly/monthly/yearly cycles available hain.",
+            "Code Filter kya hai?",
+            "Ye post me se sirf gift ya coupon code forward karta hai, baaki sab hata deta hai. Channels code do formats me chhupate hain, apne source wala chunein: Monospace, Spoiler (chamakte dots wala chhupa text), ya Both. Jis post me code nahi hoga wo poora skip ho jayega.",
         ),
         FAQItem(
-            "Free plan ke messages me 'Forwarded from' tag kyu dikhta hai?",
-            "Free plan Telegram ka native forward use karta hai, isliye original source ka tag dikhta hai. Silver aur upar ke plans clean copy mode use karte hain — na forwarded tag, na bot watermark — message seedha aapki taraf se post hua dikhta hai.",
+            "Remove Links aur Remove Usernames kya karte hain?",
+            "Ye forwarded text me se har URL ya har @handle hata dete hain. Agar hatane ki jagah apna lagana hai to Replace Links ya Replace Usernames use karein. Aapka header aur footer inse kabhi nahi chhinta.",
         ),
         FAQItem(
-            "Header aur Footer text kya hote hain?",
-            "Header har forwarded message ke upar add hota hai, Footer neeche. Settings → Filters &amp; Replacements me per task set kar sakte ho. Credits, promo line ya branding ke liye use karo.",
+            "Topics Forwarding kya hai?",
+            "Kuch groups forum hote hain jo topics me bante hain. Isse aap poore group ki jagah sirf chune hue topics se forward kar sakte hain. Kuch na chunein to sab topics se forward hoga.",
         ),
         FAQItem(
-            "Blacklist aur Whitelist filters kya karte hain?",
-            "Blacklist: jis message me blacklist ka word ho, wo skip ho jata hai. Whitelist: sirf wahi messages forward hote hain jinme whitelist ka koi word ho. Dono Gold aur Platinum features hain, Settings → Filters &amp; Replacements me per task set hote hain.",
+            "Post Edit Sync kya hai?",
+            "Jab source wala apni post edit karta hai, aapki copy bhi update ho jaati hai. Telegram sirf 48 ghante tak edit allow karta hai, isliye purani posts waisi hi rehti hain. Gold pe ye toggle hai, Platinum pe automatic.",
         ),
         FAQItem(
-            "Delay Timer aur Anti-Ban Speed kya hai?",
-            "Dono forwarding ki speed control karte hain taaki aapka account safe rahe. Delay Timer har destination bhejne ke beech wait karta hai (Off/Slow/Normal/Fast). Anti-Ban Speed har forwarded message ke beech safe gap deta hai (Slow/Normal/Fast). Silver se upar available.",
+            "Auto Reaction kya hai?",
+            "Aapka account apne aap aapke chune emoji se reaction karta hai — ya to source post pe, ya aapki forward ki hui copy pe. Agar koi channel wo emoji allow na kare to chup-chaap skip ho jaata hai, forwarding pe koi asar nahi.",
         ),
         FAQItem(
-            "Live Edit Sync kya hai?",
-            "Ye Platinum ka automatic feature hai — koi toggle nahi hai. Agar source message forward hone ke baad edit hota hai, toh aapke destination wale copies bhi apne aap update ho jate hain.",
+            "Daily message limit kaise kaam karti hai?",
+            "Free me 100 messages roz, Silver me 500, Gold me 2000, aur Platinum me unlimited. Counter raat 12 baje reset hota hai. Jis din limit khatam hoti hai us din ek notification aata hai, aur agle din messages apne aap chalu ho jaate hain.",
         ),
         FAQItem(
-            "Auto Delete kaise kaam karta hai?",
-            "Platinum feature. Settings → Media me seconds ka number set karo; har forwarded message utne time baad destination se apne aap delete ho jayega. Band karne ke liye 0 bhejo ya /clear.",
+            "Payment kaise karein, plan kitni jaldi activate hota hai?",
+            "UPI aur card payment Razorpay se seconds me apne aap activate ho jaata hai. USDT aur Telegram Stars ko pehle admin verify karta hai — transaction ID ya screenshot bhejein, approve hote hi aapko notification mil jayega.",
         ),
         FAQItem(
-            "File Upload feature (/upload_file) kya hai?",
-            "Platinum members /upload_file se file (jaise APK) upload kar sakte hain. Phir: (1) ye file har forwarded message ke sath attach hogi, aur/ya (2) jab source message me same type ki file (.apk etc.) aaye, wo aapki uploaded file se replace ho jayegi. Dono ke ON/OFF toggles Settings me hain.",
+            "Beech me upgrade karun to kya hoga?",
+            "Kuch nahi jaata. Aapke current plan ka bacha hua paisa naye plan ke extra dino me badal jaata hai. Downgrade alag hai — current plan apni expiry tak chalta hai, uske baad chhota plan shuru hota hai.",
         ),
         FAQItem(
-            "Mera forwarding ruk gaya, kya karu?",
-            "Common reasons: daily limit poori ho gayi (/account me dekho), aap updates channel se bahar nikal gaye (tasks pause ho jate hain — wapas join karke resume karo), plan expire ho gaya, ya saare tasks paused hain. /tasks se resume karo aur /account se limits dekho.",
+            "Refer & Earn kaise kaam karta hai?",
+            "Apna referral link share karein. Jab koi uske through jud kar koi bhi plan kharide, to aapko unke har payment ka 20% milta hai — sirf pehle payment ka nahi, jab tak wo paisa dete rahenge. Aapki kamai Refer & Earn screen pe dikhti hai.",
         ),
         FAQItem(
-            "Referral system kaise kaam karta hai?",
-            "Main menu me 'Refer' dabao, aapka personal link mil jayega. Jo bhi aapke link se bot start karega, wo aapka referral ban jayega. Referral rewards admin manually pay karta hai — payout ke liye support se baat karo.",
+            "Kya mera account ban ho sakta hai?",
+            "Bot aapke apne account se chalta hai, isliye Telegram ki normal limits lagti hain. Anti-Ban Speed aur per-target Delay Timer isiliye hain ki messages fasle se jaayein aur natural lagein. Sabse bada risk hai bahut saare destinations pe bahut tezi se bhejna — shak ho to speed dheemi rakhein.",
         ),
         FAQItem(
-            "Support se baat kaise karu?",
-            "Main menu me 'Support' dabao ya /support bhejo — support channel ka link milega. Team aam taur par 24 ghante me reply karti hai. Payment issue ke liye apna TXID ya Razorpay payment ID ready rakho.",
+            "Account disconnect karun to kya hoga?",
+            "Aapka session hat jaata hai aur forwarding turant ruk jaati hai. Aapke tasks, settings aur subscription safe rehte hain — /connect se dobara connect karein aur sab wahin se chalu ho jaata hai.",
         ),
-    ]
+    ],
 }
