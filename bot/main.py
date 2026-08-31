@@ -71,7 +71,7 @@ from .locales import (
     language_for,
     t,
 )
-from .plans import PLANS, REFERRAL_RATE, duration_days, format_paise
+from .plans import MIN_WITHDRAWAL_PAISE, PLANS, REFERRAL_RATE, duration_days, format_paise
 from .settings_ui import router as settings_router
 from .telethon_service import TelethonService
 
@@ -107,6 +107,10 @@ class AdminStates(StatesGroup):
 
 class AdminGrantStates(StatesGroup):
     waiting_custom_days = State()
+
+
+class PayoutStates(StatesGroup):
+    waiting_address = State()
 
 
 class AdminBroadcastStates(StatesGroup):
@@ -291,6 +295,7 @@ FLOW_LABELS: dict[str, str] = {
     "ManualPayStates:waiting_proof": "Payment Proof",
     "AdminStates:waiting_grant_days": "Grant Days",
     "AdminGrantStates:waiting_custom_days": "Grant Days",
+    "PayoutStates:waiting_address": "Payment Method",
     "AdminBroadcastStates:waiting_message": "Broadcast",
 }
 
@@ -305,6 +310,7 @@ FLOW_STEP_HINTS: dict[str, str] = {
     "SettingsFlow:waiting_value": "You were changing a setting.",
     "ManualPayStates:waiting_proof": "You were submitting payment proof.",
     "AdminBroadcastStates:waiting_message": "You were writing a broadcast.",
+    "PayoutStates:waiting_address": "You were setting your payout address.",
 }
 
 
@@ -710,37 +716,54 @@ async def choose_language(callback: CallbackQuery, db: Database, settings: Setti
 FAQ_PAGE_SIZE = 5
 
 
-def _faq_keyboard(language: str, page: int) -> InlineKeyboardMarkup:
+def _faq_keyboard(language: str, page: int, selected: int | None = None) -> InlineKeyboardMarkup:
+    """The question list. Stays on screen after an answer is opened, so the
+    user can read the next one without going back."""
     items = FAQS.get(language) or FAQS.get("en") or []
     pages = max(1, (len(items) + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     start = page * FAQ_PAGE_SIZE
     rows = []
     for offset, faq in enumerate(items[start:start + FAQ_PAGE_SIZE]):
+        index = start + offset
+        mark = "✅ " if index == selected else ""
         rows.append([InlineKeyboardButton(
-            text=f"{start + offset + 1}. {faq.question[:50]}",
-            callback_data=f"faq:item:{start + offset}",
+            text=f"{mark}{index + 1}. {faq.question[:48]}",
+            callback_data=f"faq:item:{index}",
         )])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"faq:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"faq:page:{page - 1}"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"faq:page:{page + 1}"))
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"faq:page:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _faq_text(language: str, page: int, index: int | None = None) -> str:
+    items = FAQS.get(language) or FAQS.get("en") or []
+    pages = max(1, (len(items) + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
+    header = safe_t(language, "faq_title", page=page + 1, pages=pages)
+
+    if index is None or index < 0 or index >= len(items):
+        return f"{header}\n\n{safe_t(language, 'faq_hint')}"
+
+    faq = items[index]
+    return (
+        f"{header}\n\n"
+        f"❓ <b>Q — {safe_html(faq.question)}</b>\n\n"
+        f"💡 <b>Ans —</b> {safe_html(faq.answer)}\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"{safe_t(language, 'faq_hint')}"
+    )
+
+
 @router.message(Command("faq"))
 async def faq_command(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
-    items = FAQS.get(language) or FAQS.get("en") or []
-    pages = max(1, (len(items) + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
-    await message.answer(
-        safe_t(language, "faq_title", page=1, pages=pages) + "\n\n" + safe_t(language, "faq_hint"),
-        reply_markup=_faq_keyboard(language, 0),
-    )
+    await message.answer(_faq_text(language, 0), reply_markup=_faq_keyboard(language, 0))
 
 
 @router.callback_query(F.data.startswith("faq:page:"))
@@ -749,18 +772,13 @@ async def faq_page(callback: CallbackQuery, db: Database) -> None:
         return
     page = int(callback.data.rsplit(":", 1)[1])
     language = await _language_for_callback(db, callback)
-    items = FAQS.get(language) or FAQS.get("en") or []
-    pages = max(1, (len(items) + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
-    await _safe_edit(
-        callback.message,
-        safe_t(language, "faq_title", page=page + 1, pages=pages) + "\n\n" + safe_t(language, "faq_hint"),
-        _faq_keyboard(language, page),
-    )
+    await _safe_edit(callback.message, _faq_text(language, page), _faq_keyboard(language, page))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("faq:item:"))
 async def faq_item(callback: CallbackQuery, db: Database) -> None:
+    """Edits the SAME message: answer on top, question list still below."""
     if callback.message is None:
         return
     index = int(callback.data.rsplit(":", 1)[1])
@@ -768,16 +786,11 @@ async def faq_item(callback: CallbackQuery, db: Database) -> None:
     items = FAQS.get(language) or FAQS.get("en") or []
     if index < 0 or index >= len(items):
         return await callback.answer("Not found", show_alert=True)
-    faq = items[index]
     page = index // FAQ_PAGE_SIZE
     await _safe_edit(
         callback.message,
-        safe_t(language, "faq_answer",
-               question=safe_html(faq.question), answer=safe_html(faq.answer)),
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Back to FAQ", callback_data=f"faq:page:{page}")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
+        _faq_text(language, page, index),
+        _faq_keyboard(language, page, selected=index),
     )
     await callback.answer()
 
@@ -893,13 +906,15 @@ async def _refer_screen(bot: Bot, db: Database, user_id: int, language: str):
         f"👥 Referrals: <b>{summary['joined']}</b>\n"
         f"💰 Unpaid earnings: <b>{format_paise(summary['unpaid_paise'])}</b>\n"
         f"🏆 Lifetime earned: <b>{format_paise(summary['unpaid_paise'] + summary['paid_paise'])}</b>\n\n"
-        "💸 Contact support to request a payout."
+        f"📊 Minimum payout: {format_paise(MIN_WITHDRAWAL_PAISE)}"
     )
     share = (
         f"https://t.me/share/url?url={link}"
         "&text=Auto-forward posts from any channel to yours. Free to start!"
     )
     rows = [
+        [InlineKeyboardButton(text="💸 Withdraw", callback_data="wd:menu"),
+         InlineKeyboardButton(text="🏦 Payment Method", callback_data="pm:menu")],
         [InlineKeyboardButton(text="📤 Share Link", url=share)],
         [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ]
@@ -2335,6 +2350,290 @@ async def config_list_cb(callback: CallbackQuery, db: Database) -> None:
         return await callback.answer()
     await _safe_edit(callback.message, safe_t(language, "config_select_task"), markup)
     await callback.answer()
+
+
+# ==========================================
+# WITHDRAWALS (self-serve payouts)
+# ==========================================
+
+PAYOUT_METHODS = {
+    "upi": "🇮🇳 UPI",
+    "usdt": "🪙 USDT TRC20",
+    "stars": "⭐ Telegram Stars",
+    "wallet": "💬 Telegram Wallet",
+}
+
+PAYOUT_PROMPTS = {
+    "upi": "Send your UPI ID\n\nExample: <code>himanshu@paytm</code>",
+    "usdt": "Send your USDT TRC20 wallet address\n\nExample: <code>TXYZ...abc</code>",
+    "stars": "Send the @username Stars should be sent to\n\nExample: <code>@himanshu</code>",
+    "wallet": "Send the @username linked to your Telegram Wallet\n\nExample: <code>@himanshu</code>",
+}
+
+
+async def _withdraw_screen(db: Database, user_id: int):
+    summary = await db.referral_summary(user_id)
+    balance = summary["unpaid_paise"]
+    method, address = await db.get_payout_method(user_id)
+    pending = await db.pending_withdrawal(user_id)
+
+    if pending is not None:
+        text = (
+            "💸 <b>Withdraw Earnings</b>\n\n"
+            f"⏳ You already have a payout request pending.\n\n"
+            f"Amount: <b>{format_paise(int(pending['amount_paise']))}</b>\n"
+            f"Method: {PAYOUT_METHODS.get(str(pending['method']), pending['method'])}\n\n"
+            "You'll be notified once it is processed."
+        )
+        return text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:refer")],
+        ])
+
+    if balance < MIN_WITHDRAWAL_PAISE:
+        short = MIN_WITHDRAWAL_PAISE - balance
+        text = (
+            "💸 <b>Withdraw Earnings</b>\n\n"
+            f"💰 Available: <b>{format_paise(balance)}</b>\n"
+            f"📊 Minimum: {format_paise(MIN_WITHDRAWAL_PAISE)}\n\n"
+            f"⚠️ You need <b>{format_paise(short)}</b> more to withdraw."
+        )
+        return text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Share Your Link", callback_data="menu:refer")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:refer")],
+        ])
+
+    if not method or not address:
+        text = (
+            "💸 <b>Withdraw Earnings</b>\n\n"
+            f"💰 Available: <b>{format_paise(balance)}</b>\n\n"
+            "🏦 You haven't set a payment method yet.\n"
+            "Set one to request your payout."
+        )
+        return text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏦 Set Payment Method", callback_data="pm:menu")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:refer")],
+        ])
+
+    text = (
+        "💸 <b>Withdraw Earnings</b>\n\n"
+        f"💰 Available: <b>{format_paise(balance)}</b>\n"
+        f"🏦 Method: {PAYOUT_METHODS.get(method, method)} · <code>{safe_html(address)}</code>\n\n"
+        f"Request payout of <b>{format_paise(balance)}</b>?"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Request Payout", callback_data="wd:request")],
+        [InlineKeyboardButton(text="🏦 Change Method", callback_data="pm:menu")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:refer")],
+    ])
+
+
+@router.callback_query(F.data == "wd:menu")
+async def withdraw_menu_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    text, markup = await _withdraw_screen(db, callback.from_user.id)
+    await _safe_edit(callback.message, text, markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "wd:request")
+async def withdraw_request_cb(
+    callback: CallbackQuery, db: Database, settings: Settings,
+) -> None:
+    if callback.message is None:
+        return
+    # Re-read the balance at submit time: it may have changed since the screen
+    # was drawn, and we must never file a request for money that isn't there.
+    summary = await db.referral_summary(callback.from_user.id)
+    balance = summary["unpaid_paise"]
+    method, address = await db.get_payout_method(callback.from_user.id)
+
+    if balance < MIN_WITHDRAWAL_PAISE:
+        return await callback.answer(
+            f"Minimum is {format_paise(MIN_WITHDRAWAL_PAISE)}. Your balance: {format_paise(balance)}",
+            show_alert=True,
+        )
+    if not method or not address:
+        return await callback.answer("Set a payment method first", show_alert=True)
+
+    request_id = await db.create_withdrawal(callback.from_user.id, balance, method, address)
+    if request_id is None:
+        return await callback.answer("You already have a pending request", show_alert=True)
+
+    user = await db.get_user(callback.from_user.id)
+    await _notify_admins(
+        callback.bot, settings,
+        f"💸 <b>Payout Request</b>\n\n"
+        f"User: {_format_name(user)} (<code>{callback.from_user.id}</code>)\n"
+        f"Amount: <b>{format_paise(balance)}</b>\n"
+        f"Method: {PAYOUT_METHODS.get(method, method)}\n"
+        f"Address: <code>{safe_html(address)}</code>\n\n"
+        f"Review with /withdrawals",
+    )
+    await _safe_edit(
+        callback.message,
+        "✅ <b>Payout Requested</b>\n\n"
+        f"Amount: <b>{format_paise(balance)}</b>\n"
+        f"Method: {PAYOUT_METHODS.get(method, method)}\n\n"
+        "You'll be notified once it is processed.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer("Requested")
+
+
+# ==========================================
+# PAYMENT METHOD
+# ==========================================
+
+@router.callback_query(F.data == "pm:menu")
+async def payout_method_menu(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    method, address = await db.get_payout_method(callback.from_user.id)
+    current = PAYOUT_METHODS.get(method, "❌ Not set") if method else "❌ Not set"
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"pm:set:{key}")]
+            for key, label in PAYOUT_METHODS.items()]
+    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="wd:menu")])
+    await _safe_edit(
+        callback.message,
+        "🏦 <b>Payment Method</b>\n\n"
+        f"Current: <b>{current}</b>\n"
+        f"Address: <code>{safe_html(address) if address else 'Not set'}</code>\n\n"
+        "Select a method to update:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pm:set:"))
+async def payout_method_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None:
+        return
+    method = callback.data.rsplit(":", 1)[1]
+    if method not in PAYOUT_METHODS:
+        return await callback.answer("Invalid method", show_alert=True)
+    await state.set_state(PayoutStates.waiting_address)
+    await state.update_data(payout_method=method)
+    await _safe_edit(
+        callback.message,
+        f"🏦 <b>{PAYOUT_METHODS[method]}</b>\n\n{PAYOUT_PROMPTS[method]}\n\nSend /back to cancel.",
+        None,
+    )
+    await callback.answer()
+
+
+@router.message(PayoutStates.waiting_address)
+async def payout_method_save(message: Message, state: FSMContext, db: Database) -> None:
+    if not message.text:
+        return
+    raw = message.text.strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
+    if len(raw) < 3 or len(raw) > 200:
+        return await message.answer("⚠️ That doesn't look right. Please send a valid address.")
+
+    data = await state.get_data()
+    method = str(data.get("payout_method", ""))
+    if method not in PAYOUT_METHODS:
+        await state.clear()
+        return await message.answer("⚠️ Something went wrong, try again from Refer & Earn.")
+
+    await db.set_payout_method(message.from_user.id, method, raw)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Payment method saved</b>\n\n"
+        f"Method: {PAYOUT_METHODS[method]}\n"
+        f"Address: <code>{safe_html(raw)}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💸 Withdraw", callback_data="wd:menu")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+
+
+# ==========================================
+# ADMIN: WITHDRAWAL REVIEW
+# ==========================================
+
+@router.message(Command("withdrawals"))
+async def withdrawals_command(message: Message, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    rows = await db.list_pending_withdrawals()
+    if not rows:
+        return await message.answer("✅ No pending payout requests.")
+    for w in rows:
+        label = safe_html(w["first_name"] or w["username"] or w["user_id"])
+        await message.answer(
+            f"💸 <b>Payout Request #{w['id']}</b>\n\n"
+            f"User: {label} (<code>{w['user_id']}</code>)\n"
+            f"Amount: <b>{format_paise(int(w['amount_paise']))}</b>\n"
+            f"Method: {PAYOUT_METHODS.get(str(w['method']), w['method'])}\n"
+            f"Address: <code>{safe_html(w['address'])}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Mark Paid", callback_data=f"wdr:ok:{w['id']}"),
+                InlineKeyboardButton(text="❌ Reject", callback_data=f"wdr:no:{w['id']}"),
+            ]]),
+        )
+
+
+@router.callback_query(F.data.startswith("wdr:"))
+async def withdrawal_review_cb(
+    callback: CallbackQuery, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    _, action, rid = callback.data.split(":")
+    request_id = int(rid)
+
+    request = await db.get_withdrawal(request_id)
+    if request is None:
+        return await callback.answer("Not found", show_alert=True)
+    if str(request["status"]) != "pending":
+        return await callback.answer("Already handled", show_alert=True)
+
+    user_id = int(request["user_id"])
+    amount = int(request["amount_paise"])
+
+    # Claim the row first — if this fails another admin got there already and
+    # we must not touch the balance.
+    status = "paid" if action == "ok" else "rejected"
+    if not await db.set_withdrawal_status(request_id, status, callback.from_user.id):
+        return await callback.answer("Already handled", show_alert=True)
+
+    note = ""
+    if action == "ok":
+        # Only now are the commissions marked paid, so a rejected request
+        # leaves the user's balance untouched.
+        paid = await db.payout_referrals(user_id)
+        note = f"✅ Marked paid — {format_paise(paid or amount)}"
+        with suppress(Exception):
+            await callback.bot.send_message(
+                user_id,
+                f"💸 <b>Payout sent!</b>\n\nAmount: <b>{format_paise(paid or amount)}</b>\n"
+                f"Method: {PAYOUT_METHODS.get(str(request['method']), request['method'])}",
+                parse_mode="HTML",
+            )
+    else:
+        note = "❌ Rejected — balance kept"
+        with suppress(Exception):
+            await callback.bot.send_message(
+                user_id,
+                "❌ <b>Payout request rejected</b>\n\n"
+                "Your balance has not been touched. Contact support for details.",
+                parse_mode="HTML",
+            )
+
+    if callback.message:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(
+                (callback.message.html_text or callback.message.text or "") + f"\n\n{note}",
+                parse_mode="HTML",
+            )
+    await callback.answer(note[:60])
 
 
 # ==========================================
