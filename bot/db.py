@@ -13,6 +13,7 @@ NON-NEGOTIABLE RULES (do not "optimise" these away in a rewrite):
 import json
 import logging
 import os
+import secrets
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -199,6 +200,23 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
+
+-- ===== STATS =====
+-- Per-task counters so /stats can show which task is actually working and
+-- which one has silently stopped. Updated on every successful send.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS forward_count BIGINT DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_forward_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_forward_at TIMESTAMP WITH TIME ZONE;
+
+-- Warned-today marker so the daily-limit notice is sent once, not per message.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS limit_notice_date DATE;
+
+-- ===== REFERRALS =====
+-- Short public referral code, so users share a code instead of their
+-- Telegram user id.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(16);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
+    ON users (referral_code) WHERE referral_code IS NOT NULL;
 """
 
 
@@ -448,15 +466,72 @@ class Database:
             val = await conn.fetchval("SELECT message_count FROM usage_daily WHERE user_id = $1 AND usage_date = $2", user_id, today)
             return val or 0
 
-    async def increment_usage(self, user_id: int) -> None:
+    async def increment_usage(self, user_id: int, task_id: int | None = None) -> None:
+        """Counts one successful forward.
+
+        Also stamps last_forward_at on the user and the task. That timestamp is
+        what lets /stats answer "is this thing still working?" — the single most
+        useful line on the screen when a task has silently stopped.
+        """
         if self.pool is None: return
-        today = datetime.now(timezone.utc).date()
+        now = datetime.now(timezone.utc)
+        today = now.date()
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO usage_daily (user_id, usage_date, message_count)
                 VALUES ($1, $2, 1)
                 ON CONFLICT (user_id, usage_date) DO UPDATE SET message_count = usage_daily.message_count + 1
             """, user_id, today)
+            await conn.execute(
+                "UPDATE users SET last_forward_at = $1 WHERE telegram_user_id = $2", now, user_id,
+            )
+            if task_id is not None:
+                await conn.execute(
+                    """UPDATE tasks SET forward_count = COALESCE(forward_count, 0) + 1,
+                              last_forward_at = $1
+                       WHERE id = $2""",
+                    now, task_id,
+                )
+
+    async def usage_stats(self, user_id: int) -> dict:
+        """Everything the /stats screen needs, in one round-trip."""
+        if self.pool is None:
+            return {"today": 0, "month": 0, "total": 0, "last_forward_at": None}
+        now = datetime.now(timezone.utc)
+        month_start = now.date().replace(day=1)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT
+                     COALESCE(SUM(CASE WHEN usage_date = $2 THEN message_count END), 0) AS today,
+                     COALESCE(SUM(CASE WHEN usage_date >= $3 THEN message_count END), 0) AS month,
+                     COALESCE(SUM(message_count), 0) AS total
+                   FROM usage_daily WHERE user_id = $1""",
+                user_id, now.date(), month_start,
+            )
+            last = await conn.fetchval(
+                "SELECT last_forward_at FROM users WHERE telegram_user_id = $1", user_id,
+            )
+        return {
+            "today": int(row["today"] or 0),
+            "month": int(row["month"] or 0),
+            "total": int(row["total"] or 0),
+            "last_forward_at": last,
+        }
+
+    async def should_send_limit_notice(self, user_id: int) -> bool:
+        """True at most once per day, so hitting the cap on message 501 through
+        5000 does not produce 4500 notifications."""
+        if self.pool is None: return False
+        today = datetime.now(timezone.utc).date()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE users SET limit_notice_date = $1
+                   WHERE telegram_user_id = $2
+                     AND (limit_notice_date IS NULL OR limit_notice_date <> $1)
+                   RETURNING telegram_user_id""",
+                today, user_id,
+            )
+            return row is not None
 
     # ==========================================
     # POST EDIT SYNC — SENT MESSAGE MAP
@@ -513,6 +588,38 @@ class Database:
     # ==========================================
     # REFERRALS
     # ==========================================
+
+    async def ensure_referral_code(self, user_id: int) -> str:
+        """Returns the user's short public referral code, creating it on first
+        use. Sharing a code instead of a Telegram user id keeps the id private."""
+        if self.pool is None:
+            return ""
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchval(
+                "SELECT referral_code FROM users WHERE telegram_user_id = $1", user_id,
+            )
+            if existing:
+                return str(existing)
+            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no look-alike chars
+            for _ in range(8):
+                code = "".join(secrets.choice(alphabet) for _ in range(8))
+                try:
+                    await conn.execute(
+                        "UPDATE users SET referral_code = $1 WHERE telegram_user_id = $2",
+                        code, user_id,
+                    )
+                    return code
+                except asyncpg.UniqueViolationError:
+                    continue  # astronomically unlikely; just try another
+        return ""
+
+    async def user_by_referral_code(self, code: str) -> int | None:
+        if self.pool is None or not code:
+            return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT telegram_user_id FROM users WHERE referral_code = $1", code.upper(),
+            )
 
     async def create_referral(self, referrer_id: int, referred_id: int) -> bool:
         if self.pool is None: return False
