@@ -237,7 +237,12 @@ class ForwardingEngine:
         max_concurrent_tasks: int = 100,
         bot_token: str = "",
         storage_channel_id: int | None = None,
+        bot=None,
     ):
+        # The control Bot, used ONLY to warn users about problems they cannot
+        # otherwise see (quota exhausted, a destination that keeps failing).
+        # Silent failure is what makes people think the bot is broken.
+        self.bot = bot
         self.db = db
         self.telethon = telethon
         self.max_concurrent = max_concurrent_tasks
@@ -258,6 +263,11 @@ class ForwardingEngine:
         self._dialogs_synced: set[int] = set()
         # user_id -> (stored_file_id, monotonic_check_time, exists)
         self._stored_file_checks: dict[int, tuple[int, float, bool]] = {}
+        # (task_id, dest_raw) -> consecutive failures, so one flaky send does
+        # not spam the user but a genuinely broken destination does get flagged
+        self._dest_failures: dict[tuple[int, int], int] = {}
+        # destinations already reported, so we warn once and not every message
+        self._dest_reported: set[tuple[int, int]] = set()
 
     def _remember_send(self, chat_id: int, message_id: int) -> None:
         raw = raw_peer_id(chat_id)
@@ -841,7 +851,13 @@ class ForwardingEngine:
 
             # --- LIMITS ---
             if plan.daily_messages and usage >= plan.daily_messages:
-                continue  # quota exceeded, ignore silently to prevent spam
+                # Tell the user ONCE per day. Previously this skipped silently,
+                # which looks identical to the bot being broken.
+                if await self.db.should_send_limit_notice(user_id):
+                    await self._warn_user(
+                        user_id, "limit_reached_notice", cap=plan.daily_messages,
+                    )
+                continue
 
             destinations = [d for d in self._json_field(task["destinations"], []) if isinstance(d, dict)]
             if not destinations:
@@ -923,6 +939,18 @@ class ForwardingEngine:
                     logger.warning(
                         f"Task {task['id']} failed to send to {dest_raw} for user {user_id}: {e}"
                     )
+                    # Warn only after repeated failures, so a one-off network
+                    # error stays quiet but a removed/deleted channel is caught.
+                    fail_key = (int(task["id"]), dest_raw)
+                    count = self._dest_failures.get(fail_key, 0) + 1
+                    self._dest_failures[fail_key] = count
+                    if count >= 3 and fail_key not in self._dest_reported:
+                        self._dest_reported.add(fail_key)
+                        await self._warn_user(
+                            user_id, "destination_failed",
+                            task=str(task["task_name"]),
+                            dest=str(dest.get("title") or dest.get("username") or dest_raw),
+                        )
                     continue
 
                 if isinstance(sent_msg, list):
@@ -932,8 +960,13 @@ class ForwardingEngine:
 
                 sent_any = True
                 self._remember_send(dest_raw, sent_msg.id)
+                # A success clears the failure streak, so a destination that
+                # recovers can be warned about again if it breaks later.
+                fail_key = (int(task["id"]), dest_raw)
+                self._dest_failures.pop(fail_key, None)
+                self._dest_reported.discard(fail_key)
                 # Only count usage on SUCCESS — failed sends do not consume quota
-                await self.db.increment_usage(user_id)
+                await self.db.increment_usage(user_id, int(task["id"]))
                 usage += 1
 
                 # Post Edit Sync bookkeeping (DB-backed so it survives restarts)
@@ -980,6 +1013,19 @@ class ForwardingEngine:
             if sent_any and antiban_delay:
                 # Anti-Ban Speed: pause before this account sends anything again.
                 await asyncio.sleep(antiban_delay)
+
+    async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
+        """Best-effort user warning. Never raises — a blocked user or a network
+        blip must not disturb forwarding."""
+        if self.bot is None:
+            return
+        try:
+            from .locales import language_for, t
+            user = await self.db.get_user(user_id)
+            language = language_for(user["preferred_language"]) if user else "en"
+            await self.bot.send_message(user_id, t(language, key, **kwargs), parse_mode="HTML")
+        except Exception as exc:
+            logger.debug("Could not warn user %s (%s): %s", user_id, key, exc)
 
     # ==========================================
     # EDIT SYNC
