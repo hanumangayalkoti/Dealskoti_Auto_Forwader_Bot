@@ -443,6 +443,10 @@ def stars_amount(plan_name: str, cycle: str) -> int:
 # referred user makes, for as long as that user keeps paying.
 REFERRAL_RATE = 0.20
 
+# Minimum balance before a payout can be requested. Set low enough to feel
+# reachable, high enough that payouts are not a stream of tiny transfers.
+MIN_WITHDRAWAL_PAISE = 50000  # ₹500
+
 
 def referral_commission_paise(amount_paise: int) -> int:
     """The referrer's cut of a payment, rounded down to whole paise."""
