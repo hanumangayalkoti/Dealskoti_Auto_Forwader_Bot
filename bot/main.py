@@ -566,10 +566,18 @@ async def start(message: Message, command: CommandObject, db: Database, settings
     # Referral: /start ref_<id>
     payload = (command.args or "").strip()
     if is_new and payload.startswith("ref_"):
-        raw = payload[4:]
+        raw = payload[4:].strip()
+        referrer_id: int | None = None
         if raw.isdigit():
+            # Legacy links that carried the raw user id are still honoured, so
+            # anything already shared keeps working.
+            referrer_id = int(raw)
+        elif raw:
             with suppress(Exception):
-                await db.create_referral(int(raw), message.from_user.id)
+                referrer_id = await db.user_by_referral_code(raw)
+        if referrer_id:
+            with suppress(Exception):
+                await db.create_referral(referrer_id, message.from_user.id)
 
     if is_new:
         with suppress(Exception):
@@ -860,19 +868,49 @@ async def menu_account(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
+async def _refer_screen(bot: Bot, db: Database, user_id: int, language: str):
+    """Referral screen.
+
+    The link carries a short random CODE, not the Telegram user id — sharing
+    ref_8844066493 publishes your account id to anyone who sees the link.
+    The link is wrapped in <code> so a single tap copies it.
+    """
+    me = await bot.get_me()
+    code = await db.ensure_referral_code(user_id)
+    if not code:
+        # Code generation failed (DB hiccup) — fall back so the screen still
+        # works rather than showing a broken link.
+        code = str(user_id)
+    link = f"https://t.me/{me.username}?start=ref_{code}"
+    summary = await db.referral_summary(user_id)
+
+    text = (
+        "🎁 <b>Refer &amp; Earn</b>\n\n"
+        f"Earn <b>{int(REFERRAL_RATE * 100)}% commission</b> on every payment "
+        "your referrals make — for life.\n\n"
+        "🔗 <b>Your link</b> (tap to copy):\n"
+        f"<code>{safe_html(link)}</code>\n\n"
+        f"👥 Referrals: <b>{summary['joined']}</b>\n"
+        f"💰 Unpaid earnings: <b>{format_paise(summary['unpaid_paise'])}</b>\n"
+        f"🏆 Lifetime earned: <b>{format_paise(summary['unpaid_paise'] + summary['paid_paise'])}</b>\n\n"
+        "💸 Contact support to request a payout."
+    )
+    share = (
+        f"https://t.me/share/url?url={link}"
+        "&text=Auto-forward posts from any channel to yours. Free to start!"
+    )
+    rows = [
+        [InlineKeyboardButton(text="📤 Share Link", url=share)],
+        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.message(Command("refer", "referral"))
 async def refer_command(message: Message, db: Database) -> None:
     language = await _language_for_message(db, message)
-    me = await message.bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
-    summary = await db.referral_summary(message.from_user.id)
-    text = (
-        safe_t(language, "refer_intro", link=safe_html(link), count=summary["joined"])
-        + f"\n\n💰 <b>Earnings ({int(REFERRAL_RATE * 100)}% of every payment)</b>\n"
-        + f"Unpaid: <b>{format_paise(summary['unpaid_paise'])}</b>\n"
-        + f"Already paid: {format_paise(summary['paid_paise'])}"
-    )
-    await message.answer(text, reply_markup=_nav_keyboard())
+    text, markup = await _refer_screen(message.bot, db, message.from_user.id, language)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "menu:refer")
@@ -880,16 +918,8 @@ async def menu_refer(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None:
         return
     language = await _language_for_callback(db, callback)
-    me = await callback.bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{callback.from_user.id}"
-    summary = await db.referral_summary(callback.from_user.id)
-    text = (
-        safe_t(language, "refer_intro", link=safe_html(link), count=summary["joined"])
-        + f"\n\n💰 <b>Earnings ({int(REFERRAL_RATE * 100)}% of every payment)</b>\n"
-        + f"Unpaid: <b>{format_paise(summary['unpaid_paise'])}</b>\n"
-        + f"Already paid: {format_paise(summary['paid_paise'])}"
-    )
-    await _safe_edit(callback.message, text, _nav_keyboard())
+    text, markup = await _refer_screen(callback.bot, db, callback.from_user.id, language)
+    await _safe_edit(callback.message, text, markup)
     await callback.answer()
 
 
