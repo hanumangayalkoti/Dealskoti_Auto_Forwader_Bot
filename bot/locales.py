@@ -16,35 +16,40 @@ RULES when adding text:
 # ==========================================
 
 # Format: (command, description_en, description_hinglish)
+# Telegram only allows a-z, 0-9 and _ in the command NAME, but the description
+# accepts emoji — which is what actually shows in the "/" menu, so that is
+# where they go.
 USER_COMMANDS = [
-    ("/start", "Start the bot and open main menu", "Bot chalu karein aur menu kholein"),
-    ("/menu", "Open the main navigation menu", "Main menu kholein"),
-    ("/help", "View available commands and help", "Commands aur help dekhein"),
-    ("/connect", "Connect your Telegram account", "Apna Telegram account connect karein"),
-    ("/account", "View your account details and limits", "Apne account ki details dekhein"),
-    ("/disconnect", "Disconnect your Telegram account safely", "Apna account safely hataein"),
-    ("/plans", "View and upgrade your subscription plan", "Plans dekhein aur upgrade karein"),
-    ("/tasks", "View and manage your forwarding tasks", "Apne forwarding tasks dekhein"),
-    ("/newtask", "Create a new forwarding task", "Naya forwarding task banayein"),
-    ("/settings", "Configure task settings", "Task ki settings set karein"),
-    ("/config", "Check your configuration settings", "Apni configuration settings dekhein"),
-    ("/updates", "Join the updates/announcements channel", "Updates channel join karein"),
-    ("/support", "Contact customer support", "Support team se baat karein"),
-    ("/language", "Change your language preference", "Apni bhasha (language) badlein"),
+    ("/start", "🚀 Start the bot and open main menu", "🚀 Bot chalu karein aur menu kholein"),
+    ("/menu", "🏠 Open the main navigation menu", "🏠 Main menu kholein"),
+    ("/connect", "🔌 Connect your Telegram account", "🔌 Apna Telegram account connect karein"),
+    ("/newtask", "➕ Create a new forwarding task", "➕ Naya forwarding task banayein"),
+    ("/tasks", "📋 View and manage your forwarding tasks", "📋 Apne forwarding tasks dekhein"),
+    ("/settings", "⚙️ Configure task settings", "⚙️ Task ki settings set karein"),
+    ("/config", "🛠️ Check your configuration settings", "🛠️ Apni configuration settings dekhein"),
+    ("/mystats", "📊 See how many messages were forwarded", "📊 Kitne messages forward hue dekhein"),
+    ("/plans", "💎 View and upgrade your subscription plan", "💎 Plans dekhein aur upgrade karein"),
+    ("/account", "👤 View your account details and limits", "👤 Apne account ki details dekhein"),
+    ("/refer", "🎁 Refer friends and earn commission", "🎁 Dosto ko refer karke kamayein"),
+    ("/disconnect", "🔒 Disconnect your Telegram account safely", "🔒 Apna account safely hataein"),
+    ("/language", "🌐 Change your language preference", "🌐 Apni bhasha (language) badlein"),
+    ("/updates", "📢 Join the updates/announcements channel", "📢 Updates channel join karein"),
+    ("/support", "📞 Contact customer support", "📞 Support team se baat karein"),
+    ("/help", "❓ View available commands and help", "❓ Commands aur help dekhein"),
 ]
 
 # Format: (command, description_en)
 ADMIN_COMMANDS = [
-    ("/admin", "Open Admin Dashboard"),
-    ("/stats", "View bot statistics"),
-    ("/broadcast", "Send a message to users"),
-    ("/block", "Block a user from using the bot"),
-    ("/unblock", "Unblock a restricted user"),
-    ("/grantdays", "Grant premium days to a user (optionally a specific plan)"),
-    ("/listusers", "List recently registered users"),
-    ("/userinfo", "View a user's details"),
-    ("/referralpayout", "Process a referral payout"),
-    ("/pending", "Review pending USDT / Stars payments"),
+    ("/admin", "🛠️ Open Admin Dashboard"),
+    ("/stats", "📊 View bot statistics"),
+    ("/pending", "🧾 Review pending USDT / Stars payments"),
+    ("/payouts", "💰 Review and pay referral commissions"),
+    ("/grantdays", "🎁 Grant premium days to a user"),
+    ("/userinfo", "👤 View a user's details"),
+    ("/listusers", "👥 List recently registered users"),
+    ("/broadcast", "📣 Send a message to users"),
+    ("/block", "⛔ Block a user from using the bot"),
+    ("/unblock", "✅ Unblock a restricted user"),
 ]
 
 # ==========================================
@@ -169,6 +174,13 @@ TRANSLATIONS = {
         "invalid_channel_format": "⚠️ Invalid format. Please send the channel in one of these formats:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
 
         # ---------- SETTINGS: NAVIGATION ----------
+        "flow_cancelled": "↩️ <b>Cancelled: {flow}</b>\n\n{hint}\nThat step has been cancelled — carrying on with your new command below 👇",
+        "home_first_time": "🎉 <b>Welcome to DealsKoti Auto Forwarder!</b>\n\nCopy posts from any channel to yours — automatically, 24/7.",
+        "home_not_connected": "🏠 <b>Main Menu</b>\n\n🔌 Account: <b>not connected</b>\n\nConnect your Telegram account to create tasks and start forwarding.",
+        "home_no_tasks": "🏠 <b>Main Menu</b>\n\n👤 {who}\n💎 Plan: <b>{plan}</b>\n📋 Tasks: none yet\n\n👉 Create your first task to start forwarding.",
+        "home_ready": "🏠 <b>Main Menu</b>\n\n👤 {who}\n💎 Plan: <b>{plan}</b>\n📋 Tasks: {tasks}\n📊 Today: {today} / {cap} forwarded\n🕐 Last forward: {last}\n\nWhat would you like to do?",
+        "limit_reached_notice": "⚠️ <b>Daily Limit Reached</b>\n\nYou've used all <b>{cap}</b> messages for today.\n\n🕛 Resets at midnight\n💎 Upgrade for a higher limit",
+        "destination_failed": "⚠️ <b>Forwarding Problem</b>\n\nTask: <b>{task}</b>\nCouldn't send to: <b>{dest}</b>\n\nPossible reasons:\n• Your account was removed from that channel\n• The channel was deleted\n• You don't have permission to post there\n\nFix it in Settings, or remove that destination.",
         "config_no_tasks": "📋 <b>No tasks yet</b>\n\nYou haven't created any forwarding task, so there is nothing to show.\n\nUse /tasks to create your first task.",
         "config_select_task": "🛠️ <b>Your Configuration</b>\n\nSelect a task to view its current settings:",
         "config_footer": "🦾 Control All Settings: /settings",
@@ -401,6 +413,13 @@ TRANSLATIONS = {
         "invalid_channel_format": "⚠️ Format galat hai. Channel in formats me bhejein:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
 
         # ---------- SETTINGS: NAVIGATION ----------
+        "flow_cancelled": "↩️ <b>Cancel ho gaya: {flow}</b>\n\n{hint}\nWo step cancel kar diya gaya — ab aapki nayi command chal rahi hai 👇",
+        "home_first_time": "🎉 <b>DealsKoti Auto Forwarder me swagat hai!</b>\n\nKisi bhi channel ki posts apne channel me copy karein — apne aap, 24/7.",
+        "home_not_connected": "🏠 <b>Main Menu</b>\n\n🔌 Account: <b>connect nahi hai</b>\n\nTask banane aur forwarding shuru karne ke liye apna Telegram account connect karein.",
+        "home_no_tasks": "🏠 <b>Main Menu</b>\n\n👤 {who}\n💎 Plan: <b>{plan}</b>\n📋 Tasks: abhi koi nahi\n\n👉 Forwarding shuru karne ke liye pehla task banayein.",
+        "home_ready": "🏠 <b>Main Menu</b>\n\n👤 {who}\n💎 Plan: <b>{plan}</b>\n📋 Tasks: {tasks}\n📊 Aaj: {today} / {cap} forward hue\n🕐 Last forward: {last}\n\nAap kya karna chahenge?",
+        "limit_reached_notice": "⚠️ <b>Aaj Ki Limit Poori Ho Gayi</b>\n\nAapne aaj ke saare <b>{cap}</b> messages use kar liye.\n\n🕛 Raat 12 baje reset hogi\n💎 Zyada limit ke liye upgrade karein",
+        "destination_failed": "⚠️ <b>Forwarding Me Dikkat</b>\n\nTask: <b>{task}</b>\nYahan nahi bhej paye: <b>{dest}</b>\n\nWajah ye ho sakti hai:\n• Aapka account us channel se hata diya gaya\n• Channel delete ho gaya\n• Wahan post karne ki permission nahi hai\n\nSettings me theek karein, ya wo destination hata dein.",
         "config_no_tasks": "📋 <b>Abhi koi task nahi hai</b>\n\nAapne koi forwarding task nahi banaya, isliye dikhane ko kuch nahi hai.\n\nPehla task banane ke liye /tasks use karein.",
         "config_select_task": "🛠️ <b>Aapki Configuration</b>\n\nSettings dekhne ke liye task chunein:",
         "config_footer": "🦾 Saari settings badalne ke liye: /settings",
