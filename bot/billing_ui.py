@@ -125,7 +125,8 @@ def plans_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🥇 Gold", callback_data="plan:gold")],
         [InlineKeyboardButton(text="💎 Platinum", callback_data="plan:platinum")],
         [InlineKeyboardButton(text="🆓 Free", callback_data="plan:free")],
-        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
 
 
@@ -140,7 +141,10 @@ def cycles_keyboard(plan_name: str) -> InlineKeyboardMarkup:
             callback_data=f"cycle:{plan_name}:{cycle}",
         )])
     rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans")])
-    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    rows.append([
+        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -276,7 +280,8 @@ async def _prepay_guard(callback: CallbackQuery, db: Database, settings: Setting
             safe_t(language, "connect_required"),
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
         await callback.answer()
@@ -512,7 +517,8 @@ async def proof_submit(
     await message.answer(
         safe_t(language, "usdt_submitted" if method == "usdt" else "stars_submitted"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
         parse_mode="HTML",
     )
