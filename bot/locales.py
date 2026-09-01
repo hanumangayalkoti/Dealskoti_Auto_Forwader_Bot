@@ -46,7 +46,6 @@ ADMIN_COMMANDS = [
     ("/payouts", "💰 Review and pay referral commissions"),
     ("/grantdays", "🎁 Grant premium days to a user"),
     ("/userinfo", "👤 View a user's details"),
-    ("/listusers", "👥 List recently registered users"),
     ("/broadcast", "📣 Send a message to users"),
     ("/block", "⛔ Block a user from using the bot"),
     ("/unblock", "✅ Unblock a restricted user"),
