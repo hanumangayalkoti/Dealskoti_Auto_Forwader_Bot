@@ -512,6 +512,49 @@ class Database:
                     now, task_id,
                 )
 
+    async def increment_usage_bulk(self, user_id: int, task_id: int | None, count: int) -> None:
+        """Records `count` successful forwards in ONE round-trip.
+
+        The per-message version issued three statements for every destination —
+        with 50 targets that was 150 database round-trips for a single incoming
+        post, and it dominated the forwarding time.
+        """
+        if self.pool is None or count <= 0: return
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO usage_daily (user_id, usage_date, message_count)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, usage_date)
+                DO UPDATE SET message_count = usage_daily.message_count + $3
+            """, user_id, today, count)
+            await conn.execute(
+                "UPDATE users SET last_forward_at = $1 WHERE telegram_user_id = $2", now, user_id,
+            )
+            if task_id is not None:
+                await conn.execute(
+                    """UPDATE tasks SET forward_count = COALESCE(forward_count, 0) + $1,
+                              last_forward_at = $2
+                       WHERE id = $3""",
+                    count, now, task_id,
+                )
+
+    async def record_sent_messages(self, rows: list[tuple]) -> None:
+        """Batch insert for the edit-sync map — one round-trip for all copies
+        instead of one per destination."""
+        if self.pool is None or not rows: return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.executemany(
+                    """INSERT INTO sent_messages
+                       (task_id, user_id, source_chat_id, source_message_id, dest_chat_id, dest_message_id)
+                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                    rows,
+                )
+        except Exception as exc:
+            logger.warning("Could not batch-record sent messages: %s", exc)
+
     async def usage_stats(self, user_id: int) -> dict:
         """Everything the /stats screen needs, in one round-trip."""
         if self.pool is None:
