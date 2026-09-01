@@ -126,7 +126,10 @@ def _json_field(value, default):
 
 def _nav(back: str, task_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text="◀️ Back", callback_data=back)]]
-    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    rows.append([
+        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -378,7 +381,8 @@ async def settings_command(message: Message, db: Database) -> None:
             safe_t(language, "settings_no_tasks"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ New Task", callback_data="task:create")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
             parse_mode="HTML",
         )
@@ -398,7 +402,8 @@ async def settings_menu_cb(callback: CallbackQuery, db: Database) -> None:
             callback.message, safe_t(language, "settings_no_tasks"),
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ New Task", callback_data="task:create")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
         return await callback.answer()
@@ -1098,7 +1103,8 @@ async def settings_save_value(
             safe_t(language, "feature_locked", feature=spec.display, required_plan=required),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data=f"st:task:{task_id}"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
             parse_mode="HTML",
         )
