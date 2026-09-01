@@ -212,7 +212,8 @@ async def _require_connected(db: Database, user_id: int, language: str) -> str |
 def _connect_required_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
-        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
 
 
@@ -231,6 +232,31 @@ async def _safe_edit(message_obj, text: str, reply_markup=None) -> None:
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc):
             raise
+
+
+def _now_ist() -> str:
+    """Timestamp for admin notifications, always in IST so entries from
+    different sources line up."""
+    return datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+
+
+def _handle(user) -> str:
+    """@username when set, otherwise an explicit note — never a bare blank."""
+    if user is None:
+        return "—"
+    username = user["username"] if "username" in user.keys() else None
+    return f"@{safe_html(username)}" if username else "no username"
+
+
+def _chat_label(entity: dict) -> str:
+    """Name plus @username for admin notifications.
+
+    No t.me link: inside Telegram an @username is already tappable, and a
+    private chat has no public link to give anyway.
+    """
+    title = safe_html(entity.get("title") or entity.get("id") or "?")
+    username = entity.get("username")
+    return f"{title} (@{safe_html(username)})" if username else f"{title} (private)"
 
 
 def _format_name(user) -> str:
@@ -571,7 +597,12 @@ async def start(message: Message, command: CommandObject, db: Database, settings
 
     # Referral: /start ref_<id>
     payload = (command.args or "").strip()
-    if is_new and payload.startswith("ref_"):
+    # Not restricted to brand-new users. Someone who pressed /start once
+    # during a deploy (and so was created without their referral payload being
+    # seen) could never be credited. Anyone who has never PAID and has no
+    # referrer yet can still be attached — a paying customer cannot, which is
+    # what stops abuse.
+    if payload.startswith("ref_"):
         raw = payload[4:].strip()
         referrer_id: int | None = None
         if raw.isdigit():
@@ -581,19 +612,21 @@ async def start(message: Message, command: CommandObject, db: Database, settings
         elif raw:
             with suppress(Exception):
                 referrer_id = await db.user_by_referral_code(raw)
-        if referrer_id:
+        if referrer_id and referrer_id != message.from_user.id:
             with suppress(Exception):
-                await db.create_referral(referrer_id, message.from_user.id)
+                if is_new or not await db.has_paid_order(message.from_user.id):
+                    await db.create_referral(referrer_id, message.from_user.id)
 
     if is_new:
         with suppress(Exception):
             if await db.mark_new_user_notified(message.from_user.id):
                 await _notify_admins(
                     message.bot, settings,
-                    f"🆕 <b>New user</b>\n"
-                    f"Name: {_format_name(user)}\n"
-                    f"Username: @{safe_html(message.from_user.username or '—')}\n"
-                    f"ID: <code>{message.from_user.id}</code>",
+                    f"🆕 <b>New User Joined</b>\n\n"
+                    f"👤 Name: {_format_name(user)}\n"
+                    f"🔗 Username: {_handle(user)}\n"
+                    f"🆔 User ID: <code>{message.from_user.id}</code>\n"
+                    f"🕐 Joined: {_now_ist()}",
                 )
 
     if not user["language_selected"]:
@@ -679,7 +712,8 @@ async def updates_command(message: Message, db: Database, settings: Settings) ->
         safe_t(language, "updates_intro"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📢 Open Channel", url=channel_url)],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
     )
 
@@ -738,7 +772,10 @@ def _faq_keyboard(language: str, page: int, selected: int | None = None) -> Inli
         nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"faq:page:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    rows.append([
+        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -853,7 +890,8 @@ def _account_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
         [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect")],
-        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
 
 
@@ -916,7 +954,8 @@ async def _refer_screen(bot: Bot, db: Database, user_id: int, language: str):
         [InlineKeyboardButton(text="💸 Withdraw", callback_data="wd:menu"),
          InlineKeyboardButton(text="🏦 Payment Method", callback_data="pm:menu")],
         [InlineKeyboardButton(text="📤 Share Link", url=share)],
-        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ]
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -977,16 +1016,23 @@ async def _finish_login_success(
     await state.clear()
     with suppress(Exception):
         await forwarding.refresh_user(message.from_user.id)
+    user = await db.get_user(message.from_user.id)
+    tg_username_raw = account_info.get("username")
     await _notify_admins(
         message.bot, settings,
-        f"🔌 <b>Account connected</b>\nID: <code>{message.from_user.id}</code>",
+        f"🔌 <b>Account Connected</b>\n\n"
+        f"👤 Name: {_format_name(user)}\n"
+        f"🔗 Bot Username: {_handle(user)}\n"
+        f"🆔 User ID: <code>{message.from_user.id}</code>\n"
+        f"📱 Connected as: "
+        f"{'@' + safe_html(tg_username_raw) if tg_username_raw else 'no username'}\n"
+        f"💎 Plan: {safe_html(str(user['plan']).title() if user else 'Free')}\n"
+        f"🕐 Connected: {_now_ist()}",
     )
-
-    user = await db.get_user(message.from_user.id)
     phone = str(account_info.get("phone") or "").strip()
     if phone and not phone.startswith("+"):
         phone = f"+{phone}"
-    tg_username = account_info.get("username")
+    tg_username = tg_username_raw
 
     await message.answer(
         safe_t(
@@ -998,7 +1044,8 @@ async def _finish_login_success(
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
             [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="👤 My Account", callback_data="menu:account"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
     )
 
@@ -1015,7 +1062,8 @@ async def connect_command(
             safe_t(language, "already_connected"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=safe_t(language, "reconnect_anyway"), callback_data="connect:force")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
         return
@@ -1044,7 +1092,8 @@ async def menu_connect(
             safe_t(language, "already_connected"),
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=safe_t(language, "reconnect_anyway"), callback_data="connect:force")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
         return await callback.answer()
@@ -1187,7 +1236,8 @@ async def disconnect_command(
         safe_t(language, "disconnect_confirm"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Yes, Disconnect", callback_data="auth:disconnect")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:account"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
     )
 
@@ -1222,7 +1272,8 @@ async def _start_upload(message_obj, db: Database, settings: Settings, user_id: 
         text = safe_t(language, "upload_not_platinum")
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
     elif not settings.file_storage_channel_id:
         text = safe_t(language, "upload_no_channel")
@@ -1462,7 +1513,8 @@ async def _render_tasks(message_obj, db: Database, user_id: int) -> None:
     if not tasks:
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
         text = safe_t(language, "no_tasks_short")
     else:
@@ -1538,7 +1590,8 @@ async def new_task_cmd(
     if not allowed:
         return await message.answer(warning, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Upgrade", callback_data="menu:plans")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:tasks"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]), parse_mode="HTML")
     await state.set_state(TaskStates.waiting_name)
     await message.answer(safe_t(language, "task_name"), reply_markup=_nav_keyboard(include_cancel=True))
@@ -1561,7 +1614,8 @@ async def task_create_cb(
     if not allowed:
         await _safe_edit(callback.message, warning, InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Upgrade", callback_data="menu:plans")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:tasks"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]))
         return await callback.answer()
     await state.set_state(TaskStates.waiting_name)
@@ -1835,26 +1889,23 @@ async def _finish_destinations(
     await forwarding.refresh_task(task_id)
 
     user = await db.get_user(user_id)
-    source_text = ", ".join(
-        safe_html(str(item.get("title") or item.get("username") or item.get("id")))
-        for item in data.get("sources", []) if isinstance(item, dict)
-    ) or "—"
-    destination_text = ", ".join(
-        safe_html(str(item.get("title") or item.get("username") or item.get("id")))
-        for item in destinations if isinstance(item, dict)
-    ) or "—"
+    source_list = [item for item in data.get("sources", []) if isinstance(item, dict)]
+    source_text = "\n".join(f"   • {_chat_label(i)}" for i in source_list) or "   • —"
+    destination_text = "\n".join(f"   • {_chat_label(i)}" for i in destinations
+                                 if isinstance(i, dict)) or "   • —"
     await _notify_admins(
         message_obj.bot, settings,
-        f"➕ <b>New forwarding task created</b>\n"
-        f"Task ID: <code>{task_id}</code>\n"
-        f"Task name: {safe_html(task_name_value)}\n"
-        f"User: {_format_name(user)}\n"
-        f"Username: @{safe_html((user['username'] if user else None) or '—')}\n"
-        f"User ID: <code>{user_id}</code>\n"
-        f"Plan: {safe_html(str(user['plan']).title() if user else 'Free')}\n"
-        f"Sources ({len(data.get('sources', []))}): {source_text}\n"
-        f"Destinations ({len(destinations)}): {destination_text}\n"
-        f"Status: ▶️ Active",
+        f"➕ <b>New Task Created</b>\n\n"
+        f"📝 Task: {safe_html(task_name_value)}\n"
+        f"🆔 Task ID: <code>{task_id}</code>\n\n"
+        f"👤 User: {_format_name(user)}\n"
+        f"🔗 Username: {_handle(user)}\n"
+        f"🆔 User ID: <code>{user_id}</code>\n"
+        f"💎 Plan: {safe_html(str(user['plan']).title() if user else 'Free')}\n\n"
+        f"📥 <b>Sources ({len(source_list)}):</b>\n{source_text}\n\n"
+        f"📤 <b>Destinations ({len(destinations)}):</b>\n{destination_text}\n\n"
+        f"▶️ Status: Active\n"
+        f"🕐 Created: {_now_ist()}",
     )
 
     # The user never sees the raw internal task id — just their own task name.
@@ -1863,8 +1914,8 @@ async def _finish_destinations(
         safe_t(language, "task_created", task_name=safe_html(task_name_value)),
         InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚙️ Configure Settings", callback_data=f"st:task:{task_id}")],
-            [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
         edit,
     )
@@ -2340,7 +2391,8 @@ async def config_command(message: Message, db: Database) -> None:
             safe_t(language, "config_no_tasks"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
     await message.answer(safe_t(language, "config_select_task"), reply_markup=markup)
@@ -2509,7 +2561,8 @@ async def withdraw_request_cb(
         f"Method: {PAYOUT_METHODS.get(method, method)}\n\n"
         "You'll be notified once it is processed.",
         InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:refer"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
     )
     await callback.answer("Requested")
@@ -2581,7 +2634,8 @@ async def payout_method_save(message: Message, state: FSMContext, db: Database) 
         f"Address: <code>{safe_html(raw)}</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💸 Withdraw", callback_data="wd:menu")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:refer"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
     )
 
@@ -2677,7 +2731,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats"),
          InlineKeyboardButton(text="📣 Broadcast", callback_data="admin:broadcast:start")],
         [InlineKeyboardButton(text="📅 Weekly Report", callback_data="admin:weekly"),
-         InlineKeyboardButton(text="👥 Recent Users", callback_data="admin:users")],
+         InlineKeyboardButton(text="💸 Payouts", callback_data="admin:payoutlist")],
         [InlineKeyboardButton(text="👤 User Info", callback_data="admin:userinfo:start"),
          InlineKeyboardButton(text="🎁 Grant Days", callback_data="admin:grantpicker")],
         [InlineKeyboardButton(text="🏠 User Menu", callback_data="menu:home")],
@@ -2756,6 +2810,31 @@ async def weekly_report_cb(callback: CallbackQuery, db: Database, settings: Sett
     if callback.message is None:
         return
     await _safe_edit(callback.message, await _weekly_report(db), admin_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:payoutlist")
+async def admin_payout_list_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    rows = await db.list_pending_payouts()
+    if not rows:
+        await _safe_edit(callback.message, "✅ No pending referral payouts.", admin_keyboard())
+        return await callback.answer()
+    lines = ["💰 <b>Pending Referral Payouts</b>\n"]
+    buttons = []
+    for r in rows:
+        label = safe_html(r["first_name"] or r["username"] or r["referrer_id"])
+        owed = format_paise(int(r["owed"]))
+        lines.append(f"{label} — {owed} from {r['refs']} refs")
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Pay {label} — {owed}", callback_data=f"admin:payout:{r['referrer_id']}",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin:home")])
+    await _safe_edit(callback.message, "\n".join(lines),
+                     InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
 
@@ -2888,18 +2967,6 @@ async def user_info_command(message: Message, db: Database, settings: Settings) 
         return await message.answer("⚠️ Not found.")
     text, keyboard = await _full_user_info_card(db, user)
     await message.answer(text, reply_markup=keyboard)
-
-
-@router.message(Command("listusers"))
-async def list_users_command(message: Message, db: Database, settings: Settings) -> None:
-    if not _is_admin(settings, message.from_user.id):
-        return
-    users = await db.list_recent_active_users(6)
-    if not users:
-        return await message.answer("No users found.")
-    for u in users:
-        text, keyboard = await _full_user_info_card(db, u)
-        await message.answer(text, reply_markup=keyboard)
 
 
 @router.message(Command("block", "unblock"))
@@ -3773,6 +3840,13 @@ async def _run(settings: Settings) -> None:
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Telethon logs a line every time it fetches an update difference — for an
+    # account in many channels that is thousands of lines an hour, and it
+    # buries the warnings that actually matter. Only its warnings are kept.
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+    logging.getLogger("telethon.network").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
     db = Database(settings.database_url)
     await db.connect()
 
@@ -3798,8 +3872,12 @@ async def _run(settings: Settings) -> None:
     dispatcher.include_router(router)
 
     # SAFETY: clear any stale webhook so polling cannot conflict after a restart.
+    # drop_pending_updates is deliberately FALSE: every deploy restarts the bot,
+    # and dropping the queue silently threw away whatever users sent during
+    # that window — including referral /start payloads, which only ever arrive
+    # once.
     with suppress(Exception):
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
 
     await bot.set_my_commands(_bot_commands())
     for admin_id in settings.admin_telegram_ids:
