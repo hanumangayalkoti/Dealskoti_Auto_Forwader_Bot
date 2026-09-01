@@ -320,6 +320,10 @@ class TelethonService:
                 # True when the chat is a forum (has Topics). Lets the UI offer
                 # topic selection only where it actually applies.
                 "is_forum": bool(getattr(entity, "forum", False)),
+                # True when the owner enabled "Restrict saving content".
+                # Copying from such a chat puts the USER's own account at risk,
+                # so sources with this flag are refused at task-creation time.
+                "protected": bool(getattr(entity, "noforwards", False)),
             }
 
         except (SessionExpired, ValueError):
@@ -362,6 +366,7 @@ class TelethonService:
                     "username": getattr(entity, "username", None),
                     "type": type(entity).__name__,
                     "is_forum": bool(getattr(entity, "forum", False)),
+                    "protected": bool(getattr(entity, "noforwards", False)),
                 })
         except Exception as e:
             # Full traceback so an unexpectedly empty picker is diagnosable
