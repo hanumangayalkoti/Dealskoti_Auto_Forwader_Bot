@@ -2256,7 +2256,7 @@ def _config_text(task, plan_name: str, language: str) -> str:
     out.append(f"  ├─ {line('Code Filter', code_mode != CODE_FILTER_OFF, F_MONO_TEXT, code_label)}")
     out.append(f"  ├─ {line('Topics Forwarding', topic_count > 0, F_TOPICS, f' [{topic_count} topics]' if topic_count else ' [All topics]')}")
     out.append(f"  ├─ {line('Image Watermark', bool(settings.get('watermark')), F_WATERMARK_IMAGE)}")
-    out.append(f"  ├─ {line('Attach Custom File', bool(settings.get('attach_stored_file', True)), F_ATTACH_FILE)}")
+    out.append(f"  ├─ {line('Attach Custom File', bool(settings.get('attach_stored_file', False)), F_ATTACH_FILE)}")
     out.append(f"  └─ {line('Auto Reaction', bool(reaction.get('enabled')), F_AUTO_REACTION, f" [{reaction.get('emoji')}]" if reaction.get('enabled') else '')}")
     out.append("")
 
