@@ -1601,6 +1601,22 @@ def _text_or_forwarded_chat_id(message: Message) -> str | None:
 # CHAT PICKER
 # ==========================================
 
+def _protected_block_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:tasks")],
+        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+
+
+def _is_protected(entity: dict) -> bool:
+    """True when the chat has "Restrict saving content" enabled.
+
+    Only SOURCES are refused. A protected destination is harmless — the
+    restriction is about copying content OUT of a chat, not into one.
+    """
+    return bool(entity.get("protected"))
+
+
 CHANNEL_INPUT_RE = re.compile(
     r"^(?:@[\w]{2,64}|https?://t\.me/\S+|t\.me/\S+|-?\d{5,})$", re.IGNORECASE,
 )
@@ -1708,6 +1724,16 @@ async def _picker_toggle_number(
 
     entity = dialogs[idx]
     eid = int(entity.get("id", 0))
+
+    # Refuse protected chats as SOURCES, before they can be selected.
+    if field == "src" and _is_protected(entity):
+        await message_obj.answer(
+            safe_t(language, "protected_source_blocked",
+                   name=safe_html(entity.get("title") or eid)),
+            parse_mode="HTML",
+        )
+        return True
+
     sel_ids = {int(e.get("id", 0)) for e in selected}
     if eid in sel_ids:
         selected = [e for e in selected if int(e.get("id", 0)) != eid]
@@ -1941,6 +1967,12 @@ async def task_source(
             entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         return await message.answer(f"⚠️ {safe_html(exc)}")
+    if _is_protected(entity):
+        return await message.answer(
+            safe_t(language, "protected_source_blocked",
+                   name=safe_html(entity.get("title") or text)),
+            reply_markup=_protected_block_markup(),
+        )
     if any(int(e.get("id", 0)) == int(entity.get("id", 0)) for e in sources):
         return await message.answer(safe_t(language, "picker_already_added"), parse_mode="HTML")
 
