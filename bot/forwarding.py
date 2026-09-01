@@ -26,7 +26,7 @@ import os
 import re
 from contextlib import suppress
 
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, errors, events, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     InputPeerChannel,
@@ -107,7 +107,8 @@ DEFAULT_REACTION_EMOJI = "👍"
 # How many destinations to send to at once when no Delay Timer is set.
 # Kept deliberately low: Telegram rate-limits per account, and a large burst
 # earns a FloodWait that is far slower than sending in small batches.
-PARALLEL_SENDS = 4
+# Lowered from 4 after FloodWait was suspected of causing invisible stalls.
+PARALLEL_SENDS = 2
 
 
 def _preset_seconds(table: dict[str, float], value, default: str = "off") -> float:
@@ -283,6 +284,14 @@ class ForwardingEngine:
         self._dest_failures: dict[tuple[int, int], int] = {}
         # destinations already reported, so we warn once and not every message
         self._dest_reported: set[tuple[int, int]] = set()
+        # (task_id, source_raw) -> already told the user this source is protected
+        self._protected_reported: dict[tuple[int, int], bool] = {}
+        # Counter surfaced in the logs so rate limiting is measurable, not guessed
+        self._floodwaits = 0
+        # user_id -> monotonic time before which this account should not send
+        # again. Enforced BEFORE taking a lane slot, so a user's own anti-ban
+        # delay never consumes shared capacity.
+        self._cooldowns: dict[int, float] = {}
 
     def _remember_send(self, chat_id: int, message_id: int) -> None:
         raw = raw_peer_id(chat_id)
@@ -368,6 +377,12 @@ class ForwardingEngine:
                 if client.is_connected():
                     await client.disconnect()
                 return
+
+            # By default Telethon SILENTLY sleeps through any FloodWait under
+            # 60 seconds and logs nothing at all — the bot simply appears to
+            # stall with no trace anywhere. Lower the threshold so we handle
+            # (and log) it ourselves instead of guessing.
+            client.flood_sleep_threshold = 0
 
             client.add_event_handler(
                 lambda event: self._on_new_message(event, user_id),
@@ -805,20 +820,34 @@ class ForwardingEngine:
         # Read the plan BEFORE queueing so a paying user never waits in the
         # free lane just to find out which lane they belong in.
         plan_name = "free"
+        user = None
         with suppress(Exception):
             user = await self.db.get_user(user_id)
             if user is not None:
                 plan_name = str(user["plan"] or "free")
 
+        # Honour any pending anti-ban cooldown for this account before queueing.
+        cooldown = self._cooldowns.get(user_id)
+        if cooldown:
+            wait = cooldown - asyncio.get_running_loop().time()
+            if wait > 0:
+                await asyncio.sleep(min(wait, 60))
+            self._cooldowns.pop(user_id, None)
+
         async with self._lane_for(plan_name):
             try:
-                await self._process_new_message(event, user_id)
+                # The user row is passed straight through: reading it again
+                # inside meant two identical database round-trips for every
+                # single incoming message.
+                await self._process_new_message(event, user_id, user)
             except Exception:
                 # A crash here would be swallowed by Telethon with a stack trace
                 # nobody reads. Log it loudly with context instead.
                 logger.exception("Unhandled error while forwarding for user %s", user_id)
 
-    async def _process_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
+    async def _process_new_message(
+        self, event: events.NewMessage.Event, user_id: int, user=None,
+    ) -> None:
         """Triggered when the user's account receives a new message in any chat."""
         message: Message = event.message
         source_raw = raw_peer_id(event.chat_id)
@@ -840,7 +869,8 @@ class ForwardingEngine:
         if not client:
             return
 
-        user = await self.db.get_user(user_id)
+        if user is None:
+            user = await self.db.get_user(user_id)
         if not user or user["is_blocked"]:
             return
 
@@ -977,7 +1007,56 @@ class ForwardingEngine:
                             link_preview=link_preview,
                             parse_mode=parse_mode,
                         )
+                except errors.FloodWaitError as fw:
+                    # Temporary rate limit, NOT a broken destination. Wait it
+                    # out once and retry; only give up if it happens again.
+                    wait = int(getattr(fw, "seconds", 0) or 0)
+                    logger.warning(
+                        "FLOODWAIT %ss for user %s task %s dest %s — Telegram is rate limiting",
+                        wait, user_id, task["id"], dest_raw,
+                    )
+                    self._floodwaits += 1
+                    if wait > 300:
+                        return None  # too long to hold a slot for
+                    await asyncio.sleep(wait + 1)
+                    try:
+                        sent_msg = await client.send_message(
+                            dest_peer,
+                            message=self.build_text(
+                                message, message.message or "", settings, plan_name, dest_raw
+                            )[0],
+                            link_preview=link_preview,
+                        )
+                    except Exception as e2:
+                        logger.warning(
+                            f"Task {task['id']} retry after FloodWait failed for {dest_raw}: {e2}"
+                        )
+                        return None
                 except Exception as e:
+                    text = str(e)
+                    # A protected source is a permanent, explainable condition —
+                    # not the "channel deleted / you were removed" story the
+                    # generic warning tells. Report it accurately instead.
+                    if "protected chat" in text.lower():
+                        logger.warning(
+                            "PROTECTED SOURCE: task %s user %s cannot copy from source %s",
+                            task["id"], user_id, source_raw,
+                        )
+                        if not self._protected_reported.get((int(task["id"]), source_raw)):
+                            self._protected_reported[(int(task["id"]), source_raw)] = True
+                            await self._warn_user(
+                                user_id, "protected_source_blocked",
+                                task=str(task["task_name"]),
+                            )
+                        return None
+                    # Service messages and deleted posts cannot be forwarded.
+                    # These are normal events, not failures — never warn.
+                    if "message ID is invalid" in text or "MESSAGE_ID_INVALID" in text:
+                        logger.info(
+                            "Skipping unforwardable message %s for task %s",
+                            message.id, task["id"],
+                        )
+                        return None
                     logger.warning(
                         f"Task {task['id']} failed to send to {dest_raw} for user {user_id}: {e}"
                     )
@@ -1079,7 +1158,12 @@ class ForwardingEngine:
 
             if sent_any and antiban_delay:
                 # Anti-Ban Speed: pause before this account sends anything again.
-                await asyncio.sleep(antiban_delay)
+                # The wait is scheduled OUTSIDE the lane. Sleeping while holding
+                # a lane slot meant one user's 8-second anti-ban setting also
+                # stalled every other user on the same plan.
+                self._cooldowns[user_id] = (
+                    asyncio.get_running_loop().time() + antiban_delay
+                )
 
     async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
         """Best-effort user warning. Never raises — a blocked user or a network
