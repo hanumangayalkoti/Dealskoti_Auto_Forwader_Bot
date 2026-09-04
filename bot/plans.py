@@ -61,7 +61,7 @@ PLANS: dict[str, Plan] = {
         sources_per_task=15,
         destinations_per_task=15,
         daily_messages=2000,
-        monthly_rupees=400,
+        monthly_rupees=500,
         usdt_monthly_usd=5.0,
         tg_stars=340,
     ),
