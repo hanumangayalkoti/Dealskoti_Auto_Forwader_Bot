@@ -39,6 +39,7 @@ from .gate import enforce_gate
 from .locales import language_for, t
 from .plans import (
     PLANS,
+    cycles_for,
     duration_days,
     format_paise,
     payable_amount_paise as _payable,
@@ -119,21 +120,37 @@ def _display_name(record) -> str:
 # PLAN SCREENS
 # ==========================================
 
+# Two per row: full-width buttons wasted vertical space and pushed the
+# navigation off the first screen on a phone.
+PLAN_BUTTONS = [
+    ("🥉 Basic", "plan:basic"),
+    ("🥈 Silver", "plan:silver"),
+    ("🥇 Gold", "plan:gold"),
+    ("💎 Platinum", "plan:platinum"),
+    ("🆓 Free", "plan:free"),
+]
+
+
 def plans_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🥈 Silver", callback_data="plan:silver")],
-        [InlineKeyboardButton(text="🥇 Gold", callback_data="plan:gold")],
-        [InlineKeyboardButton(text="💎 Platinum", callback_data="plan:platinum")],
-        [InlineKeyboardButton(text="🆓 Free", callback_data="plan:free")],
-        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
-         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    rows = []
+    row = []
+    for label, data in PLAN_BUTTONS:
+        row.append(InlineKeyboardButton(text=label, callback_data=data))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cycles_keyboard(plan_name: str) -> InlineKeyboardMarkup:
-    plan = PLANS[plan_name]
     rows = []
-    for cycle in CYCLES:
+    for cycle in cycles_for(plan_name):
         _o, _d, payable = payable_amount_paise(plan_name, cycle)
         label = {"weekly": "🗓️ Weekly", "monthly": "📅 Monthly", "yearly": "⭐ Yearly (20% OFF)"}[cycle]
         rows.append([InlineKeyboardButton(
@@ -227,7 +244,7 @@ async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) ->
     if len(parts) != 3:
         return await callback.answer("Invalid option", show_alert=True)
     plan_name, cycle = parts[1], parts[2]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in CYCLES:
+    if plan_name not in PLANS or plan_name == "free" or cycle not in cycles_for(plan_name):
         return await callback.answer("Invalid option", show_alert=True)
 
     language = await _lang(db, callback.from_user.id)
@@ -303,7 +320,7 @@ async def pay_inr_cb(
     if len(parts) != 4:
         return await callback.answer("Invalid option", show_alert=True)
     plan_name, cycle = parts[2], parts[3]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in CYCLES:
+    if plan_name not in PLANS or plan_name == "free" or cycle not in cycles_for(plan_name):
         return await callback.answer("Invalid option", show_alert=True)
 
     language = await _lang(db, callback.from_user.id)
