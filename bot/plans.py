@@ -40,8 +40,19 @@ PLANS: dict[str, Plan] = {
         tasks=1,
         sources_per_task=1,
         destinations_per_task=1,
-        daily_messages=100,
+        daily_messages=50,
         monthly_rupees=0,
+        usdt_monthly_usd=0.0,
+        tg_stars=0,
+    ),
+    "basic": Plan(
+        name="Basic",
+        tasks=1,
+        sources_per_task=1,
+        destinations_per_task=1,
+        daily_messages=100,
+        monthly_rupees=30,
+        # INR only: at this price the USDT/Stars fees cost more than the plan.
         usdt_monthly_usd=0.0,
         tg_stars=0,
     ),
@@ -51,7 +62,7 @@ PLANS: dict[str, Plan] = {
         sources_per_task=5,
         destinations_per_task=5,
         daily_messages=500,
-        monthly_rupees=100,
+        monthly_rupees=150,
         usdt_monthly_usd=2.0,
         tg_stars=130,
     ),
@@ -61,7 +72,7 @@ PLANS: dict[str, Plan] = {
         sources_per_task=15,
         destinations_per_task=15,
         daily_messages=2000,
-        monthly_rupees=500,
+        monthly_rupees=400,
         usdt_monthly_usd=5.0,
         tg_stars=340,
     ),
@@ -78,7 +89,7 @@ PLANS: dict[str, Plan] = {
 }
 
 # Rank order used for upgrade/downgrade maths. Higher = better plan.
-PLAN_ORDER: list[str] = ["free", "silver", "gold", "platinum"]
+PLAN_ORDER: list[str] = ["free", "basic", "silver", "gold", "platinum"]
 
 
 # ==========================================
@@ -132,6 +143,11 @@ _FREE_FEATURES: set[str] = {
     F_MEDIA,
 }
 
+# Basic buys exactly one thing over Free: no "Forwarded from" tag.
+_BASIC_ADDS: set[str] = {
+    F_NO_WATERMARK,
+}
+
 _SILVER_ADDS: set[str] = {
     F_HEADER,
     F_FOOTER,
@@ -144,7 +160,6 @@ _SILVER_ADDS: set[str] = {
     F_WHITELIST,
     F_REPLACE_USERNAMES,
     F_REPLACE_WORDS,
-    F_NO_WATERMARK,
     F_ANTIBAN,
     F_FAST_DELIVERY,
 }
@@ -172,9 +187,10 @@ _PLATINUM_ADDS: set[str] = {
 
 FEATURE_MATRIX: dict[str, set[str]] = {
     "free": set(_FREE_FEATURES),
-    "silver": _FREE_FEATURES | _SILVER_ADDS,
-    "gold": _FREE_FEATURES | _SILVER_ADDS | _GOLD_ADDS,
-    "platinum": _FREE_FEATURES | _SILVER_ADDS | _GOLD_ADDS | _PLATINUM_ADDS,
+    "basic": _FREE_FEATURES | _BASIC_ADDS,
+    "silver": _FREE_FEATURES | _BASIC_ADDS | _SILVER_ADDS,
+    "gold": _FREE_FEATURES | _BASIC_ADDS | _SILVER_ADDS | _GOLD_ADDS,
+    "platinum": _FREE_FEATURES | _BASIC_ADDS | _SILVER_ADDS | _GOLD_ADDS | _PLATINUM_ADDS,
 }
 
 
@@ -207,7 +223,16 @@ def min_plan_for(feature: str) -> str:
 # "{limits}" and "{daily}" are filled in from PLANS at render time.
 
 PLAN_FEATURE_TREE: dict[str, list[str]] = {
+    "basic": [
+        "{tasks}",
+        "{limits}",
+        "Auto Forwarding",
+        "Media Forwarding",
+        "No BOT Watermark",
+        "{daily}",
+    ],
     "silver": [
+        "{tasks}",
         "{limits}",
         "Auto Forwarding",
         "Header Control",
@@ -229,6 +254,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Super Fast Message Delivery",
     ],
     "gold": [
+        "{tasks}",
         "{limits}",
         "Auto Forwarding",
         "Header & Footer Control",
@@ -255,6 +281,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Super Fast Message Delivery",
     ],
     "platinum": [
+        "{tasks}",
         "{limits}",
         "Auto Forwarding",
         "Header & Footer Control",
@@ -297,11 +324,22 @@ def daily_label(plan_name: str) -> str:
     return f"{plan.daily_messages} Messages/Day"
 
 
+def tasks_label(plan_name: str) -> str:
+    """How many separate forwarding tasks the plan allows. This was missing
+    from the feature list entirely, so nobody could see it before buying."""
+    plan = PLANS.get(plan_name)
+    if plan is None:
+        return "—"
+    return f"{plan.tasks} Task" + ("s" if plan.tasks != 1 else "")
+
+
 def limits_label(plan_name: str) -> str:
     plan = PLANS.get(plan_name)
     if plan is None:
         return "—"
-    return f"{plan.sources_per_task} Sources + {plan.destinations_per_task} Targets"
+    src = f"{plan.sources_per_task} Source" + ("s" if plan.sources_per_task != 1 else "")
+    dst = f"{plan.destinations_per_task} Target" + ("s" if plan.destinations_per_task != 1 else "")
+    return f"{src} + {dst} per Task"
 
 
 def plan_feature_tree(plan_name: str) -> str:
@@ -311,7 +349,11 @@ def plan_feature_tree(plan_name: str) -> str:
     if not items:
         return ""
     rendered = [
-        item.format(limits=limits_label(plan_name), daily=daily_label(plan_name))
+        item.format(
+            limits=limits_label(plan_name),
+            daily=daily_label(plan_name),
+            tasks=tasks_label(plan_name),
+        )
         for item in items
     ]
     lines = [f"┌─{rendered[0]}"]
@@ -364,6 +406,18 @@ def plan_details_text(plan_name: str) -> str:
 # ==========================================
 # BILLING HELPERS
 # ==========================================
+
+# Cycles offered per plan. Basic skips weekly: at ₹7.50 the payment fee would
+# be a large share of the payment itself.
+PLAN_CYCLES: dict[str, tuple[str, ...]] = {
+    "basic": ("monthly", "yearly"),
+}
+DEFAULT_CYCLES: tuple[str, ...] = ("weekly", "monthly", "yearly")
+
+
+def cycles_for(plan_name: str) -> tuple[str, ...]:
+    return PLAN_CYCLES.get((plan_name or "").lower(), DEFAULT_CYCLES)
+
 
 def duration_days(cycle: str) -> int:
     """Number of days a billing cycle grants."""
