@@ -220,6 +220,37 @@ def extract_mono_spans(text: str, entities) -> list[str]:
     return extract_code_spans(text, entities, CODE_FILTER_MONO)
 
 
+def _shift_entities(entities, shift: int):
+    """Returns a copy of the message entities moved along by `shift` units.
+
+    Entities carry bold/italic/links AND custom (animated) emoji. Sending a
+    clean copy without them silently stripped all of that — paid users were
+    getting worse fidelity than free users, whose native forward keeps
+    everything.
+
+    Copies are made so the original message object is never mutated: the same
+    message is rendered once per destination.
+    """
+    if not entities:
+        return None
+    import copy as _copy
+
+    out = []
+    for ent in entities:
+        # A web-page preview entity is not sendable and Telegram rejects it.
+        if type(ent).__name__ == "MessageEntityUnknown":
+            continue
+        clone = _copy.copy(ent)
+        try:
+            clone.offset = int(ent.offset) + shift
+        except (TypeError, ValueError):
+            continue
+        if clone.offset < 0:
+            continue
+        out.append(clone)
+    return out or None
+
+
 def _as_list(value) -> list:
     """Settings written by older versions may be a bare string or None."""
     if value is None:
@@ -266,6 +297,7 @@ class ForwardingEngine:
             "platinum": asyncio.Semaphore(base),
             "gold": asyncio.Semaphore(max(2, base // 2)),
             "silver": asyncio.Semaphore(max(2, base // 4)),
+            "basic": asyncio.Semaphore(max(2, base // 6)),
             "free": asyncio.Semaphore(max(1, base // 8)),
         }
         self._message_semaphore = self._lanes["free"]  # kept for compatibility
@@ -678,6 +710,14 @@ class ForwardingEngine:
         mode = self.code_filter_for(settings, plan_name)
         mono = mode != CODE_FILTER_OFF
 
+        # Entities (bold, italic, links and CUSTOM/animated emoji) live
+        # separately from the text, keyed by character offsets. They can only
+        # be reused when the body is untouched — any replacement or removal
+        # shifts every offset after it and would smear the formatting onto the
+        # wrong words. A header only shifts everything by a fixed amount, which
+        # IS computable, so that case is still preserved.
+        self._last_entity_shift = None
+
         if mono:
             text = self.code_body(message, mode)
             if not text:
@@ -688,7 +728,9 @@ class ForwardingEngine:
                 entities = getattr(message, "entities", None) if message is not None else None
                 text = self._reveal_hidden_links(text, entities)
 
+        body_untouched = not mono
         if text:
+            before = text
             text = self._apply_replacements(text, settings, plan_name)
             if not mono:
                 # Trim and the blanket Remove Links / Remove Usernames toggles are
@@ -698,6 +740,8 @@ class ForwardingEngine:
                 # for and the message would vanish with no error anywhere.
                 text = self._apply_trim(text, settings, plan_name)
                 text = self._apply_removals(text, settings, plan_name)
+            if text != before:
+                body_untouched = False
 
         if mono and not text.strip():
             # Extracted code was blank/whitespace only.
@@ -725,6 +769,13 @@ class ForwardingEngine:
             parts.append(text)
         if footer:
             parts.append(footer)
+
+        if body_untouched and text.strip():
+            # Header is prepended with a blank line between, so every original
+            # offset moves by exactly that many UTF-16 units.
+            prefix = f"{header}\n\n" if header else ""
+            self._last_entity_shift = len(prefix.encode("utf-16-le")) // 2
+
         return "\n\n".join(parts), None
 
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
@@ -994,6 +1045,14 @@ class ForwardingEngine:
                         )
                         if not new_text and media_file is None:
                             return None  # nothing to send (e.g. service message)
+                        # Carry the source formatting through when it is safe.
+                        entities = None
+                        shift = getattr(self, "_last_entity_shift", None)
+                        if shift is not None:
+                            entities = _shift_entities(
+                                getattr(message, "entities", None), shift,
+                            )
+
                         payload = media_file
                         if isinstance(payload, io.BytesIO):
                             # A BytesIO can only be read once, so each parallel
@@ -1006,6 +1065,7 @@ class ForwardingEngine:
                             file=payload,
                             link_preview=link_preview,
                             parse_mode=parse_mode,
+                            formatting_entities=entities,
                         )
                 except errors.FloodWaitError as fw:
                     # Temporary rate limit, NOT a broken destination. Wait it
