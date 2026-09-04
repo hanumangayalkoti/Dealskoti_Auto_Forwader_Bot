@@ -29,7 +29,8 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -322,6 +323,7 @@ FLOW_LABELS: dict[str, str] = {
     "AdminStates:waiting_grant_days": "Grant Days",
     "AdminGrantStates:waiting_custom_days": "Grant Days",
     "PayoutStates:waiting_address": "Payment Method",
+    "RestoreStates:waiting_confirm": "Database Restore",
     "AdminBroadcastStates:waiting_message": "Broadcast",
 }
 
@@ -2723,6 +2725,218 @@ async def withdrawal_review_cb(
 
 
 # ==========================================
+# BACKUP / RESTORE
+# ==========================================
+
+class RestoreStates(StatesGroup):
+    waiting_confirm = State()
+
+
+def _json_default(value):
+    """asyncpg returns datetimes, dates and Decimals — none are JSON types."""
+    if isinstance(value, (datetime, date)):
+        return {"__dt__": value.isoformat()}
+    if isinstance(value, Decimal):
+        return {"__dec__": str(value)}
+    return str(value)
+
+
+def _json_revive(obj):
+    if "__dt__" in obj:
+        raw = obj["__dt__"]
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return date.fromisoformat(raw)
+    if "__dec__" in obj:
+        return Decimal(obj["__dec__"])
+    return obj
+
+
+async def _make_backup(bot: Bot, db: Database, settings: Settings, reason: str = "nightly") -> str | None:
+    """Writes a full database backup to the private backup channel.
+
+    Returns the filename on success. Never raises — a failed backup must not
+    take the bot down with it, but it IS reported to admins, because a backup
+    that silently stopped running is worse than none at all.
+    """
+    if not settings.backup_channel_id:
+        return None
+    try:
+        data = await db.export_backup()
+        counts = {k: len(v) for k, v in data.items()}
+        stamp = datetime.now(IST).strftime("%Y-%m-%d_%H%M")
+        name = f"dealskoti_backup_{stamp}.json"
+        path = Path("uploads") / name
+        path.parent.mkdir(exist_ok=True)
+        payload = {"version": 1, "created_at": datetime.now(timezone.utc).isoformat(), "data": data}
+        path.write_text(json.dumps(payload, default=_json_default), encoding="utf-8")
+
+        size_kb = max(1, path.stat().st_size // 1024)
+        caption = (
+            f"💾 <b>Database Backup</b> ({reason})\n\n"
+            f"🕐 {datetime.now(IST).strftime('%d %b %Y, %I:%M %p IST')}\n"
+            f"📦 {size_kb} KB\n\n"
+            f"👥 Users: {counts.get('users', 0)}\n"
+            f"📋 Tasks: {counts.get('tasks', 0)}\n"
+            f"🔐 Sessions: {counts.get('sessions', 0)}\n"
+            f"💳 Payments: {counts.get('payments', 0)}\n"
+            f"🎁 Referrals: {counts.get('referrals', 0)}\n\n"
+            f"⚠️ Sessions here are encrypted. Without SESSION_ENCRYPTION_KEY "
+            f"they cannot be restored — keep that key somewhere else."
+        )
+        await bot.send_document(
+            settings.backup_channel_id, FSInputFile(str(path)),
+            caption=caption, parse_mode="HTML",
+        )
+        with suppress(Exception):
+            path.unlink(missing_ok=True)
+        logger.info("Backup sent: %s (%s)", name, counts)
+        return name
+    except Exception as exc:
+        logger.exception("Backup failed")
+        await _notify_admins(bot, settings, f"⚠️ <b>Backup FAILED</b>\n\n<code>{safe_html(exc)}</code>")
+        return None
+
+
+@router.message(Command("backup"))
+async def backup_command(message: Message, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    if not settings.backup_channel_id:
+        return await message.answer(
+            "⚠️ Backups are not configured.\n\n"
+            "Create a private channel, add this bot as admin, and set "
+            "<code>BACKUP_CHANNEL_ID</code> in your environment variables.",
+            parse_mode="HTML",
+        )
+    notice = await message.answer("💾 Creating backup…")
+    name = await _make_backup(message.bot, db, settings, reason="manual")
+    with suppress(Exception):
+        await notice.delete()
+    await message.answer(
+        f"✅ Backup sent to your backup channel.\n\n<code>{safe_html(name)}</code>"
+        if name else "⚠️ Backup failed — check the logs.",
+        parse_mode="HTML", reply_markup=admin_keyboard(),
+    )
+
+
+@router.message(Command("restore"))
+async def restore_command(message: Message, settings: Settings) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    await message.answer(
+        "♻️ <b>Restore from Backup</b>\n\n"
+        "Forward or upload a <code>dealskoti_backup_*.json</code> file here.\n\n"
+        "⚠️ This <b>replaces everything</b> currently in the database.\n"
+        "A safety backup of the current data is taken first, automatically.",
+        parse_mode="HTML", reply_markup=admin_keyboard(),
+    )
+
+
+@router.message(F.document)
+async def restore_receive(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    """Picks up a backup file sent by an admin.
+
+    Filtered on the filename so it cannot collide with the Platinum file
+    upload flow, which runs inside its own FSM state.
+    """
+    if not _is_admin(settings, message.from_user.id):
+        return
+    if await state.get_state() is not None:
+        return  # a different flow owns this message
+    name = (message.document.file_name or "").lower()
+    if not (name.startswith("dealskoti_backup") and name.endswith(".json")):
+        return
+
+    notice = await message.answer("🔍 Reading backup…")
+    try:
+        tg_file = await message.bot.get_file(message.document.file_id)
+        buf = await message.bot.download_file(tg_file.file_path)
+        payload = json.loads(buf.read().decode("utf-8"), object_hook=_json_revive)
+        data = payload.get("data") or {}
+        if not isinstance(data, dict) or "users" not in data:
+            raise ValueError("This does not look like a DealsKoti backup")
+    except Exception as exc:
+        with suppress(Exception):
+            await notice.delete()
+        return await message.answer(f"⚠️ Could not read that file:\n<code>{safe_html(exc)}</code>",
+                                    parse_mode="HTML")
+
+    counts = {k: len(v) for k, v in data.items() if isinstance(v, list)}
+    created = payload.get("created_at", "unknown")
+    await state.set_state(RestoreStates.waiting_confirm)
+    await state.update_data(restore_file_id=message.document.file_id)
+
+    with suppress(Exception):
+        await notice.delete()
+    await message.answer(
+        f"♻️ <b>Confirm Restore</b>\n\n"
+        f"📅 Backup from: {safe_html(created)}\n\n"
+        f"👥 Users: {counts.get('users', 0)}\n"
+        f"📋 Tasks: {counts.get('tasks', 0)}\n"
+        f"🔐 Sessions: {counts.get('sessions', 0)}\n"
+        f"💳 Payments: {counts.get('payments', 0)}\n\n"
+        f"⚠️ <b>Everything currently in the database will be replaced.</b>\n"
+        f"A safety backup of the current data is taken first.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Yes, Restore", callback_data="restore:go")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "restore:go")
+async def restore_apply(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+    forwarding: ForwardingEngine,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    data = await state.get_data()
+    file_id = data.get("restore_file_id")
+    await state.clear()
+    if not file_id or callback.message is None:
+        return await callback.answer("Nothing to restore", show_alert=True)
+
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_text("💾 Taking a safety backup first…", reply_markup=None)
+    await _make_backup(callback.bot, db, settings, reason="pre-restore safety")
+
+    try:
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text("♻️ Restoring…", reply_markup=None)
+        tg_file = await callback.bot.get_file(file_id)
+        buf = await callback.bot.download_file(tg_file.file_path)
+        payload = json.loads(buf.read().decode("utf-8"), object_hook=_json_revive)
+        restored = await db.import_backup(payload.get("data") or {})
+    except Exception as exc:
+        logger.exception("Restore failed")
+        return await _safe_edit(
+            callback.message,
+            f"❌ <b>Restore failed</b>\n\n<code>{safe_html(exc)}</code>\n\n"
+            f"Nothing was changed — the database is exactly as it was.",
+            admin_keyboard(),
+        )
+
+    # Reload every forwarding client against the restored data.
+    with suppress(Exception):
+        await forwarding.stop()
+        await forwarding.start()
+
+    lines = "\n".join(f"  {k}: {v}" for k, v in restored.items() if v)
+    await _safe_edit(
+        callback.message,
+        f"✅ <b>Restore complete</b>\n\n{lines}\n\nForwarding has been reloaded.",
+        admin_keyboard(),
+    )
+    await callback.answer("Restored")
+
+
+# ==========================================
 # ADMIN
 # ==========================================
 
@@ -2734,6 +2948,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="💸 Payouts", callback_data="admin:payoutlist")],
         [InlineKeyboardButton(text="👤 User Info", callback_data="admin:userinfo:start"),
          InlineKeyboardButton(text="🎁 Grant Days", callback_data="admin:grantpicker")],
+        [InlineKeyboardButton(text="💾 Backup Now", callback_data="admin:backup")],
         [InlineKeyboardButton(text="🏠 User Menu", callback_data="menu:home")],
     ])
 
@@ -2810,6 +3025,31 @@ async def weekly_report_cb(callback: CallbackQuery, db: Database, settings: Sett
     if callback.message is None:
         return
     await _safe_edit(callback.message, await _weekly_report(db), admin_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:backup")
+async def admin_backup_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    if not settings.backup_channel_id:
+        await _safe_edit(
+            callback.message,
+            "⚠️ Backups are not configured.\n\nCreate a private channel, add this "
+            "bot as admin, and set <code>BACKUP_CHANNEL_ID</code>.",
+            admin_keyboard(),
+        )
+        return await callback.answer()
+    await _safe_edit(callback.message, "💾 Creating backup…", None)
+    name = await _make_backup(callback.bot, db, settings, reason="manual")
+    await _safe_edit(
+        callback.message,
+        f"✅ Backup sent.\n\n<code>{safe_html(name)}</code>" if name
+        else "⚠️ Backup failed — check the logs.",
+        admin_keyboard(),
+    )
     await callback.answer()
 
 
@@ -3768,9 +4008,15 @@ def build_app(
                     )
                 await _notify_admins(
                     bot, settings,
-                    f"✅ <b>Verified Payment</b>\nUser: <code>{user_id}</code>\n"
-                    f"Plan: {stored_plan.title()}\n"
-                    f"Amount: {format_paise(captured.amount_paise)}",
+                    f"💰 <b>Payment Received</b>\n\n"
+                    f"👤 User: {_format_name(user)}\n"
+                    f"🔗 Username: {_handle(user)}\n"
+                    f"🆔 User ID: <code>{user_id}</code>\n\n"
+                    f"💎 Plan: <b>{stored_plan.title()}</b> ({stored_cycle.title()})\n"
+                    f"💵 Amount: <b>{format_paise(captured.amount_paise)}</b>\n"
+                    f"🧾 Txn: <code>{safe_html(captured.payment_id)}</code>\n"
+                    f"📅 New expiry: {expiry_str}\n"
+                    f"🕐 {_now_ist()}",
                 )
         return JSONResponse({"status": "processed"})
 
@@ -3909,29 +4155,45 @@ async def _run(settings: Settings) -> None:
         await _notify_admins(bot, settings, await _weekly_report(db))
 
     async def send_expiry_reminders():
-        """Warns users 3 days and then 1 day before expiry.
+        """Warns at 5, 3, 2, 1 and 0 days before expiry.
 
-        The 3-day warning is sent first so a user who is already inside the
-        1-day window gets the more urgent one. mark_expiry_reminder_sent()
-        records the stage, which is what stops a second copy going out — the
-        old version relied on catching a ±1 hour window and silently skipped
-        anyone whose expiry fell outside it.
+        Stages run from the largest number down, so a user who is already
+        inside a shorter window gets the most urgent message rather than a
+        stale one. mark_expiry_reminder_sent() records the stage, which is what
+        stops a second copy going out.
         """
-        for stage in (3, 1):
-            for row in await db.get_expiring_users(stage):
+        for stage in (5, 3, 2, 1, 0):
+            for row in await db.get_expiring_users(max(stage, 1) if stage else 1):
                 user_id = int(row["telegram_user_id"])
                 language = language_for(row["preferred_language"])
                 plan_label = str(row["plan"]).title()
-                try:
-                    await bot.send_message(
-                        user_id,
-                        f"⏳ Your <b>{plan_label}</b> plan expires in {stage} day(s).\n"
-                        f"Use /plans to renew.",
-                        parse_mode="HTML",
+                expiry_raw = row["plan_expiry"]
+                expiry = (
+                    expiry_raw.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+                    if expiry_raw else "—"
+                )
+                # Only send this stage to users actually inside its window.
+                if expiry_raw is not None:
+                    left = (expiry_raw - datetime.now(timezone.utc)).total_seconds() / 86400
+                    if stage and left > stage:
+                        continue
+                    if not stage and left > 1:
+                        continue
+
+                if stage == 0:
+                    text = safe_t(language, "expiry_today", plan=plan_label, expiry=expiry)
+                else:
+                    label = f"{stage} day" + ("s" if stage != 1 else "")
+                    text = safe_t(
+                        language, "expiry_warning",
+                        plan=plan_label, days=label, expiry=expiry,
                     )
-                    await db.mark_expiry_reminder_sent(user_id, stage)
+                try:
+                    await bot.send_message(user_id, text, parse_mode="HTML")
+                    # Stage 0 is stored as -1 so it never blocks the others.
+                    await db.mark_expiry_reminder_sent(user_id, stage if stage else -1)
                 except TelegramForbiddenError:
-                    await db.mark_expiry_reminder_sent(user_id, stage)
+                    await db.mark_expiry_reminder_sent(user_id, stage if stage else -1)
                     await db.mark_user_inactive(user_id)
                 except Exception:
                     logger.warning("Could not send expiry reminder to %s", user_id)
@@ -3941,14 +4203,20 @@ async def _run(settings: Settings) -> None:
             with suppress(Exception):
                 await bot.send_message(
                     int(row["telegram_user_id"]),
-                    "❌ Your plan has expired and you've been downgraded to Free.\n"
-                    "Use /plans to resubscribe.",
+                    safe_t(
+                        language_for(row["preferred_language"]), "expiry_done",
+                        plan=str(row["scheduled_plan"] or "Premium").title(),
+                    ),
+                    parse_mode="HTML",
                 )
             with suppress(Exception):
                 await forwarding.refresh_user(int(row["telegram_user_id"]))
 
     async def send_task_creation_reminders():
         await _send_task_creation_reminders(bot, db, settings)
+
+    async def nightly_backup():
+        await _make_backup(bot, db, settings, reason="nightly")
 
     async def prune_edit_sync_map():
         """Telegram refuses edits older than 48h, so anything older in the
@@ -3963,6 +4231,7 @@ async def _run(settings: Settings) -> None:
     scheduler.add_job(downgrade_expired_plans, CronTrigger(hour="*", minute=5, timezone=timezone), replace_existing=True)
     scheduler.add_job(send_task_creation_reminders, CronTrigger(minute=15, timezone=timezone), replace_existing=True)
     scheduler.add_job(prune_edit_sync_map, CronTrigger(hour=4, minute=30, timezone=timezone), replace_existing=True)
+    scheduler.add_job(nightly_backup, CronTrigger(hour=3, minute=0, timezone=timezone), replace_existing=True)
     scheduler.start()
 
     forwarding_task = None
