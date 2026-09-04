@@ -50,6 +50,8 @@ ADMIN_COMMANDS = [
     ("/block", "⛔ Block a user from using the bot"),
     ("/unblock", "✅ Unblock a restricted user"),
     ("/withdrawals", "💸 Review pending payout requests"),
+    ("/backup", "💾 Create a database backup now"),
+    ("/restore", "♻️ Restore the database from a backup"),
 ]
 
 # ==========================================
@@ -183,6 +185,9 @@ TRANSLATIONS = {
         "destination_failed": "⚠️ <b>Forwarding Problem</b>\n\nTask: <b>{task}</b>\nCouldn't send to: <b>{dest}</b>\n\nPossible reasons:\n• Your account was removed from that channel\n• The channel was deleted\n• You don't have permission to post there\n\nFix it in Settings, or remove that destination.",
         "protected_source_blocked": "🛡️ <b>This channel can't be used as a source</b>\n\n<b>{name}</b> has <b>Restrict saving content</b> turned on — its owner does not allow their posts to be copied.\n\nCopying from it would put <b>your own Telegram account</b> at risk: the owner can report it, and Telegram can act on your account, not ours.\n\nWe block these on purpose. Your account matters more to us than one extra source.\n\n✅ <b>Everything else works</b> — private channels, invite-only groups and bots are all fine.",
         "protected_source_task": "🛡️ <b>Forwarding stopped for this source</b>\n\nTask: <b>{task}</b>\n\nOne of this task's source channels has turned on <b>Restrict saving content</b>, so its posts can no longer be copied.\n\nThis protects <b>your account</b> — copying from a protected channel can get your account reported.\n\nYour other sources are still working normally.",
+        "expiry_warning": "⏳ <b>Your {plan} plan expires in {days}</b>\n\n📅 Expires: {expiry}\n\nAfter that you move to the <b>Free plan</b>:\n• 1 task only\n• 1 source, 1 target\n• 50 messages/day\n\nYour extra tasks will be paused and your settings kept safe — renew any time to get them back.\n\n👉 Use /plans to continue.",
+        "expiry_today": "⚠️ <b>Your {plan} plan expires today</b>\n\n📅 Expires: {expiry}\n\nFrom tomorrow you'll be on the <b>Free plan</b> — 1 task, 1 source, 1 target, 50 messages/day.\n\nYour tasks and settings are kept safe, just paused.\n\n👉 Renew now with /plans",
+        "expiry_done": "❌ <b>Your {plan} plan has expired</b>\n\nYou're now on the <b>Free plan</b>:\n• 1 task, 1 source, 1 target\n• 50 messages/day\n\nYour other tasks are paused, not deleted — every setting is still there.\n\n👉 Use /plans to get them back instantly.",
         "config_no_tasks": "📋 <b>No tasks yet</b>\n\nYou haven't created any forwarding task, so there is nothing to show.\n\nUse /tasks to create your first task.",
         "config_select_task": "🛠️ <b>Your Configuration</b>\n\nSelect a task to view its current settings:",
         "config_footer": "🦾 Control All Settings: /settings",
@@ -424,6 +429,9 @@ TRANSLATIONS = {
         "destination_failed": "⚠️ <b>Forwarding Me Dikkat</b>\n\nTask: <b>{task}</b>\nYahan nahi bhej paye: <b>{dest}</b>\n\nWajah ye ho sakti hai:\n• Aapka account us channel se hata diya gaya\n• Channel delete ho gaya\n• Wahan post karne ki permission nahi hai\n\nSettings me theek karein, ya wo destination hata dein.",
         "protected_source_blocked": "🛡️ <b>Ye channel source nahi ban sakta</b>\n\n<b>{name}</b> par <b>Restrict saving content</b> laga hua hai — iske owner ne apni posts copy hone se rok rakha hai.\n\nIsse copy karna <b>aapke apne Telegram account</b> ke liye risk hai: owner report kar sakta hai, aur Telegram action aapke account par lega, humare par nahi.\n\nHum ise jaan-boojh kar block karte hain. Ek extra source se zyada zaroori aapka account hai.\n\n✅ <b>Baaki sab chalta hai</b> — private channels, invite-only groups aur bots sab theek hain.",
         "protected_source_task": "🛡️ <b>Is source se forwarding ruk gayi</b>\n\nTask: <b>{task}</b>\n\nIs task ke ek source channel par <b>Restrict saving content</b> on ho gaya hai, isliye uski posts ab copy nahi ho sakti.\n\nYe <b>aapke account ki suraksha</b> ke liye hai — protected channel se copy karne par account report ho sakta hai.\n\nAapke baaki sources normal chal rahe hain.",
+        "expiry_warning": "⏳ <b>Aapka {plan} plan {days} me khatam ho raha hai</b>\n\n📅 Expiry: {expiry}\n\nUske baad aap <b>Free plan</b> par aa jayenge:\n• Sirf 1 task\n• 1 source, 1 target\n• 50 messages/day\n\nAapke extra tasks pause ho jayenge aur settings safe rahengi — kabhi bhi renew karke wapas paa sakte hain.\n\n👉 Jaari rakhne ke liye /plans use karein.",
+        "expiry_today": "⚠️ <b>Aapka {plan} plan aaj khatam ho raha hai</b>\n\n📅 Expiry: {expiry}\n\nKal se aap <b>Free plan</b> par honge — 1 task, 1 source, 1 target, 50 messages/day.\n\nAapke tasks aur settings safe hain, bas pause ho jayenge.\n\n👉 Abhi renew karein: /plans",
+        "expiry_done": "❌ <b>Aapka {plan} plan khatam ho gaya</b>\n\nAb aap <b>Free plan</b> par hain:\n• 1 task, 1 source, 1 target\n• 50 messages/day\n\nAapke baaki tasks pause hain, delete nahi hue — saari settings waisi hi hain.\n\n👉 Turant wapas paane ke liye /plans use karein.",
         "config_no_tasks": "📋 <b>Abhi koi task nahi hai</b>\n\nAapne koi forwarding task nahi banaya, isliye dikhane ko kuch nahi hai.\n\nPehla task banane ke liye /tasks use karein.",
         "config_select_task": "🛠️ <b>Aapki Configuration</b>\n\nSettings dekhne ke liye task chunein:",
         "config_footer": "🦾 Saari settings badalne ke liye: /settings",
