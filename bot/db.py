@@ -26,9 +26,10 @@ logger = logging.getLogger("dealskoti.db")
 
 PLAN_RANKS = {
     "free": 0,
-    "silver": 1,
-    "gold": 2,
-    "platinum": 3,
+    "basic": 1,
+    "silver": 2,
+    "gold": 3,
+    "platinum": 4,
 }
 
 # ---------------------------------------------------------
@@ -1201,7 +1202,11 @@ class Database:
                      AND plan_expiry IS NOT NULL
                      AND plan_expiry > $1
                      AND plan_expiry <= $2
-                     AND (expiry_reminder_stage = 0 OR expiry_reminder_stage > $3)
+                     -- 0 means "never warned". A stored stage is only skipped
+                     -- when we have already sent that stage or a more urgent
+                     -- one; -1 marks the final same-day warning.
+                     AND (expiry_reminder_stage = 0
+                          OR (expiry_reminder_stage > $3 AND expiry_reminder_stage <> -1))
                    ORDER BY plan_expiry ASC""",
                 now, cutoff, days,
             )
@@ -1277,6 +1282,89 @@ class Database:
     # ==========================================
     # ADMIN STATS & BROADCASTS
     # ==========================================
+
+    # ==========================================
+    # BACKUP / RESTORE
+    # ==========================================
+    # Every table that holds real state. sent_messages is deliberately left
+    # out: it rebuilds itself and is pruned after 3 days anyway.
+    BACKUP_TABLES = [
+        "users", "sessions", "tasks", "payments", "manual_payments",
+        "usdt_payments", "withdrawals", "referrals", "usage_daily",
+        "stored_files", "broadcasts",
+    ]
+
+    async def export_backup(self) -> dict:
+        """Reads every table into a plain dict, ready to be written as JSON.
+
+        Deliberately not pg_dump: this runs inside the bot with no shell, which
+        is what makes a one-tap restore from Telegram possible.
+        """
+        if self.pool is None:
+            return {}
+        data: dict[str, list] = {}
+        async with self.pool.acquire() as conn:
+            for table in self.BACKUP_TABLES:
+                try:
+                    rows = await conn.fetch(f"SELECT * FROM {table}")  # noqa: S608 - fixed list
+                except Exception as exc:
+                    logger.warning("Backup: could not read %s: %s", table, exc)
+                    continue
+                data[table] = [dict(r) for r in rows]
+        return data
+
+    async def import_backup(self, data: dict) -> dict:
+        """Replaces the current contents with a backup.
+
+        Runs in ONE transaction: if any table fails, nothing is committed and
+        the live database is left exactly as it was. A half-restored database
+        would be worse than no restore at all.
+        """
+        if self.pool is None:
+            return {}
+        restored: dict[str, int] = {}
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # Reverse order so child rows go before their parents.
+                for table in reversed(self.BACKUP_TABLES):
+                    if table in data:
+                        await conn.execute(f"DELETE FROM {table}")  # noqa: S608
+
+                for table in self.BACKUP_TABLES:
+                    rows = data.get(table) or []
+                    if not rows:
+                        restored[table] = 0
+                        continue
+                    columns = list(rows[0].keys())
+                    col_sql = ", ".join(f'"{c}"' for c in columns)
+                    placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
+                    stmt = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"  # noqa: S608
+                    await conn.executemany(
+                        stmt, [tuple(r.get(c) for c in columns) for r in rows],
+                    )
+                    restored[table] = len(rows)
+
+        # Sequences must be moved past the restored ids, or the next insert
+        # collides with a row that already exists.
+        #
+        # This runs OUTSIDE the transaction above, deliberately. Tables such as
+        # `sessions` have no `id` column, so pg_get_serial_sequence returns NULL
+        # and setval errors. A failed statement poisons the WHOLE PostgreSQL
+        # transaction — suppressing the Python exception does not un-poison it,
+        # and the commit silently rolled everything back. The restore then
+        # reported success while having restored nothing at all.
+        async with self.pool.acquire() as conn:
+            for table in self.BACKUP_TABLES:
+                try:
+                    async with conn.transaction():
+                        await conn.execute(
+                            f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                            f"COALESCE((SELECT MAX(id) FROM {table}), 1), true)"  # noqa: S608
+                        )
+                except Exception:
+                    # No id column on this table — nothing to reset.
+                    continue
+        return restored
 
     async def stats(self) -> dict[str, Any]:
         if self.pool is None: return {}
