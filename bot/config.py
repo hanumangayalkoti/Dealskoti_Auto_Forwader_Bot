@@ -43,6 +43,10 @@ class Settings:
     # shown verbatim in the payment instructions.
     stars_receiver: str = ""
 
+    # Private channel the nightly database backup is sent to. Leave unset to
+    # disable backups entirely.
+    backup_channel_id: int | None = None
+
     # Platinum file-upload storage
     file_storage_channel_id: int | None = None
     max_file_size_mb: int = 2000
@@ -131,6 +135,16 @@ class Settings:
         if stars_receiver and not stars_receiver.startswith(("@", "http")):
             stars_receiver = f"@{stars_receiver}"
 
+        # --- NIGHTLY DATABASE BACKUP (OPTIONAL BUT STRONGLY RECOMMENDED) ---
+        # A PRIVATE channel where the bot is an admin. Never put the
+        # SESSION_ENCRYPTION_KEY in the same place: sessions in the dump are
+        # encrypted, and keeping the key apart is what keeps them safe if the
+        # backup ever leaks.
+        backup_channel_id: int | None = None
+        bk_raw = get_env("BACKUP_CHANNEL_ID", required=False) or ""
+        if bk_raw.lstrip("-").isdigit():
+            backup_channel_id = int(bk_raw)
+
         # --- FILE STORAGE (PLATINUM /upload_file) ---
         file_storage_channel_id: int | None = None
         fs_raw = get_env("FILE_STORAGE_CHANNEL_ID", required=False) or ""
@@ -159,6 +173,7 @@ class Settings:
             log_level=log_level,
             default_timezone=default_timezone,
             max_concurrent_forward_tasks=max_tasks,
+            backup_channel_id=backup_channel_id,
             usdt_wallet_address=usdt_wallet_address,
             usdt_network=usdt_network,
             stars_receiver=stars_receiver,
