@@ -899,6 +899,62 @@ class Database:
                 max(0, offset), max(1, limit),
             )
 
+    async def list_all_tasks_page(self, offset: int = 0, limit: int = 10) -> list[asyncpg.Record]:
+        """One page of EVERY user's tasks, newest first — the /usertasks view."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT t.*, u.username, u.first_name, u.plan
+                   FROM tasks t
+                   LEFT JOIN users u ON u.telegram_user_id = t.user_id
+                   ORDER BY t.id DESC
+                   OFFSET $1 LIMIT $2""",
+                max(0, offset), max(1, limit),
+            )
+
+    async def count_all_tasks(self) -> int:
+        if self.pool is None: return 0
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval("SELECT COUNT(*) FROM tasks") or 0)
+
+    async def reduce_plan_days(self, user_id: int, days: int) -> tuple[bool, bool]:
+        """Takes `days` off a user's plan.
+
+        Returns (changed, expired_now). Expiry never goes negative: once the
+        remaining time runs out the user drops straight to Free, because a
+        plan with a date in the past is meaningless.
+        """
+        if self.pool is None or days <= 0:
+            return False, False
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT plan, plan_expiry FROM users WHERE telegram_user_id = $1 FOR UPDATE",
+                    user_id,
+                )
+                if not row or row["plan"] == "free":
+                    return False, False
+                expiry = row["plan_expiry"]
+                if expiry is None:
+                    return False, False
+                new_expiry = expiry - timedelta(days=days)
+                if new_expiry <= now:
+                    await conn.execute(
+                        """UPDATE users SET plan = 'free', plan_expiry = NULL,
+                                  scheduled_plan = NULL, scheduled_days = NULL,
+                                  expiry_reminder_stage = 0
+                           WHERE telegram_user_id = $1""",
+                        user_id,
+                    )
+                    return True, True
+                await conn.execute(
+                    """UPDATE users SET plan_expiry = $1, expiry_reminder_stage = 0
+                       WHERE telegram_user_id = $2""",
+                    new_expiry, user_id,
+                )
+                return True, False
+
     async def count_all_users(self) -> int:
         if self.pool is None: return 0
         async with self.pool.acquire() as conn:
