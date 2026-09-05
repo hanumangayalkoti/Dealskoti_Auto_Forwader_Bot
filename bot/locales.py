@@ -52,6 +52,8 @@ ADMIN_COMMANDS = [
     ("/withdrawals", "💸 Review pending payout requests"),
     ("/backup", "💾 Create a database backup now"),
     ("/restore", "♻️ Restore the database from a backup"),
+    ("/usertasks", "📋 Browse every user's forwarding tasks"),
+    ("/reducedays", "➖ Reduce premium days for users"),
 ]
 
 # ==========================================
@@ -188,6 +190,8 @@ TRANSLATIONS = {
         "expiry_warning": "⏳ <b>Your {plan} plan expires in {days}</b>\n\n📅 Expires: {expiry}\n\nAfter that you move to the <b>Free plan</b>:\n• 1 task only\n• 1 source, 1 target\n• 50 messages/day\n\nYour extra tasks will be paused and your settings kept safe — renew any time to get them back.\n\n👉 Use /plans to continue.",
         "expiry_today": "⚠️ <b>Your {plan} plan expires today</b>\n\n📅 Expires: {expiry}\n\nFrom tomorrow you'll be on the <b>Free plan</b> — 1 task, 1 source, 1 target, 50 messages/day.\n\nYour tasks and settings are kept safe, just paused.\n\n👉 Renew now with /plans",
         "expiry_done": "❌ <b>Your {plan} plan has expired</b>\n\nYou're now on the <b>Free plan</b>:\n• 1 task, 1 source, 1 target\n• 50 messages/day\n\nYour other tasks are paused, not deleted — every setting is still there.\n\n👉 Use /plans to get them back instantly.",
+        "why_connect": "🔐 <b>Why do I need to connect?</b>\n\nThe bot forwards using <b>your own Telegram account</b>, not its own. That is what makes everything work:\n\n✅ Your chat list appears here, so you can pick sources and targets\n✅ It can post into channels you're already a member of\n✅ Private and invite-only channels work too\n\n🔒 <b>Your data</b>\n• Your session is encrypted before it is stored\n• Your OTP and 2FA password are <b>never saved</b>\n• Your 2FA password is deleted from this chat the moment you send it\n• You can remove access any time with /disconnect\n\nWithout connecting, the bot cannot see a single one of your chats — so there would be nothing to forward.",
+        "disconnect_ask": "⚠️ <b>Disconnect your Telegram account?</b>\n\nThis will:\n• Stop all forwarding immediately\n• Remove your stored session\n\nThis will NOT:\n• Delete your tasks or settings\n• Cancel or refund your plan\n\nYou can reconnect any time with /connect and everything resumes exactly where it was.",
         "config_no_tasks": "📋 <b>No tasks yet</b>\n\nYou haven't created any forwarding task, so there is nothing to show.\n\nUse /tasks to create your first task.",
         "config_select_task": "🛠️ <b>Your Configuration</b>\n\nSelect a task to view its current settings:",
         "config_footer": "🦾 Control All Settings: /settings",
@@ -432,6 +436,8 @@ TRANSLATIONS = {
         "expiry_warning": "⏳ <b>Aapka {plan} plan {days} me khatam ho raha hai</b>\n\n📅 Expiry: {expiry}\n\nUske baad aap <b>Free plan</b> par aa jayenge:\n• Sirf 1 task\n• 1 source, 1 target\n• 50 messages/day\n\nAapke extra tasks pause ho jayenge aur settings safe rahengi — kabhi bhi renew karke wapas paa sakte hain.\n\n👉 Jaari rakhne ke liye /plans use karein.",
         "expiry_today": "⚠️ <b>Aapka {plan} plan aaj khatam ho raha hai</b>\n\n📅 Expiry: {expiry}\n\nKal se aap <b>Free plan</b> par honge — 1 task, 1 source, 1 target, 50 messages/day.\n\nAapke tasks aur settings safe hain, bas pause ho jayenge.\n\n👉 Abhi renew karein: /plans",
         "expiry_done": "❌ <b>Aapka {plan} plan khatam ho gaya</b>\n\nAb aap <b>Free plan</b> par hain:\n• 1 task, 1 source, 1 target\n• 50 messages/day\n\nAapke baaki tasks pause hain, delete nahi hue — saari settings waisi hi hain.\n\n👉 Turant wapas paane ke liye /plans use karein.",
+        "why_connect": "🔐 <b>Connect karna kyun zaroori hai?</b>\n\nBot forwarding <b>aapke apne Telegram account</b> se karta hai, apne se nahi. Isi se sab kuch chalta hai:\n\n✅ Aapki chat list yahan dikhti hai, jisme se source aur target chun sakein\n✅ Jin channels me aap pehle se ho, unme post kar sake\n✅ Private aur invite-only channels bhi chalein\n\n🔒 <b>Aapka data</b>\n• Aapka session encrypt karke store hota hai\n• Aapka OTP aur 2FA password <b>kabhi save nahi</b> hote\n• 2FA password bhejte hi is chat se delete ho jaata hai\n• /disconnect se kabhi bhi access hata sakte ho\n\nConnect kiye bina bot aapki ek bhi chat nahi dekh sakta — to forward karne ko kuch hoga hi nahi.",
+        "disconnect_ask": "⚠️ <b>Telegram account disconnect karein?</b>\n\nIsse ye hoga:\n• Saari forwarding turant ruk jayegi\n• Aapka stored session hat jayega\n\nYe NAHI hoga:\n• Aapke tasks ya settings delete nahi honge\n• Aapka plan cancel ya refund nahi hoga\n\n/connect se kabhi bhi dobara jud sakte ho aur sab wahin se chalu ho jayega.",
         "config_no_tasks": "📋 <b>Abhi koi task nahi hai</b>\n\nAapne koi forwarding task nahi banaya, isliye dikhane ko kuch nahi hai.\n\nPehla task banane ke liye /tasks use karein.",
         "config_select_task": "🛠️ <b>Aapki Configuration</b>\n\nSettings dekhne ke liye task chunein:",
         "config_footer": "🦾 Saari settings badalne ke liye: /settings",
