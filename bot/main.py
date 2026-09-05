@@ -213,13 +213,38 @@ async def _require_connected(db: Database, user_id: int, language: str) -> str |
 def _connect_required_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+        # Most people stop right here: handing a phone number and 2FA password
+        # to a bot is a big ask. This answers that worry before they leave.
+        [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
 
 
-def _nav_keyboard(*, back: str = "menu:home", include_cancel: bool = False) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="◀️ Back", callback_data=back)]]
+@router.callback_query(F.data == "why:connect")
+async def why_connect_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await _safe_edit(
+        callback.message,
+        safe_t(language, "why_connect"),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔌 Connect Now", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer()
+
+
+def _nav_keyboard(
+    *, back: str = "menu:home", include_cancel: bool = False, why_connect: bool = False,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if why_connect:
+        rows.append([InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")])
+    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data=back)])
     if include_cancel:
         rows.append([InlineKeyboardButton(text="✖️ Cancel", callback_data="flow:cancel")])
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
@@ -468,8 +493,9 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
         text = safe_t(language, "home_not_connected")
         rows = [
             [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
-            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
-            [InlineKeyboardButton(text="❓ How it works", callback_data="faq:page:0")],
+            [InlineKeyboardButton(text="🔐 Why connect?", callback_data="why:connect")],
+            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
+             InlineKeyboardButton(text="❓ How it works", callback_data="faq:page:0")],
         ]
         if settings.support_bot_link:
             rows.append([InlineKeyboardButton(text="📞 Support", url=settings.support_bot_link)])
@@ -891,7 +917,7 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
 def _account_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
-        [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect")],
+        [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect-ask")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
@@ -1073,7 +1099,8 @@ async def connect_command(
     await state.set_state(LoginStates.waiting_phone)
     await state.update_data(login_msg_ids=[message.message_id])
     prompt = await message.answer(
-        safe_t(language, "login_phone"), reply_markup=_nav_keyboard(include_cancel=True),
+        safe_t(language, "login_phone"),
+        reply_markup=_nav_keyboard(include_cancel=True, why_connect=True),
     )
     await _track_login_msg(state, prompt.message_id)
 
@@ -1103,7 +1130,8 @@ async def menu_connect(
     await state.set_state(LoginStates.waiting_phone)
     await state.update_data(login_msg_ids=[callback.message.message_id])
     await _safe_edit(
-        callback.message, safe_t(language, "login_phone"), _nav_keyboard(include_cancel=True),
+        callback.message, safe_t(language, "login_phone"),
+        _nav_keyboard(include_cancel=True, why_connect=True),
     )
     await callback.answer()
 
@@ -1235,13 +1263,35 @@ async def disconnect_command(
 ) -> None:
     language = await _language_for_message(db, message)
     await message.answer(
-        safe_t(language, "disconnect_confirm"),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Yes, Disconnect", callback_data="auth:disconnect")],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:account"),
-             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
+        safe_t(language, "disconnect_ask"),
+        reply_markup=_disconnect_confirm_markup(language),
     )
+
+
+def _disconnect_confirm_markup(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, Disconnect", callback_data="auth:disconnect")],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:account"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+
+
+@router.callback_query(F.data == "auth:disconnect-ask")
+async def auth_disconnect_ask(callback: CallbackQuery, db: Database) -> None:
+    """Disconnect is destructive, so it always asks first.
+
+    The Account screen's button used to disconnect instantly with no prompt —
+    one stray tap stopped all of a user's forwarding.
+    """
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await _safe_edit(
+        callback.message,
+        safe_t(language, "disconnect_ask"),
+        _disconnect_confirm_markup(language),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "auth:disconnect")
@@ -2948,6 +2998,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="💸 Payouts", callback_data="admin:payoutlist")],
         [InlineKeyboardButton(text="👤 User Info", callback_data="admin:userinfo:start"),
          InlineKeyboardButton(text="🎁 Grant Days", callback_data="admin:grantpicker")],
+        [InlineKeyboardButton(text="➖ Reduce Days", callback_data="admin:reducepicker"),
+         InlineKeyboardButton(text="📋 All Tasks", callback_data="admin:tasks:0")],
         [InlineKeyboardButton(text="💾 Backup Now", callback_data="admin:backup")],
         [InlineKeyboardButton(text="🏠 User Menu", callback_data="menu:home")],
     ])
@@ -3254,13 +3306,45 @@ async def admin_block_toggle(
 
 
 @router.callback_query(F.data == "admin:grantpicker")
-async def admin_grant_picker_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+async def admin_grant_picker_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None:
         return
-    await _render_user_picker(callback.message, db, "grant", ADMIN_PICKER_TITLES["grant"], 0)
+    await state.update_data(sel_grant=[])
+    await _render_user_picker(
+        callback.message, db, "grant", ADMIN_PICKER_TITLES["grant"], 0, selected=[],
+    )
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:reducepicker")
+async def admin_reduce_picker_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    await state.update_data(sel_reduce=[])
+    await _render_user_picker(
+        callback.message, db, "reduce", ADMIN_PICKER_TITLES["reduce"], 0, selected=[],
+    )
+    await callback.answer()
+
+
+@router.message(Command("reducedays"))
+async def reduce_days_command(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    await state.update_data(sel_reduce=[])
+    await _render_user_picker(
+        message, db, "reduce", ADMIN_PICKER_TITLES["reduce"], 0, selected=[],
+    )
 
 
 @router.callback_query(F.data.startswith("admin:grant:"))
@@ -3318,13 +3402,17 @@ async def admin_grant_days_finish(
 
 @router.message(Command("grantdays"))
 async def grant_days_command(
-    message: Message, db: Database, settings: Settings, forwarding: ForwardingEngine,
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+    forwarding: ForwardingEngine,
 ) -> None:
     if not _is_admin(settings, message.from_user.id):
         return
     parts = (message.text or "").split()
     if len(parts) == 1:
-        return await _render_user_picker(message, db, "grant", ADMIN_PICKER_TITLES["grant"], 0)
+        await state.update_data(sel_grant=[])
+        return await _render_user_picker(
+            message, db, "grant", ADMIN_PICKER_TITLES["grant"], 0, selected=[],
+        )
     if len(parts) not in (3, 4) or not parts[2].isdigit():
         return await message.answer(
             "Usage: /grantdays &lt;user&gt; &lt;days&gt; [plan]\n"
@@ -3359,11 +3447,14 @@ ADMIN_PAGE_SIZE = 10
 
 async def _render_user_picker(
     message_obj, db: Database, action: str, title: str, page: int = 0,
+    selected: list[int] | None = None,
 ) -> None:
     total = await db.count_all_users()
     pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     users = await db.list_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
+    selected = selected or []
+    multi = action in MULTI_SELECT_ACTIONS
 
     if not users:
         text, markup = "No users found.", admin_keyboard()
@@ -3377,9 +3468,11 @@ async def _render_user_picker(
             label = safe_html(u["first_name"] or u["username"] or uid)[:26]
             plan = str(u["plan"] or "free").title()
             flag = " ⛔" if u["is_blocked"] else ""
-            lines.append(f"{number}. {label} — {plan}{flag}")
+            tick = " ✅" if uid in selected else ""
+            lines.append(f"{number}. {label} — {plan}{flag}{tick}")
             number_row.append(InlineKeyboardButton(
-                text=str(number), callback_data=f"apick:{action}:{page}:{uid}",
+                text=f"✅{number}" if uid in selected else str(number),
+                callback_data=f"apick:{action}:{page}:{uid}",
             ))
             if len(number_row) == 5:
                 rows.append(number_row)
@@ -3394,11 +3487,24 @@ async def _render_user_picker(
             nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"apage:{action}:{page + 1}"))
         if nav:
             rows.append(nav)
+
+        if multi:
+            rows.append([InlineKeyboardButton(
+                text=f"✅ Done ({len(selected)} selected)", callback_data=f"adone:{action}",
+            )])
+            if selected:
+                rows.append([InlineKeyboardButton(
+                    text="🗑️ Clear selection", callback_data=f"aclear:{action}:{page}",
+                )])
         rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
 
         lines.append("")
         lines.append(f"Page {page + 1} of {pages} · {total} users total")
-        lines.append("👆 Tap a number to select that user")
+        if multi:
+            lines.append(f"✅ Selected: <b>{len(selected)}</b> — selection is kept while you page")
+            lines.append("👆 Tap numbers to select, then tap Done")
+        else:
+            lines.append("👆 Tap a number to select that user")
         text, markup = "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     if hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
@@ -3409,30 +3515,41 @@ async def _render_user_picker(
 
 
 ADMIN_PICKER_TITLES = {
-    "grant": "🎁 <b>Grant days — select a user</b>",
+    "grant": "🎁 <b>Grant days — select users</b>",
+    "reduce": "➖ <b>Reduce days — select users</b>",
     "uinfo": "👤 <b>User info — select a user</b>",
     "block": "⛔ <b>Block / unblock — select a user</b>",
     "payout": "💰 <b>Referral payout — select a user</b>",
 }
 
+# Actions where a number TOGGLES selection instead of acting at once, so
+# several users can be handled in one go. Selection survives paging because it
+# lives in FSM state, not in the keyboard.
+MULTI_SELECT_ACTIONS = {"grant", "reduce"}
+
 
 @router.callback_query(F.data.startswith("apage:"))
-async def admin_picker_page_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+async def admin_picker_page_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None:
         return
     _, action, page = callback.data.split(":")
+    data = await state.get_data()
     await _render_user_picker(
         callback.message, db, action,
         ADMIN_PICKER_TITLES.get(action, "👥 <b>Select a user</b>"), int(page),
+        selected=list(data.get(f"sel_{action}") or []),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("apick:"))
 async def admin_picker_select_cb(
-    callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine,
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+    forwarding: ForwardingEngine,
 ) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
@@ -3445,6 +3562,22 @@ async def admin_picker_select_cb(
     if user is None:
         return await callback.answer("User not found", show_alert=True)
     label = safe_html(user["first_name"] or user["username"] or target_user_id)
+
+    if action in MULTI_SELECT_ACTIONS:
+        key = f"sel_{action}"
+        data = await state.get_data()
+        selected = list(data.get(key) or [])
+        if target_user_id in selected:
+            selected.remove(target_user_id)
+            note = f"{label} removed"
+        else:
+            selected.append(target_user_id)
+            note = f"{label} selected"
+        await state.update_data({key: selected})
+        await _render_user_picker(
+            callback.message, db, action, ADMIN_PICKER_TITLES[action], page, selected=selected,
+        )
+        return await callback.answer(note)
 
     if action == "uinfo":
         text, keyboard = await _full_user_info_card(db, user)
@@ -3478,80 +3611,271 @@ async def admin_picker_select_cb(
             callback.message, db, "payout", ADMIN_PICKER_TITLES["payout"], page,
         )
 
-    if action == "grant":
-        current = str(user["plan"] or "free").title()
-        expiry = user["plan_expiry"].astimezone(IST).strftime("%d %b %Y") if user["plan_expiry"] else "—"
-        rows = [[InlineKeyboardButton(text=f"💎 {plan.name}", callback_data=f"agrant:{target_user_id}:{key}")]
-                for key, plan in PLANS.items() if key != "free"]
-        rows.append([InlineKeyboardButton(text="◀️ Back", callback_data=f"apage:grant:{page}")])
-        await _safe_edit(
-            callback.message,
-            f"🎁 <b>Grant plan to {label}</b>\n"
-            f"ID: <code>{target_user_id}</code>\n"
-            f"Current: {current} (expires {expiry})\n\n"
-            f"Which plan?",
-            InlineKeyboardMarkup(inline_keyboard=rows),
-        )
-        return await callback.answer()
-
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("agrant:"))
-async def admin_grant_days_cb(callback: CallbackQuery, settings: Settings) -> None:
-    """Day presets, so the common cases need no typing at all."""
+@router.callback_query(F.data.startswith("aclear:"))
+async def admin_picker_clear_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None:
         return
-    _, uid_str, plan_key = callback.data.split(":")
-    if plan_key not in PLANS or plan_key == "free":
-        return await callback.answer("Invalid plan", show_alert=True)
-    rows = [
-        [InlineKeyboardButton(text="7 days", callback_data=f"agdays:{uid_str}:{plan_key}:7"),
-         InlineKeyboardButton(text="30 days", callback_data=f"agdays:{uid_str}:{plan_key}:30")],
-        [InlineKeyboardButton(text="90 days", callback_data=f"agdays:{uid_str}:{plan_key}:90"),
-         InlineKeyboardButton(text="365 days", callback_data=f"agdays:{uid_str}:{plan_key}:365")],
-        # Presets cover the common cases; custom handles the 1-2 day comps.
-        [InlineKeyboardButton(text="✍️ Custom days", callback_data=f"agcust:{uid_str}:{plan_key}")],
-        [InlineKeyboardButton(text="◀️ Back", callback_data="apage:grant:0")],
-    ]
-    await _safe_edit(
-        callback.message,
-        f"🎁 Granting <b>{PLANS[plan_key].name}</b> to <code>{uid_str}</code>\n\nFor how long?",
-        InlineKeyboardMarkup(inline_keyboard=rows),
+    _, action, page = callback.data.split(":")
+    await state.update_data({f"sel_{action}": []})
+    await _render_user_picker(
+        callback.message, db, action, ADMIN_PICKER_TITLES[action], int(page), selected=[],
     )
+    await callback.answer("Selection cleared")
+
+
+@router.callback_query(F.data.startswith("adone:"))
+async def admin_picker_done_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    """Selection finished — now choose what to apply to all of them."""
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    action = callback.data.split(":")[1]
+    data = await state.get_data()
+    selected = list(data.get(f"sel_{action}") or [])
+    if not selected:
+        return await callback.answer("Select at least one user first", show_alert=True)
+
+    if action == "grant":
+        rows = [[InlineKeyboardButton(text=f"💎 {plan.name}", callback_data=f"agrant:{key}")]
+                for key, plan in PLANS.items() if key != "free"]
+        rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="apage:grant:0")])
+        await _safe_edit(
+            callback.message,
+            f"🎁 <b>Grant to {len(selected)} user(s)</b>\n\nWhich plan?",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    else:  # reduce — no plan to pick, only an amount
+        rows = [
+            [InlineKeyboardButton(text="7 days", callback_data="aredd:7"),
+             InlineKeyboardButton(text="15 days", callback_data="aredd:15")],
+            [InlineKeyboardButton(text="30 days", callback_data="aredd:30"),
+             InlineKeyboardButton(text="90 days", callback_data="aredd:90")],
+            [InlineKeyboardButton(text="✍️ Custom days", callback_data="aredd:custom")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="apage:reduce:0")],
+        ]
+        await _safe_edit(
+            callback.message,
+            f"➖ <b>Reduce days for {len(selected)} user(s)</b>\n\nHow many days to remove?",
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("agcust:"))
-async def admin_grant_custom_cb(
+async def _selection_summary(db: Database, user_ids: list[int]) -> str:
+    """Numbered list of exactly who is about to be affected, so a bulk action
+    is never applied to a set the admin cannot see."""
+    lines = []
+    for i, uid in enumerate(user_ids, 1):
+        u = await db.get_user(uid)
+        if u is None:
+            lines.append(f"{i}. <code>{uid}</code> — ⚠️ not found")
+            continue
+        name = safe_html(u["first_name"] or u["username"] or uid)
+        handle = f"@{safe_html(u['username'])}" if u["username"] else "no username"
+        plan = str(u["plan"] or "free").title()
+        expiry = u["plan_expiry"].astimezone(IST).strftime("%d %b %Y") if u["plan_expiry"] else "—"
+        lines.append(f"{i}. {name} ({handle}) — {plan}, expires {expiry}")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("agrant:"))
+async def admin_grant_days_cb(
     callback: CallbackQuery, state: FSMContext, settings: Settings,
 ) -> None:
     if not _is_admin(settings, callback.from_user.id):
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None:
         return
-    _, uid_str, plan_key = callback.data.split(":")
+    plan_key = callback.data.split(":")[1]
     if plan_key not in PLANS or plan_key == "free":
         return await callback.answer("Invalid plan", show_alert=True)
-    await state.set_state(AdminGrantStates.waiting_custom_days)
-    await state.update_data(grant_user_id=int(uid_str), grant_plan=plan_key)
+    await state.update_data(grant_plan=plan_key)
+    data = await state.get_data()
+    count = len(list(data.get("sel_grant") or []))
+    rows = [
+        [InlineKeyboardButton(text="7 days", callback_data="agdays:7"),
+         InlineKeyboardButton(text="30 days", callback_data="agdays:30")],
+        [InlineKeyboardButton(text="90 days", callback_data="agdays:90"),
+         InlineKeyboardButton(text="365 days", callback_data="agdays:365")],
+        [InlineKeyboardButton(text="✍️ Custom days", callback_data="agdays:custom")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="adone:grant")],
+    ]
     await _safe_edit(
         callback.message,
-        f"✍️ <b>Enter number of days</b>\n\n"
-        f"Granting <b>{PLANS[plan_key].name}</b> to <code>{uid_str}</code>\n\n"
-        f"Example: <code>2</code>\n\nSend /back to cancel.",
-        None,
+        f"🎁 Granting <b>{PLANS[plan_key].name}</b> to <b>{count}</b> user(s)\n\nFor how long?",
+        InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
 
-@router.message(AdminGrantStates.waiting_custom_days)
-async def admin_grant_custom_apply(
-    message: Message, state: FSMContext, db: Database, settings: Settings,
+@router.callback_query(F.data.startswith("agdays:") | F.data.startswith("aredd:"))
+async def admin_bulk_days_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    """Shows the confirmation with the full list before anything is applied."""
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    prefix, value = callback.data.split(":")
+    mode = "grant" if prefix == "agdays" else "reduce"
+
+    if value == "custom":
+        await state.set_state(AdminGrantStates.waiting_custom_days)
+        await state.update_data(bulk_mode=mode)
+        await _safe_edit(
+            callback.message,
+            "✍️ <b>Enter number of days</b>\n\nExample: <code>2</code>\n\nSend /back to cancel.",
+            None,
+        )
+        return await callback.answer()
+
+    await _show_bulk_confirm(callback.message, state, db, mode, int(value))
+    await callback.answer()
+
+
+async def _show_bulk_confirm(message_obj, state: FSMContext, db: Database, mode: str, days: int) -> None:
+    data = await state.get_data()
+    selected = list(data.get(f"sel_{mode}") or [])
+    if not selected:
+        return await message_obj.answer("⚠️ Nothing selected. Start again.", reply_markup=admin_keyboard())
+    await state.update_data(bulk_days=days, bulk_mode=mode)
+    summary = await _selection_summary(db, selected)
+
+    if mode == "grant":
+        plan_key = str(data.get("grant_plan", ""))
+        head = (
+            f"🎁 <b>Confirm Grant</b>\n\n"
+            f"Plan: <b>{PLANS[plan_key].name}</b> · <b>{days} days</b>\n\n"
+            f"{summary}\n\n"
+            f"These <b>{len(selected)}</b> user(s) will get "
+            f"{PLANS[plan_key].name} for {days} days."
+        )
+    else:
+        head = (
+            f"➖ <b>Confirm Reduce</b>\n\n"
+            f"Removing: <b>{days} days</b>\n\n"
+            f"{summary}\n\n"
+            f"⚠️ Anyone left with 0 days moves to the <b>Free plan</b> immediately."
+        )
+    await _show_or_edit(message_obj, head, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Confirm", callback_data="abulk:go")],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")],
+    ]))
+
+
+async def _show_or_edit(message_obj, text: str, markup) -> None:
+    if hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
+        with suppress(TelegramBadRequest):
+            await message_obj.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            return
+    await message_obj.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "abulk:go")
+async def admin_bulk_apply_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
     forwarding: ForwardingEngine,
 ) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    data = await state.get_data()
+    mode = str(data.get("bulk_mode", "grant"))
+    days = int(data.get("bulk_days", 0))
+    plan_key = str(data.get("grant_plan", ""))
+    selected = list(data.get(f"sel_{mode}") or [])
+    await state.clear()
+
+    if not selected or days <= 0:
+        return await callback.answer("Nothing to apply", show_alert=True)
+
+    done, failed, expired = [], [], []
+    for uid in selected:
+        try:
+            if mode == "grant":
+                ok = await db.set_plan(uid, plan_key, days)
+                if not ok:
+                    failed.append(uid)
+                    continue
+            else:
+                ok, now_expired = await db.reduce_plan_days(uid, days)
+                if not ok:
+                    failed.append(uid)
+                    continue
+                if now_expired:
+                    expired.append(uid)
+            done.append(uid)
+            with suppress(Exception):
+                await forwarding.refresh_user(uid)
+        except Exception:
+            logger.exception("Bulk %s failed for %s", mode, uid)
+            failed.append(uid)
+
+    # Tell each affected user what changed — a silent plan change is the kind
+    # of thing that turns into a support message.
+    for uid in done:
+        user = await db.get_user(uid)
+        expiry = (
+            user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+            if user and user["plan_expiry"] else "—"
+        )
+        with suppress(Exception):
+            if mode == "grant":
+                await callback.bot.send_message(
+                    uid,
+                    f"🎁 <b>Your plan has been upgraded!</b>\n\n"
+                    f"Plan: <b>{PLANS[plan_key].name}</b>\n"
+                    f"Days added: {days}\n"
+                    f"Valid until: {expiry}\n\nUse /tasks to get started.",
+                    parse_mode="HTML",
+                )
+            elif uid in expired:
+                await callback.bot.send_message(
+                    uid,
+                    safe_t(
+                        language_for(user["preferred_language"]) if user else "en",
+                        "expiry_done", plan="Premium",
+                    ),
+                    parse_mode="HTML",
+                )
+            else:
+                await callback.bot.send_message(
+                    uid,
+                    f"ℹ️ <b>Your plan duration was adjusted</b>\n\n"
+                    f"New expiry: <b>{expiry}</b>\n\nQuestions? Contact support.",
+                    parse_mode="HTML",
+                )
+
+    verb = "Granted" if mode == "grant" else "Reduced"
+    detail = f"{PLANS[plan_key].name} · {days} days" if mode == "grant" else f"{days} days removed"
+    lines = [f"✅ <b>{verb}</b>\n", detail, "", f"👥 Applied to: <b>{len(done)}</b> user(s)"]
+    if expired:
+        lines.append(f"⬇️ Moved to Free: {len(expired)}")
+    if failed:
+        lines.append(f"⚠️ Failed: {len(failed)} — {', '.join(str(x) for x in failed[:5])}")
+    lines.append(f"\n🕐 {_now_ist()}")
+    await _safe_edit(callback.message, "\n".join(lines), admin_keyboard())
+    await callback.answer(f"{verb} for {len(done)} user(s)")
+
+
+@router.message(AdminGrantStates.waiting_custom_days)
+async def admin_bulk_custom_days(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    """Custom day count for a bulk grant or reduce. Goes to the same
+    confirmation screen as the presets — nothing is applied without it."""
     if not _is_admin(settings, message.from_user.id):
         return
     if not message.text:
@@ -3561,44 +3885,16 @@ async def admin_grant_custom_apply(
         await state.clear()
         return await message.answer("↩️ Cancelled.", reply_markup=admin_keyboard())
     if not raw.isdigit() or int(raw) <= 0:
-        return await message.answer("⚠️ Send a whole number of days, e.g. <code>2</code>", parse_mode="HTML")
-
+        return await message.answer(
+            "⚠️ Send a whole number of days, e.g. <code>2</code>", parse_mode="HTML",
+        )
     days = int(raw)
     if days > 3650:
         return await message.answer("⚠️ That's over 10 years — send a smaller number.")
 
     data = await state.get_data()
-    target_user_id = int(data.get("grant_user_id", 0))
-    plan_key = str(data.get("grant_plan", ""))
-    await state.clear()
-    if plan_key not in PLANS or plan_key == "free" or not target_user_id:
-        return await message.answer("⚠️ Something went wrong, start again from /grantdays")
-
-    if not await db.set_plan(target_user_id, plan_key, days):
-        return await message.answer("⚠️ User not found.", reply_markup=admin_keyboard())
-    with suppress(Exception):
-        await forwarding.refresh_user(target_user_id)
-
-    user = await db.get_user(target_user_id)
-    expiry = (
-        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-        if user and user["plan_expiry"] else "—"
-    )
-    with suppress(Exception):
-        await message.bot.send_message(
-            target_user_id,
-            f"🎁 <b>Your plan has been upgraded!</b>\n\n"
-            f"Plan: <b>{PLANS[plan_key].name}</b>\n"
-            f"Days added: {days}\n"
-            f"Valid until: {expiry}\n\n"
-            f"Use /tasks to get started.",
-            parse_mode="HTML",
-        )
-    await message.answer(
-        f"✅ <b>Granted</b>\n\nUser: <code>{target_user_id}</code>\n"
-        f"Plan: {PLANS[plan_key].name}\nDays: {days}\nNew expiry: {expiry}",
-        reply_markup=admin_keyboard(),
-    )
+    mode = str(data.get("bulk_mode", "grant"))
+    await _show_bulk_confirm(message, state, db, mode, days)
 
 
 @router.callback_query(F.data.startswith("agdays:"))
@@ -3710,6 +4006,125 @@ async def referral_payout_cb(callback: CallbackQuery, db: Database, settings: Se
                 parse_mode="HTML",
             )
     await callback.answer("Paid")
+
+
+# ==========================================
+# /usertasks — every user's tasks, for support
+# ==========================================
+
+async def _render_task_browser(message_obj, db: Database, page: int = 0) -> None:
+    total = await db.count_all_tasks()
+    pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    tasks = await db.list_all_tasks_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
+
+    if not tasks:
+        return await _show_or_edit(message_obj, "📋 No tasks exist yet.", admin_keyboard())
+
+    lines = ["📋 <b>All Tasks</b>", ""]
+    number_row: list[InlineKeyboardButton] = []
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, t_ in enumerate(tasks):
+        number = idx + 1
+        icon = "⏸️" if t_["is_paused"] else "▶️"
+        owner = safe_html(t_["first_name"] or t_["username"] or t_["user_id"])[:18]
+        handle = f"@{safe_html(t_['username'])}" if t_["username"] else "no username"
+        name = safe_html(t_["task_name"])[:26]
+        lines.append(f"{number}. {icon} <b>{name}</b>")
+        lines.append(f"     {owner} ({handle})")
+        number_row.append(InlineKeyboardButton(
+            text=str(number), callback_data=f"tinfo:{page}:{t_['id']}",
+        ))
+        if len(number_row) == 5:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin:tasks:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:tasks:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
+
+    lines.append("")
+    lines.append(f"Page {page + 1} of {pages} · {total} tasks total")
+    lines.append("👆 Tap a number for full details")
+    await _show_or_edit(message_obj, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(Command("usertasks", "alltasks"))
+async def usertasks_command(message: Message, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    await _render_task_browser(message, db, 0)
+
+
+@router.callback_query(F.data.startswith("admin:tasks:"))
+async def admin_tasks_page_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    page = int(callback.data.rsplit(":", 1)[1])
+    await _render_task_browser(callback.message, db, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tinfo:"))
+async def admin_task_info_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    """Same shape as the 'new task created' notification, plus live counters —
+    'last forward 9d ago' is usually the whole answer to a support question."""
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, page, task_id_str = callback.data.split(":")
+    task = await db.get_task(int(task_id_str))
+    if task is None:
+        return await callback.answer("Task not found", show_alert=True)
+
+    owner = await db.get_user(int(task["user_id"]))
+    sources = [x for x in _json_field(task["sources"], []) if isinstance(x, dict)]
+    dests = [x for x in _json_field(task["destinations"], []) if isinstance(x, dict)]
+    src_text = "\n".join(f"   • {_chat_label(i)}" for i in sources) or "   • —"
+    dst_text = "\n".join(f"   • {_chat_label(i)}" for i in dests) or "   • —"
+    created = (
+        task["created_at"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        if task["created_at"] else "—"
+    )
+    count = int(task["forward_count"] or 0)
+    last = _ago(task["last_forward_at"])
+    status = "⏸️ Paused" if task["is_paused"] else "▶️ Active"
+    if task["is_paused"] and task["pause_reason"]:
+        status += f" ({safe_html(task['pause_reason'])})"
+
+    text = (
+        f"📋 <b>Task Details</b>\n\n"
+        f"📝 Task: <b>{safe_html(task['task_name'])}</b>\n"
+        f"🆔 Task ID: <code>{task['id']}</code>\n\n"
+        f"👤 User: {_format_name(owner)}\n"
+        f"🔗 Username: {_handle(owner)}\n"
+        f"🆔 User ID: <code>{task['user_id']}</code>\n"
+        f"💎 Plan: {safe_html(str(owner['plan']).title() if owner else 'Free')}\n\n"
+        f"📥 <b>Sources ({len(sources)}):</b>\n{src_text}\n\n"
+        f"📤 <b>Destinations ({len(dests)}):</b>\n{dst_text}\n\n"
+        f"{status}\n"
+        f"📊 Forwarded: <b>{count:,}</b> · last {last}\n"
+        f"🕐 Created: {created}"
+    )
+    if not task["is_paused"] and not task["last_forward_at"]:
+        text += "\n\n⚠️ This task has never forwarded anything — the source is probably wrong."
+
+    await _safe_edit(callback.message, text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 User Info", callback_data=f"admin:uinfo:{task['user_id']}")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data=f"admin:tasks:{page}"),
+         InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")],
+    ]))
+    await callback.answer()
 
 
 # ==========================================
