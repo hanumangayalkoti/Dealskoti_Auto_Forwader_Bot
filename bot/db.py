@@ -1116,6 +1116,46 @@ class Database:
             val = await conn.fetchval("SELECT 1 FROM payments WHERE user_id = $1 AND status = 'captured' LIMIT 1", user_id)
             return bool(val)
 
+    async def last_purchase_info(self, user_id: int) -> dict | None:
+        """The most recent successful purchase across ALL payment methods.
+
+        Used on the reduce-days confirmation so an admin can see what the user
+        actually paid before shortening their plan.
+        """
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            card = await conn.fetchrow(
+                """SELECT plan, cycle, payable_amount_paise, amount_paise, created_at
+                   FROM payments WHERE user_id = $1 AND status = 'captured'
+                   ORDER BY id DESC LIMIT 1""",
+                user_id,
+            )
+            manual = await conn.fetchrow(
+                """SELECT plan, cycle, method, amount, created_at
+                   FROM manual_payments WHERE user_id = $1 AND status = 'approved'
+                   ORDER BY id DESC LIMIT 1""",
+                user_id,
+            )
+        best, source = None, None
+        if card and (not manual or card["created_at"] >= manual["created_at"]):
+            best, source = card, "card"
+        elif manual:
+            best, source = manual, "manual"
+        if best is None:
+            return None
+        if source == "card":
+            paise = int(best["payable_amount_paise"] or best["amount_paise"] or 0)
+            return {
+                "plan": str(best["plan"]), "cycle": str(best["cycle"]),
+                "method": "UPI / Card", "amount": f"₹{paise / 100:.2f}",
+                "when": best["created_at"],
+            }
+        return {
+            "plan": str(best["plan"]), "cycle": str(best["cycle"]),
+            "method": str(best["method"]).upper(), "amount": str(best["amount"]),
+            "when": best["created_at"],
+        }
+
     async def get_last_captured_payment(self, user_id: int) -> asyncpg.Record | None:
         if self.pool is None: return None
         async with self.pool.acquire() as conn:
