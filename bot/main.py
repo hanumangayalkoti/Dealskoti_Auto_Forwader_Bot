@@ -29,7 +29,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager, suppress
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -3671,21 +3671,54 @@ async def admin_picker_done_cb(
     await callback.answer()
 
 
-async def _selection_summary(db: Database, user_ids: list[int]) -> str:
-    """Numbered list of exactly who is about to be affected, so a bulk action
-    is never applied to a set the admin cannot see."""
+async def _selection_summary(db: Database, user_ids: list[int], cut_days: int = 0) -> str:
+    """Numbered list of exactly who is about to be affected.
+
+    For a reduce, `cut_days` also shows what each user is LEFT with — so an
+    admin can see who drops to Free before applying it, not after.
+    """
+    now = datetime.now(timezone.utc)
     lines = []
     for i, uid in enumerate(user_ids, 1):
         u = await db.get_user(uid)
         if u is None:
             lines.append(f"{i}. <code>{uid}</code> — ⚠️ not found")
             continue
+
         name = safe_html(u["first_name"] or u["username"] or uid)
         handle = f"@{safe_html(u['username'])}" if u["username"] else "no username"
         plan = str(u["plan"] or "free").title()
-        expiry = u["plan_expiry"].astimezone(IST).strftime("%d %b %Y") if u["plan_expiry"] else "—"
-        lines.append(f"{i}. {name} ({handle}) — {plan}, expires {expiry}")
-    return "\n".join(lines)
+        expiry_raw = u["plan_expiry"]
+
+        if expiry_raw:
+            left = max(0, -(-int((expiry_raw - now).total_seconds()) // 86400))
+            expiry = expiry_raw.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        else:
+            left, expiry = 0, "—"
+
+        lines.append(f"{i}. <b>{name}</b> ({handle})")
+        lines.append(f"     💎 {plan} · {left} day{'s' if left != 1 else ''} left")
+        lines.append(f"     📅 Expires: {expiry}")
+
+        purchase = await db.last_purchase_info(uid)
+        if purchase:
+            bought = purchase["when"].astimezone(IST).strftime("%d %b %Y") if purchase["when"] else "—"
+            lines.append(
+                f"     💳 Bought: {bought} · {safe_html(purchase['method'])} "
+                f"({safe_html(purchase['amount'])})"
+            )
+        elif plan.lower() != "free":
+            lines.append("     💳 Granted by admin (no payment)")
+
+        if cut_days:
+            remaining = left - cut_days
+            if remaining <= 0:
+                lines.append("     ➖ After: <b>⚠️ moves to Free plan</b>")
+            else:
+                new_date = (expiry_raw - timedelta(days=cut_days)).astimezone(IST).strftime("%d %b %Y")
+                lines.append(f"     ➖ After: <b>{remaining} days left</b> ({new_date})")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 @router.callback_query(F.data.startswith("agrant:"))
@@ -3750,7 +3783,7 @@ async def _show_bulk_confirm(message_obj, state: FSMContext, db: Database, mode:
     if not selected:
         return await message_obj.answer("⚠️ Nothing selected. Start again.", reply_markup=admin_keyboard())
     await state.update_data(bulk_days=days, bulk_mode=mode)
-    summary = await _selection_summary(db, selected)
+    summary = await _selection_summary(db, selected, cut_days=days if mode == "reduce" else 0)
 
     if mode == "grant":
         plan_key = str(data.get("grant_plan", ""))
@@ -3823,9 +3856,11 @@ async def admin_bulk_apply_cb(
             logger.exception("Bulk %s failed for %s", mode, uid)
             failed.append(uid)
 
-    # Tell each affected user what changed — a silent plan change is the kind
-    # of thing that turns into a support message.
+    # Grants are announced; reductions are not. Only a user who actually lost
+    # their plan is told, because that one is impossible to hide anyway.
     for uid in done:
+        if mode == "reduce" and uid not in expired:
+            continue
         user = await db.get_user(uid)
         expiry = (
             user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
@@ -3842,19 +3877,15 @@ async def admin_bulk_apply_cb(
                     parse_mode="HTML",
                 )
             elif uid in expired:
+                # A shortened plan stays silent, but LOSING the plan cannot:
+                # their extra tasks pause and their limits drop, and without a
+                # word they would assume the bot broke.
                 await callback.bot.send_message(
                     uid,
                     safe_t(
                         language_for(user["preferred_language"]) if user else "en",
                         "expiry_done", plan="Premium",
                     ),
-                    parse_mode="HTML",
-                )
-            else:
-                await callback.bot.send_message(
-                    uid,
-                    f"ℹ️ <b>Your plan duration was adjusted</b>\n\n"
-                    f"New expiry: <b>{expiry}</b>\n\nQuestions? Contact support.",
                     parse_mode="HTML",
                 )
 
