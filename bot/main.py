@@ -4592,10 +4592,12 @@ async def _run(settings: Settings) -> None:
     membership_task = asyncio.create_task(_membership_monitor(bot, db, settings, forwarding))
 
     try:
-        timezone = ZoneInfo(settings.default_timezone)
+        scheduler_tz = ZoneInfo(settings.default_timezone)
     except Exception:
-        timezone = ZoneInfo("UTC")
-    scheduler = AsyncIOScheduler(timezone=timezone)
+        scheduler_tz = ZoneInfo("UTC")
+    # NOT named `timezone`: that shadowed datetime.timezone for every nested
+    # job below, and send_expiry_reminders crashed on timezone.utc every day.
+    scheduler = AsyncIOScheduler(timezone=scheduler_tz)
 
     async def send_weekly_report():
         await _notify_admins(bot, settings, await _weekly_report(db))
@@ -4672,12 +4674,12 @@ async def _run(settings: Settings) -> None:
             if removed:
                 logger.info("Pruned %s stale edit-sync rows", removed)
 
-    scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=timezone), replace_existing=True)
-    scheduler.add_job(send_expiry_reminders, CronTrigger(hour=10, minute=0, timezone=timezone), replace_existing=True)
-    scheduler.add_job(downgrade_expired_plans, CronTrigger(hour="*", minute=5, timezone=timezone), replace_existing=True)
-    scheduler.add_job(send_task_creation_reminders, CronTrigger(minute=15, timezone=timezone), replace_existing=True)
-    scheduler.add_job(prune_edit_sync_map, CronTrigger(hour=4, minute=30, timezone=timezone), replace_existing=True)
-    scheduler.add_job(nightly_backup, CronTrigger(hour=3, minute=0, timezone=timezone), replace_existing=True)
+    scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(send_expiry_reminders, CronTrigger(hour=10, minute=0, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(downgrade_expired_plans, CronTrigger(hour="*", minute=5, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(send_task_creation_reminders, CronTrigger(minute=15, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(prune_edit_sync_map, CronTrigger(hour=4, minute=30, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(nightly_backup, CronTrigger(hour=3, minute=0, timezone=scheduler_tz), replace_existing=True)
     scheduler.start()
 
     forwarding_task = None
