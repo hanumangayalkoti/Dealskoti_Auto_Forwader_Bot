@@ -220,6 +220,118 @@ def extract_mono_spans(text: str, entities) -> list[str]:
     return extract_code_spans(text, entities, CODE_FILTER_MONO)
 
 
+# ==========================================
+# OFFSET-AWARE TEXT EDITING
+# ==========================================
+# Telegram stores formatting (bold, links and CUSTOM/animated emoji) as
+# entities pinned to character positions, not inside the text. A plain string
+# replacement moves every character after it and leaves those positions
+# pointing at the wrong place — which is why an earlier build simply threw the
+# entities away whenever any replacement rule was active, silently stripping
+# premium emoji from the message.
+#
+# _Rich edits the text and the entity positions TOGETHER, so replacements,
+# removals and trims all keep the formatting exactly where it belongs.
+#
+# Entity offsets from Telegram count UTF-16 code units; Python indexes by code
+# point. They differ for every emoji, so offsets are converted on the way in
+# and back out, and all editing happens in Python index space.
+
+
+def _u16_to_py(text: str, offset: int) -> int:
+    """UTF-16 code-unit offset -> Python character index."""
+    if offset <= 0:
+        return 0
+    count = 0
+    for i, ch in enumerate(text):
+        if count >= offset:
+            return i
+        count += 2 if ord(ch) > 0xFFFF else 1
+    return len(text)
+
+
+def _py_to_u16(text: str, index: int) -> int:
+    """Python character index -> UTF-16 code-unit offset."""
+    return len(text[:index].encode("utf-16-le")) // 2
+
+
+class _Rich:
+    """Text plus its entities, editable without breaking either."""
+
+    def __init__(self, text: str, entities=None):
+        self.text = text or ""
+        self.spans: list[list] = []
+        for ent in entities or []:
+            try:
+                start = _u16_to_py(self.text, int(ent.offset))
+                end = _u16_to_py(self.text, int(ent.offset) + int(ent.length))
+            except (TypeError, ValueError):
+                continue
+            if end > start:
+                self.spans.append([ent, start, end])
+
+    def _apply(self, start: int, end: int, replacement: str) -> None:
+        """Replaces text[start:end] and moves every entity position with it."""
+        delta = len(replacement) - (end - start)
+        self.text = self.text[:start] + replacement + self.text[end:]
+
+        def move(pos: int, is_end: bool) -> int:
+            if pos <= start:
+                return pos
+            if pos >= end:
+                return pos + delta
+            # Inside the replaced region: clamp to its edge. An entity wholly
+            # inside is collapsed and dropped below — correct, because the text
+            # it described no longer exists.
+            return start + (len(replacement) if is_end else 0)
+
+        kept = []
+        for span in self.spans:
+            new_start = move(span[1], False)
+            new_end = move(span[2], True)
+            if new_end > new_start:
+                kept.append([span[0], new_start, new_end])
+        self.spans = kept
+
+    def sub(self, pattern: re.Pattern, repl) -> None:
+        """Regex replace. Matches are applied right-to-left so each edit cannot
+        disturb the positions of the ones still to come."""
+        matches = list(pattern.finditer(self.text))
+        for match in reversed(matches):
+            value = repl(match) if callable(repl) else repl
+            self._apply(match.start(), match.end(), value)
+
+    def replace_literal(self, needle: str, value: str) -> None:
+        if not needle:
+            return
+        start = 0
+        found = []
+        while True:
+            idx = self.text.find(needle, start)
+            if idx < 0:
+                break
+            found.append(idx)
+            start = idx + len(needle)
+        for idx in reversed(found):
+            self._apply(idx, idx + len(needle), value)
+
+    def entities(self):
+        """Entities back in Telegram's UTF-16 coordinates, ready to send."""
+        import copy as _copy
+
+        out = []
+        for ent, start, end in self.spans:
+            offset = _py_to_u16(self.text, start)
+            length = _py_to_u16(self.text, end) - offset
+            if length <= 0:
+                continue
+            clone = _copy.copy(ent)
+            clone.offset = offset
+            clone.length = length
+            out.append(clone)
+        return out or None
+
+
 def _shift_entities(entities, shift: int):
     """Returns a copy of the message entities moved along by `shift` units.
 
@@ -562,14 +674,18 @@ class ForwardingEngine:
         pieces.append(buf[cursor:].decode("utf-16-le", errors="ignore"))
         return "".join(pieces)
 
-    def _apply_replacements(self, text: str, settings: dict, plan_name: str) -> str:
-        """Replace Words / Usernames / Links — the user's explicit swaps."""
+    def _apply_replacements(self, rich: "_Rich", settings: dict, plan_name: str) -> None:
+        """Replace Words / Usernames / Links — the user's explicit swaps.
+
+        Edits go through _Rich so entity positions move with the text and
+        premium emoji survive the replacement.
+        """
         if plan_has(plan_name, F_REPLACE_WORDS):
             # "replace" is the legacy key; kept so old tasks keep working.
             for key in ("replace", "replace_words"):
                 for old_word, new_word in _as_dict(settings.get(key)).items():
                     if old_word:
-                        text = text.replace(str(old_word), str(new_word))
+                        rich.replace_literal(str(old_word), str(new_word))
 
         if plan_has(plan_name, F_REPLACE_USERNAMES):
             mapping = _as_dict(settings.get("replace_usernames"))
@@ -583,16 +699,14 @@ class ForwardingEngine:
                     token = match.group(0)
                     return lookup.get(token.lower(), lookup.get(token[1:].lower(), token))
 
-                text = USERNAME_RE.sub(_sub_username, text)
+                rich.sub(USERNAME_RE, _sub_username)
 
         if plan_has(plan_name, F_REPLACE_LINKS):
             for old_link, new_link in _as_dict(settings.get("replace_links")).items():
-                if old_link and str(old_link) in text:
-                    text = text.replace(str(old_link), str(new_link))
+                if old_link:
+                    rich.replace_literal(str(old_link), str(new_link))
 
-        return text
-
-    def _apply_trim(self, text: str, settings: dict, plan_name: str) -> str:
+    def _apply_trim(self, rich: "_Rich", settings: dict, plan_name: str) -> None:
         """Trim Single Words/Lines.
 
         Each entry is removed wherever it appears. If removing it leaves a line
@@ -600,42 +714,46 @@ class ForwardingEngine:
         blank gaps where the trimmed words used to be.
         """
         if not plan_has(plan_name, F_TRIM_WORDS):
-            return text
+            return
         words = [str(w).strip() for w in _as_list(settings.get("trim_words")) if str(w).strip()]
         if not words:
-            return text
+            return
 
         for word in words:
-            text = re.sub(re.escape(word), "", text, flags=re.IGNORECASE)
+            rich.sub(re.compile(re.escape(word), re.IGNORECASE), "")
 
-        kept = []
-        for line in text.split("\n"):
-            if line.strip():
-                kept.append(line.rstrip())
-            elif kept and kept[-1] != "":
-                # Collapse runs of blank lines into a single one.
-                kept.append("")
-        return "\n".join(kept).strip("\n")
+        # Drop lines that are now empty, still keeping entity positions intact.
+        while True:
+            match = re.search(r"\n[ \t]*\n[ \t]*\n", rich.text)
+            if not match:
+                break
+            rich._apply(match.start(), match.end(), "\n\n")
+        rich.sub(re.compile(r"^[ \t]*\n"), "")
 
-    def _apply_removals(self, text: str, settings: dict, plan_name: str) -> str:
+    def _apply_removals(self, rich: "_Rich", settings: dict, plan_name: str) -> None:
         """Remove Usernames / Remove Links — blanket strip toggles.
 
         Runs AFTER replacements, so a user who set up a replacement gets their
         swap applied first. Header/footer are added later and are never touched
         by this, so the user's own handles and links always survive.
         """
+        touched = False
         if plan_has(plan_name, F_REMOVE_USERNAMES) and settings.get("remove_usernames"):
-            text = USERNAME_RE.sub("", text)
+            rich.sub(USERNAME_RE, "")
+            touched = True
 
         if plan_has(plan_name, F_REMOVE_LINKS) and settings.get("remove_links"):
-            text = URL_RE.sub("", text)
+            rich.sub(URL_RE, "")
+            touched = True
 
-        if settings.get("remove_usernames") or settings.get("remove_links"):
-            # Tidy up the double spaces / empty lines the strip leaves behind.
-            text = re.sub(r"[ \t]{2,}", " ", text)
-            text = "\n".join(line.rstrip() for line in text.split("\n"))
-            text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return text
+        if touched:
+            # Tidy up the double spaces and empty lines the strip leaves behind.
+            rich.sub(re.compile(r"[ \t]{2,}"), " ")
+            while True:
+                match = re.search(r"\n[ \t]*\n[ \t]*\n", rich.text)
+                if not match:
+                    break
+                rich._apply(match.start(), match.end(), "\n\n")
 
     def _header_footer_for(self, settings: dict, plan_name: str, dest_raw: int | None) -> tuple[str, str]:
         """Returns (header, footer) for one destination.
@@ -718,67 +836,73 @@ class ForwardingEngine:
         # shifts every offset after it and would smear the formatting onto the
         # wrong words. A header only shifts everything by a fixed amount, which
         # IS computable, so that case is still preserved.
-        entity_shift: int | None = None
+        mode = self.code_filter_for(settings, plan_name)
+        mono = mode != CODE_FILTER_OFF
 
         if mono:
             text = self.code_body(message, mode)
             if not text:
                 return "", None  # no code in the source — skip the message
+            # A code filter rebuilds the body from scratch, so the original
+            # entities describe text that no longer exists.
+            rich = _Rich(text, None)
         else:
             text = base_text or ""
+            entities = getattr(message, "entities", None) if message is not None else None
             if text and plan_has(plan_name, F_HIDDEN_LINKS) and settings.get("disable_hidden_links"):
-                entities = getattr(message, "entities", None) if message is not None else None
+                # Revealing hidden links rewrites the text wholesale, so the
+                # entities cannot follow it.
                 text = self._reveal_hidden_links(text, entities)
+                entities = None
+            rich = _Rich(text, entities)
 
-        body_untouched = not mono
-        if text:
-            before = text
-            text = self._apply_replacements(text, settings, plan_name)
+        if rich.text:
+            self._apply_replacements(rich, settings, plan_name)
             if not mono:
-                # Trim and the blanket Remove Links / Remove Usernames toggles are
-                # deliberately NOT applied to a code the filter just extracted.
-                # A gift code is often a referral link or an @handle, so running
-                # the removals over it would delete the very thing the user asked
-                # for and the message would vanish with no error anywhere.
-                text = self._apply_trim(text, settings, plan_name)
-                text = self._apply_removals(text, settings, plan_name)
-            if text != before:
-                body_untouched = False
+                # Trim and the blanket Remove toggles are deliberately NOT
+                # applied to a code the filter just extracted: a gift code is
+                # often a referral link or an @handle, and stripping it would
+                # delete the very thing the user asked for.
+                self._apply_trim(rich, settings, plan_name)
+                self._apply_removals(rich, settings, plan_name)
 
-        if mono and not text.strip():
-            # Extracted code was blank/whitespace only.
-            return "", None
+        text = rich.text.strip()
+        if mono and not text:
+            return "", None  # extracted code was blank
 
         header, footer = self._header_footer_for(settings, plan_name, dest_raw)
 
         if mono:
             # Always re-sent as monospace, whichever format it came from, so
             # subscribers can tap-to-copy the code in the destination.
-            # Header/footer stay plain, otherwise the user's own branding and
-            # links would become unreadable and unclickable.
             parts = []
             if header:
                 parts.append(html_lib.escape(header))
             parts.append(f"<code>{html_lib.escape(text)}</code>")
             if footer:
                 parts.append(html_lib.escape(footer))
+            self._last_entities = None
             return "\n\n".join(parts), "html"
 
         parts = []
         if header:
             parts.append(header)
-        if text.strip():
+        if text:
             parts.append(text)
         if footer:
             parts.append(footer)
 
-        if body_untouched and text.strip():
-            # Header is prepended with a blank line between, so every original
-            # offset moves by exactly that many UTF-16 units.
-            prefix = f"{header}\n\n" if header else ""
-            entity_shift = len(prefix.encode("utf-16-le")) // 2
+        # Entity offsets are relative to the body, so a header prefix shifts
+        # them all by exactly its length. Everything else was already tracked
+        # by _Rich as the text was edited.
+        shift = 0
+        if header:
+            shift = _py_to_u16(f"{header}\n\n", len(header) + 2)
+        stripped = rich.text.lstrip()
+        if stripped != rich.text:
+            shift -= _py_to_u16(rich.text, len(rich.text) - len(stripped))
+        self._last_entities = _shift_entities(rich.entities(), shift)
 
-        self._last_entity_shift = entity_shift
         return "\n\n".join(parts), None
 
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
@@ -1052,11 +1176,7 @@ class ForwardingEngine:
                         # Carry the source formatting through when it is safe.
                         # This includes CUSTOM (animated) emoji, which live in
                         # the entities and are lost entirely without them.
-                        shift = self._last_entity_shift
-                        if shift is not None:
-                            entities = _shift_entities(
-                                getattr(message, "entities", None), shift,
-                            )
+                        entities = self._last_entities
 
                         payload = media_file
                         if isinstance(payload, io.BytesIO):
