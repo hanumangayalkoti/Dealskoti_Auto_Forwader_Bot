@@ -981,6 +981,52 @@ async def settings_open_cb(
 # SAVING A TYPED VALUE
 # ==========================================
 
+# Rule separators, tried in this order.
+# "=>" is the documented one because it cannot appear inside a URL, while
+# both "=" and "," routinely do: an affiliate link like
+#   amazon.in/dp/X?tag=old-21
+# was being split at "?tag=" and the rule silently came out wrong. "=" is
+# still accepted last so every rule saved before this change keeps working.
+RULE_SEPARATORS = ("=>", "->", "=")
+
+
+def _split_rule(line: str) -> tuple[str, str] | None:
+    for sep in RULE_SEPARATORS:
+        if sep in line:
+            left, right = line.split(sep, 1)
+            if left.strip() and right.strip():
+                return left.strip(), right.strip()
+    return None
+
+
+def _parse_rules(text: str) -> tuple[dict[str, str], bool]:
+    """Parses replacement rules, one per line.
+
+    Falls back to comma-splitting only when the whole input is a single line
+    AND contains no separator-bearing commas — otherwise a replacement whose
+    text legitimately contains a comma ("Hello, world => Namaste, duniya")
+    would be torn in half.
+    """
+    mapping: dict[str, str] = {}
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+
+    if len(lines) == 1 and _split_rule(lines[0]) is None:
+        return {}, False
+
+    if len(lines) == 1:
+        # One line: it may hold several comma-separated rules, but only treat
+        # it that way if EVERY comma-piece is itself a valid rule.
+        pieces = [p for p in lines[0].split(",") if p.strip()]
+        if len(pieces) > 1 and all(_split_rule(p) for p in pieces):
+            lines = pieces
+
+    for line in lines:
+        parsed = _split_rule(line)
+        if parsed:
+            mapping[parsed[0]] = parsed[1]
+    return mapping, bool(mapping)
+
+
 def _parse_value(spec: Spec, text: str) -> tuple[bool, object, str | None]:
     """Parses user input for a spec.
 
@@ -1021,15 +1067,8 @@ def _parse_value(spec: Spec, text: str) -> tuple[bool, object, str | None]:
         return True, number, None
 
     if spec.kind == "map":
-        mapping: dict[str, str] = {}
-        for pair in text.split(","):
-            if "=" not in pair:
-                continue
-            old, new = pair.split("=", 1)
-            old_s, new_s = old.strip(), new.strip()
-            if old_s and new_s:
-                mapping[old_s] = new_s
-        if not mapping:
+        mapping, ok = _parse_rules(text)
+        if not ok:
             return False, None, "setting_invalid_replace"
         return True, mapping, None
 
@@ -1038,9 +1077,12 @@ def _parse_value(spec: Spec, text: str) -> tuple[bool, object, str | None]:
         mapping: dict[str, dict] = {}
         for line in text.splitlines():
             line = line.strip()
-            if not line or "=" not in line:
+            if not line:
                 continue
-            target, rest = line.split("=", 1)
+            parsed = _split_rule(line)
+            if not parsed:
+                continue
+            target, rest = parsed
             target_key = target.strip().lstrip("@")
             if not target_key:
                 continue
