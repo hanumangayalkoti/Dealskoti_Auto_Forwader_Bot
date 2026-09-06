@@ -981,44 +981,52 @@ async def settings_open_cb(
 # SAVING A TYPED VALUE
 # ==========================================
 
-# Rule separators, tried in this order.
-# "=>" is the documented one because it cannot appear inside a URL, while
-# both "=" and "," routinely do: an affiliate link like
-#   amazon.in/dp/X?tag=old-21
-# was being split at "?tag=" and the rule silently came out wrong. "=" is
-# still accepted last so every rule saved before this change keeps working.
-RULE_SEPARATORS = ("=>", "->", "=")
-
-
 def _split_rule(line: str) -> tuple[str, str] | None:
-    for sep in RULE_SEPARATORS:
+    """Splits one rule into (old, new), or None if it is ambiguous.
+
+    "=>" is checked first and always wins, so a link's own "=" (as in
+    "?tag=old-21") is never mistaken for the separator.
+
+    A bare "=" is still accepted for simple rules like "sale=SALE", but ONLY
+    when the line contains exactly one "=". With two or more and no arrow the
+    line is genuinely ambiguous — that is the case that used to be split in
+    the wrong place silently — so it is REJECTED and the user is told to use
+    "=>" instead of being handed a broken rule.
+    """
+    for sep in ("=>", "->"):
         if sep in line:
             left, right = line.split(sep, 1)
             if left.strip() and right.strip():
                 return left.strip(), right.strip()
+
+    if line.count("=") == 1:
+        left, right = line.split("=", 1)
+        if left.strip() and right.strip():
+            return left.strip(), right.strip()
     return None
 
 
 def _parse_rules(text: str) -> tuple[dict[str, str], bool]:
-    """Parses replacement rules, one per line.
+    """Parses replacement rules — one per line, or comma-separated on one line.
 
-    Falls back to comma-splitting only when the whole input is a single line
-    AND contains no separator-bearing commas — otherwise a replacement whose
-    text legitimately contains a comma ("Hello, world => Namaste, duniya")
-    would be torn in half.
+    Comma splitting is only used when EVERY comma-piece is itself a valid
+    rule. Otherwise a replacement whose text legitimately contains a comma
+    ("Hello, world => Namaste, duniya") would be torn in half.
     """
     mapping: dict[str, str] = {}
     lines = [ln for ln in text.splitlines() if ln.strip()]
-
-    if len(lines) == 1 and _split_rule(lines[0]) is None:
+    if not lines:
         return {}, False
 
     if len(lines) == 1:
-        # One line: it may hold several comma-separated rules, but only treat
-        # it that way if EVERY comma-piece is itself a valid rule.
-        pieces = [p for p in lines[0].split(",") if p.strip()]
+        line = lines[0]
+        # Prefer the line as ONE rule; only fall back to comma-splitting if
+        # that fails, or if every comma-piece is independently a valid rule.
+        pieces = [p for p in line.split(",") if p.strip()]
         if len(pieces) > 1 and all(_split_rule(p) for p in pieces):
             lines = pieces
+        elif _split_rule(line) is None:
+            return {}, False
 
     for line in lines:
         parsed = _split_rule(line)
