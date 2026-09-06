@@ -410,11 +410,13 @@ class ForwardingEngine:
                     await client.disconnect()
                 return
 
-            # By default Telethon SILENTLY sleeps through any FloodWait under
-            # 60 seconds and logs nothing at all — the bot simply appears to
-            # stall with no trace anywhere. Lower the threshold so we handle
-            # (and log) it ourselves instead of guessing.
-            client.flood_sleep_threshold = 0
+            # Telethon handles SHORT rate limits itself by sleeping. Setting
+            # this to 0 (as an earlier build did) made every 1-2 second limit
+            # raise instead, which pushed ordinary messages down the degraded
+            # retry path and lost their media and formatting. 20s is the
+            # balance: routine limits are absorbed quietly, anything longer
+            # reaches our own handler and gets logged.
+            client.flood_sleep_threshold = 20
 
             client.add_event_handler(
                 lambda event: self._on_new_message(event, user_id),
@@ -716,7 +718,7 @@ class ForwardingEngine:
         # shifts every offset after it and would smear the formatting onto the
         # wrong words. A header only shifts everything by a fixed amount, which
         # IS computable, so that case is still preserved.
-        self._last_entity_shift = None
+        entity_shift: int | None = None
 
         if mono:
             text = self.code_body(message, mode)
@@ -774,8 +776,9 @@ class ForwardingEngine:
             # Header is prepended with a blank line between, so every original
             # offset moves by exactly that many UTF-16 units.
             prefix = f"{header}\n\n" if header else ""
-            self._last_entity_shift = len(prefix.encode("utf-16-le")) // 2
+            entity_shift = len(prefix.encode("utf-16-le")) // 2
 
+        self._last_entity_shift = entity_shift
         return "\n\n".join(parts), None
 
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
@@ -1024,6 +1027,7 @@ class ForwardingEngine:
             async def _deliver(dest: dict):
                 """Sends one copy. Returns (dest_raw, sent_msg) or None."""
                 nonlocal shared_file_id
+                new_text, parse_mode, entities = "", None, None
                 if dest.get("id") is None:
                     return None
                 dest_raw = raw_peer_id(dest.get("id"))
@@ -1046,8 +1050,9 @@ class ForwardingEngine:
                         if not new_text and media_file is None:
                             return None  # nothing to send (e.g. service message)
                         # Carry the source formatting through when it is safe.
-                        entities = None
-                        shift = getattr(self, "_last_entity_shift", None)
+                        # This includes CUSTOM (animated) emoji, which live in
+                        # the entities and are lost entirely without them.
+                        shift = self._last_entity_shift
                         if shift is not None:
                             entities = _shift_entities(
                                 getattr(message, "entities", None), shift,
@@ -1069,7 +1074,10 @@ class ForwardingEngine:
                         )
                 except errors.FloodWaitError as fw:
                     # Temporary rate limit, NOT a broken destination. Wait it
-                    # out once and retry; only give up if it happens again.
+                    # out once and repeat the EXACT same send — the previous
+                    # build retried with a stripped-down message that dropped
+                    # the media and all formatting, so a rate-limited post
+                    # silently arrived degraded.
                     wait = int(getattr(fw, "seconds", 0) or 0)
                     logger.warning(
                         "FLOODWAIT %ss for user %s task %s dest %s — Telegram is rate limiting",
@@ -1080,13 +1088,26 @@ class ForwardingEngine:
                         return None  # too long to hold a slot for
                     await asyncio.sleep(wait + 1)
                     try:
-                        sent_msg = await client.send_message(
-                            dest_peer,
-                            message=self.build_text(
-                                message, message.message or "", settings, plan_name, dest_raw
-                            )[0],
-                            link_preview=link_preview,
-                        )
+                        if not clean_copy:
+                            forward_kwargs = {}
+                            if source_entity is not None:
+                                forward_kwargs["from_peer"] = source_entity
+                            sent_msg = await client.forward_messages(
+                                dest_peer, message, **forward_kwargs,
+                            )
+                        else:
+                            retry_payload = media_file
+                            if isinstance(retry_payload, io.BytesIO):
+                                retry_payload = io.BytesIO(media_file.getvalue())
+                                retry_payload.name = getattr(media_file, "name", "photo.jpg")
+                            sent_msg = await client.send_message(
+                                dest_peer,
+                                message=new_text,
+                                file=retry_payload,
+                                link_preview=link_preview,
+                                parse_mode=parse_mode,
+                                formatting_entities=entities,
+                            )
                     except Exception as e2:
                         logger.warning(
                             f"Task {task['id']} retry after FloodWait failed for {dest_raw}: {e2}"
