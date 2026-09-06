@@ -72,7 +72,14 @@ from .locales import (
     language_for,
     t,
 )
-from .plans import MIN_WITHDRAWAL_PAISE, PLANS, REFERRAL_RATE, duration_days, format_paise
+from .plans import (
+    MIN_WITHDRAWAL_PAISE,
+    PLANS,
+    REFERRAL_RATE,
+    duration_days,
+    format_paise,
+    plan_rank,
+)
 from .settings_ui import router as settings_router
 from .telethon_service import TelethonService
 
@@ -116,6 +123,12 @@ class PayoutStates(StatesGroup):
 
 class AdminBroadcastStates(StatesGroup):
     waiting_message = State()
+
+
+class BulkStates(StatesGroup):
+    """One-time history transfer: pick a source chat, then a destination."""
+    waiting_source = State()
+    waiting_dest = State()
 
 
 # ==========================================
@@ -349,6 +362,8 @@ FLOW_LABELS: dict[str, str] = {
     "AdminGrantStates:waiting_custom_days": "Grant Days",
     "PayoutStates:waiting_address": "Payment Method",
     "RestoreStates:waiting_confirm": "Database Restore",
+    "BulkStates:waiting_source": "Bulk Transfer",
+    "BulkStates:waiting_dest": "Bulk Transfer",
     "AdminBroadcastStates:waiting_message": "Broadcast",
 }
 
@@ -1988,7 +2003,10 @@ async def picker_callback(
     language = await _language_for_callback(db, callback)
 
     current = await state.get_state()
-    if current not in {TaskStates.waiting_source.state, TaskStates.waiting_destination.state}:
+    bulk_states = {BulkStates.waiting_source.state, BulkStates.waiting_dest.state}
+    if current not in {
+        TaskStates.waiting_source.state, TaskStates.waiting_destination.state,
+    } | bulk_states:
         # Stale keyboard from an earlier, already-finished flow.
         return await callback.answer(safe_t(language, "picker_expired"), show_alert=True)
 
@@ -2002,6 +2020,30 @@ async def picker_callback(
 
     if action == "done":
         field = value if value in {"src", "dst"} else "src"
+
+        if current in bulk_states:
+            # Bulk transfer takes exactly ONE chat per side and has no task to
+            # create, so it gets its own continuation.
+            if current == BulkStates.waiting_source.state:
+                data = await state.get_data()
+                if not (data.get("sources") or []):
+                    return await callback.answer(
+                        safe_t(language, "picker_need_source_toast"), show_alert=True,
+                    )
+                await _bulk_after_source(
+                    callback.message, state, db, telethon, callback.from_user.id, language,
+                )
+            else:
+                data = await state.get_data()
+                if not (data.get("destinations") or []):
+                    return await callback.answer(
+                        safe_t(language, "picker_need_destination_toast"), show_alert=True,
+                    )
+                await _bulk_after_dest(
+                    callback.message, state, db, callback.from_user.id, language,
+                )
+            return await callback.answer()
+
         if field == "src":
             toast = await _finish_sources(
                 callback.message, state, db, telethon, forwarding, callback.from_user.id,
@@ -2141,6 +2183,349 @@ async def task_destination(
     await _finish_destinations(
         message, state, db, telethon, forwarding, settings, message.from_user.id, language,
     )
+
+
+# ==========================================
+# /bulk_transfer — one-time history copy
+# ==========================================
+# Gold and above. Separate from tasks on purpose: this is a one-shot copy of
+# posts that already exist, not an ongoing rule.
+
+BULK_RANGES = {
+    "7": ("Last 7 days", 7, None),
+    "30": ("Last 30 days", 30, None),
+    "90": ("Last 90 days", 90, None),
+    "all": ("Everything", None, None),
+    "500": ("Last 500 messages", None, 500),
+}
+
+
+def _bulk_allowed(plan_name: str) -> bool:
+    # Gold is the floor: the same tier that unlocks the other heavy features.
+    return plan_rank(plan_name) >= plan_rank("gold")
+
+
+def _eta_text(count: int, language: str = "en") -> str:
+    """Honest estimate at the fixed safe pace, rounded up."""
+    seconds = int(count * 1.5)
+    hin = language == "hinglish"
+    if seconds < 90:
+        return "1 minute se kam" if hin else "under a minute"
+    minutes = -(-seconds // 60)
+    if minutes < 60:
+        return f"lagbhag {minutes} minute" if hin else f"about {minutes} minutes"
+    hours = minutes / 60
+    return f"lagbhag {hours:.1f} ghante" if hin else f"about {hours:.1f} hours"
+
+
+def _progress_bar(done: int, total: int, width: int = 14) -> str:
+    if total <= 0:
+        return "░" * width
+    filled = max(0, min(width, int(width * done / total)))
+    return "▓" * filled + "░" * (width - filled)
+
+
+@router.message(Command("bulk_transfer", "transfer"))
+async def bulk_transfer_command(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+    forwarding: ForwardingEngine,
+) -> None:
+    language = await _language_for_message(db, message)
+    user = await db.get_user(message.from_user.id)
+    plan_name = str(user["plan"]) if user else "free"
+
+    if not _bulk_allowed(plan_name):
+        return await message.answer(
+            safe_t(language, "bulk_locked"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+
+    connect_msg = await _require_connected(db, message.from_user.id, language)
+    if connect_msg:
+        return await message.answer(connect_msg, reply_markup=_connect_required_keyboard())
+
+    running = forwarding.transfer_state(message.from_user.id)
+    if running:
+        return await message.answer(
+            safe_t(language, "bulk_busy", sent=running.get("sent", 0)),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏹️ Stop Transfer", callback_data="bulk:stop")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+
+    await message.answer(
+        safe_t(language, "bulk_intro"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Start Transfer", callback_data="bulk:start")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "bulk:start")
+async def bulk_start_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService,
+) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await state.set_state(BulkStates.waiting_source)
+    await state.update_data(bulk_source=None, bulk_dest=None, picker_dialogs=None, sources=[])
+    await _safe_edit(callback.message, safe_t(language, "bulk_pick_source"), None)
+    await _render_chat_picker(
+        callback.message, db, telethon, state, callback.from_user.id, "src", language,
+    )
+    await callback.answer()
+
+
+async def _bulk_after_source(message_obj, state: FSMContext, db: Database,
+                             telethon: TelethonService, user_id: int, language: str) -> None:
+    data = await state.get_data()
+    picked = list(data.get("sources") or [])
+    if not picked:
+        return
+    await state.update_data(
+        bulk_source=picked[0], sources=[], destinations=[], picker_dialogs=None,
+    )
+    await state.set_state(BulkStates.waiting_dest)
+    await message_obj.answer(safe_t(language, "bulk_pick_dest"), parse_mode="HTML")
+    await _render_chat_picker(message_obj, db, telethon, state, user_id, "dst", language)
+
+
+async def _bulk_after_dest(message_obj, state: FSMContext, db: Database,
+                           user_id: int, language: str) -> None:
+    data = await state.get_data()
+    picked = list(data.get("destinations") or [])
+    source = data.get("bulk_source")
+    if not picked or not source:
+        return
+    dest = picked[0]
+    await state.update_data(bulk_dest=dest, destinations=[])
+    await state.set_state(None)
+
+    rows = [
+        [InlineKeyboardButton(text="📆 Last 7 days", callback_data="bulk:range:7"),
+         InlineKeyboardButton(text="📆 Last 30 days", callback_data="bulk:range:30")],
+        [InlineKeyboardButton(text="📆 Last 90 days", callback_data="bulk:range:90"),
+         InlineKeyboardButton(text="🔢 Last 500 msgs", callback_data="bulk:range:500")],
+        [InlineKeyboardButton(text="📚 Everything", callback_data="bulk:range:all")],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
+    ]
+    await message_obj.answer(
+        safe_t(
+            language, "bulk_pick_range",
+            source=safe_html(source.get("title") or source.get("id")),
+            dest=safe_html(dest.get("title") or dest.get("id")),
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("bulk:range:"))
+async def bulk_range_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, forwarding: ForwardingEngine,
+) -> None:
+    if callback.message is None:
+        return
+    key = callback.data.rsplit(":", 1)[1]
+    if key not in BULK_RANGES:
+        return await callback.answer("Invalid option", show_alert=True)
+    label, days, limit = BULK_RANGES[key]
+
+    language = await _language_for_callback(db, callback)
+    data = await state.get_data()
+    source, dest = data.get("bulk_source"), data.get("bulk_dest")
+    if not source or not dest:
+        return await callback.answer("Start again with /bulk_transfer", show_alert=True)
+
+    await _safe_edit(callback.message, "🔍 <b>Counting messages…</b>", None)
+    async with _busy(callback.bot, callback.message.chat.id):
+        count = await forwarding.count_transfer_messages(
+            callback.from_user.id, source, days, limit,
+        )
+
+    if count <= 0:
+        await state.clear()
+        return await _safe_edit(
+            callback.message, safe_t(language, "bulk_empty"), _nav_keyboard(),
+        )
+
+    await state.update_data(bulk_range=key)
+    await _safe_edit(
+        callback.message,
+        safe_t(
+            language, "bulk_confirm",
+            source=safe_html(source.get("title") or source.get("id")),
+            dest=safe_html(dest.get("title") or dest.get("id")),
+            range=label, count=f"{count:,}", eta=_eta_text(count, language),
+        ),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "bulk:go")
+async def bulk_go_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, forwarding: ForwardingEngine,
+) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    data = await state.get_data()
+    source, dest = data.get("bulk_source"), data.get("bulk_dest")
+    key = str(data.get("bulk_range", "30"))
+    await state.clear()
+    if not source or not dest or key not in BULK_RANGES:
+        return await callback.answer("Start again with /bulk_transfer", show_alert=True)
+
+    label, days, limit = BULK_RANGES[key]
+    total = await forwarding.count_transfer_messages(callback.from_user.id, source, days, limit)
+    src_name = safe_html(source.get("title") or source.get("id"))
+    dst_name = safe_html(dest.get("title") or dest.get("id"))
+
+    stop_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏹️ Stop Transfer", callback_data="bulk:stop")],
+    ])
+
+    async def progress(st: dict) -> None:
+        sent = st.get("sent", 0)
+        pct = int(100 * sent / total) if total else 0
+        remaining = max(0, total - sent)
+        with suppress(Exception):
+            await callback.message.edit_text(
+                safe_t(
+                    language, "bulk_running",
+                    bar=_progress_bar(sent, total), percent=pct,
+                    sent=f"{sent:,}", total=f"{total:,}",
+                    skipped=st.get("skipped", 0), eta=_eta_text(remaining, language),
+                ),
+                reply_markup=stop_markup, parse_mode="HTML",
+            )
+
+    await _safe_edit(
+        callback.message,
+        safe_t(
+            language, "bulk_running", bar=_progress_bar(0, total), percent=0,
+            sent="0", total=f"{total:,}", skipped=0, eta=_eta_text(total, language),
+        ),
+        stop_markup,
+    )
+    await callback.answer("Transfer started")
+
+    result = await forwarding.run_bulk_transfer(
+        callback.from_user.id, source, dest, days, limit, progress_cb=progress,
+    )
+
+    if result.get("error") == "already_running":
+        return await _safe_edit(
+            callback.message,
+            safe_t(language, "bulk_busy", sent=result.get("sent", 0)), _nav_keyboard(),
+        )
+    if result.get("error"):
+        return await _safe_edit(
+            callback.message,
+            f"⚠️ <b>Transfer stopped</b>\n\nSent: <b>{result.get('sent', 0)}</b>\n"
+            f"Reason: {safe_html(result.get('error'))}",
+            _nav_keyboard(),
+        )
+
+    key_out = "bulk_stopped" if result.get("cancelled") else "bulk_done"
+    await _safe_edit(
+        callback.message,
+        safe_t(
+            language, key_out, source=src_name, dest=dst_name,
+            sent=f"{result.get('sent', 0):,}", skipped=result.get("skipped", 0),
+            when=_now_ist(),
+        ),
+        _nav_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "bulk:stop")
+async def bulk_stop_cb(callback: CallbackQuery, forwarding: ForwardingEngine) -> None:
+    if forwarding.cancel_transfer(callback.from_user.id):
+        await callback.answer("Stopping… finishing the current message", show_alert=True)
+    else:
+        await callback.answer("No transfer is running", show_alert=True)
+
+
+@router.message(BulkStates.waiting_source)
+async def bulk_source_input(
+    message: Message, state: FSMContext, db: Database, telethon: TelethonService,
+) -> None:
+    """Typed @username or a forwarded message, for the bulk source."""
+    text = _text_or_forwarded_chat_id(message)
+    if not text:
+        return
+    language = await _language_for_message(db, message)
+    if text == "/back":
+        await state.clear()
+        return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
+    if text.isdigit():
+        handled = await _picker_toggle_number(
+            message, state, db, telethon, message.from_user.id, "src", language, int(text),
+        )
+        if handled:
+            return
+        return await message.answer(safe_t(language, "picker_bad_number"), parse_mode="HTML")
+    if text.lower() == "/done":
+        return await _bulk_after_source(
+            message, state, db, telethon, message.from_user.id, language,
+        )
+    if not CHANNEL_INPUT_RE.match(text):
+        return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
+    try:
+        async with _busy(message.bot, message.chat.id):
+            entity = await telethon.validate_for_user(message.from_user.id, text)
+    except ValueError as exc:
+        return await message.answer(f"⚠️ {safe_html(exc)}")
+    if _is_protected(entity):
+        return await message.answer(
+            safe_t(language, "protected_source_blocked",
+                   name=safe_html(entity.get("title") or text)),
+            reply_markup=_protected_block_markup(),
+        )
+    await state.update_data(sources=[entity])
+    await _bulk_after_source(message, state, db, telethon, message.from_user.id, language)
+
+
+@router.message(BulkStates.waiting_dest)
+async def bulk_dest_input(
+    message: Message, state: FSMContext, db: Database, telethon: TelethonService,
+) -> None:
+    text = _text_or_forwarded_chat_id(message)
+    if not text:
+        return
+    language = await _language_for_message(db, message)
+    if text == "/back":
+        await state.clear()
+        return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
+    if text.isdigit():
+        handled = await _picker_toggle_number(
+            message, state, db, telethon, message.from_user.id, "dst", language, int(text),
+        )
+        if handled:
+            return
+        return await message.answer(safe_t(language, "picker_bad_number"), parse_mode="HTML")
+    if text.lower() == "/done":
+        return await _bulk_after_dest(message, state, db, message.from_user.id, language)
+    if not CHANNEL_INPUT_RE.match(text):
+        return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
+    try:
+        async with _busy(message.bot, message.chat.id):
+            entity = await telethon.validate_for_user(message.from_user.id, text)
+    except ValueError as exc:
+        return await message.answer(f"⚠️ {safe_html(exc)}")
+    await state.update_data(destinations=[entity])
+    await _bulk_after_dest(message, state, db, message.from_user.id, language)
 
 
 # ==========================================
@@ -3926,51 +4311,6 @@ async def admin_bulk_custom_days(
     data = await state.get_data()
     mode = str(data.get("bulk_mode", "grant"))
     await _show_bulk_confirm(message, state, db, mode, days)
-
-
-@router.callback_query(F.data.startswith("agdays:"))
-async def admin_grant_apply_cb(
-    callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine,
-) -> None:
-    if not _is_admin(settings, callback.from_user.id):
-        return await callback.answer("Admin only", show_alert=True)
-    if callback.message is None:
-        return
-    _, uid_str, plan_key, days_str = callback.data.split(":")
-    target_user_id, days = int(uid_str), int(days_str)
-    if plan_key not in PLANS or plan_key == "free" or days <= 0:
-        return await callback.answer("Invalid option", show_alert=True)
-
-    if not await db.set_plan(target_user_id, plan_key, days):
-        return await callback.answer("User not found", show_alert=True)
-    with suppress(Exception):
-        await forwarding.refresh_user(target_user_id)
-
-    user = await db.get_user(target_user_id)
-    expiry = (
-        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-        if user and user["plan_expiry"] else "—"
-    )
-    with suppress(Exception):
-        await callback.bot.send_message(
-            target_user_id,
-            f"🎁 <b>Your plan has been upgraded!</b>\n\n"
-            f"Plan: <b>{PLANS[plan_key].name}</b>\n"
-            f"Days added: {days}\n"
-            f"Valid until: {expiry}\n\n"
-            f"Use /tasks to get started.",
-            parse_mode="HTML",
-        )
-    await _safe_edit(
-        callback.message,
-        f"✅ <b>Granted</b>\n\n"
-        f"User: <code>{target_user_id}</code>\n"
-        f"Plan: {PLANS[plan_key].name}\n"
-        f"Days: {days}\n"
-        f"New expiry: {expiry}",
-        admin_keyboard(),
-    )
-    await callback.answer("Granted")
 
 
 @router.message(Command("referralpayout", "payouts"))
