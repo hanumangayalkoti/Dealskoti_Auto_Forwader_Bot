@@ -227,7 +227,7 @@ TRANSLATIONS = {
         "setting_cleared": "✅ <b>{feature}</b> cleared.",
         "setting_invalid_number": "⚠️ Please send a valid number.",
         "setting_invalid_ids": "⚠️ Please send only numeric Telegram IDs or @usernames separated by commas.",
-        "setting_invalid_replace": "⚠️ Invalid format. Use <code>old=new</code> separated by commas.",
+        "setting_invalid_replace": "⚠️ <b>Couldn't read that rule</b>\n\nUse <code>=&gt;</code> between the old and new value, one rule per line:\n\n<code>old =&gt; new</code>\n\nExample with a link:\n<code>amazon.in/dp/X?tag=old-21 =&gt; amazon.in/dp/X?tag=mine-21</code>\n\n💡 Links contain their own <code>=</code> signs, so <code>=&gt;</code> is what tells us where the rule splits.",
         "toggle_on": "✅ <b>{feature}</b> is now <b>ON</b>.",
         "toggle_off": "❌ <b>{feature}</b> is now <b>OFF</b>.",
 
@@ -484,7 +484,7 @@ TRANSLATIONS = {
         "setting_cleared": "✅ <b>{feature}</b> hata diya gaya.",
         "setting_invalid_number": "⚠️ Kripya ek valid number bhejein.",
         "setting_invalid_ids": "⚠️ Kripya sirf numeric Telegram IDs ya @usernames comma se alag karke bhejein.",
-        "setting_invalid_replace": "⚠️ Galat format. <code>purana=naya</code> comma se alag karke bhejein.",
+        "setting_invalid_replace": "⚠️ <b>Ye rule samajh nahi aaya</b>\n\nPurane aur naye value ke beech <code>=&gt;</code> lagayein, har rule nayi line par:\n\n<code>purana =&gt; naya</code>\n\nLink ke saath example:\n<code>amazon.in/dp/X?tag=old-21 =&gt; amazon.in/dp/X?tag=mine-21</code>\n\n💡 Links me khud ke <code>=</code> hote hain, isliye <code>=&gt;</code> se hi pata chalta hai ki rule kahan tootna hai.",
         "toggle_on": "✅ <b>{feature}</b> ab <b>ON</b> hai.",
         "toggle_off": "❌ <b>{feature}</b> ab <b>OFF</b> hai.",
 
