@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from contextlib import suppress
 
 from telethon import TelegramClient, errors, events, functions, types
@@ -332,6 +333,12 @@ class _Rich:
         return out or None
 
 
+async def _async_iter(items):
+    """Wraps a plain list so both transfer paths can use `async for`."""
+    for item in items:
+        yield item
+
+
 def _shift_entities(entities, shift: int):
     """Returns a copy of the message entities moved along by `shift` units.
 
@@ -432,6 +439,8 @@ class ForwardingEngine:
         self._protected_reported: dict[tuple[int, int], bool] = {}
         # Counter surfaced in the logs so rate limiting is measurable, not guessed
         self._floodwaits = 0
+        # user_id -> live bulk-transfer state (progress + cancel flag)
+        self._transfers: dict[int, dict] = {}
         # user_id -> monotonic time before which this account should not send
         # again. Enforced BEFORE taking a lane slot, so a user's own anti-ban
         # delay never consumes shared capacity.
@@ -1729,6 +1738,153 @@ class ForwardingEngine:
             int(stored_file["id"]), asyncio.get_running_loop().time(), True,
         )
         return record
+
+    # ==========================================
+    # BULK TRANSFER (one-time history copy)
+    # ==========================================
+    # Copies a channel's EXISTING posts into another channel. Completely
+    # separate from live forwarding: no task, no task settings, no daily-quota
+    # accounting.
+    #
+    # Deliberately SLOW. Pushing thousands of old messages through an account
+    # in a few minutes is exactly the pattern Telegram rate-limits and
+    # restricts accounts for, so the pace is fixed low and cannot be raised
+    # from the UI. A user's account is worth more than a faster transfer.
+
+    TRANSFER_DELAY = 1.2          # seconds between messages
+    TRANSFER_MEDIA_DELAY = 2.0    # media uploads are heavier, wait longer
+
+    def transfer_state(self, user_id: int) -> dict | None:
+        return self._transfers.get(user_id)
+
+    def cancel_transfer(self, user_id: int) -> bool:
+        state = self._transfers.get(user_id)
+        if not state:
+            return False
+        state["cancel"] = True
+        return True
+
+    async def count_transfer_messages(
+        self, user_id: int, source_ref: dict, since_days: int | None, limit: int | None,
+    ) -> int:
+        """How many messages the chosen range holds, so the confirmation can
+        show a real number and a real time estimate."""
+        client = self.clients.get(user_id)
+        if client is None:
+            return 0
+        peer = await self._resolve_peer(client, user_id, source_ref)
+        if peer is None:
+            return 0
+        try:
+            if limit:
+                total = await client.get_messages(peer, limit=1)
+                return min(int(getattr(total, "total", 0) or 0), limit)
+            if since_days is None:
+                total = await client.get_messages(peer, limit=1)
+                return int(getattr(total, "total", 0) or 0)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+            count = 0
+            async for _ in client.iter_messages(peer, offset_date=cutoff, reverse=True):
+                count += 1
+                if count >= 50000:
+                    break
+            return count
+        except Exception as exc:
+            logger.warning("Could not count transfer messages for %s: %s", user_id, exc)
+            return 0
+
+    async def run_bulk_transfer(
+        self, user_id: int, source_ref: dict, dest_ref: dict,
+        since_days: int | None, limit: int | None, progress_cb=None,
+    ) -> dict:
+        """Runs the copy. Returns a result summary.
+
+        Only ONE transfer per user at a time — several at once from the same
+        account is the fastest way to get it rate-limited.
+        """
+        if user_id in self._transfers:
+            return {"error": "already_running"}
+
+        client = self.clients.get(user_id)
+        if client is None:
+            return {"error": "not_connected"}
+
+        source = await self._resolve_peer(client, user_id, source_ref)
+        dest = await self._resolve_peer(client, user_id, dest_ref)
+        if source is None or dest is None:
+            return {"error": "peer_unresolved"}
+
+        state = {"cancel": False, "sent": 0, "skipped": 0, "total": 0, "started": True}
+        self._transfers[user_id] = state
+        dest_raw = raw_peer_id(dest_ref.get("id"))
+
+        try:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=since_days)
+                if since_days is not None else None
+            )
+            if limit:
+                # Newest-first, then reversed so the copy reads chronologically
+                # in the destination rather than backwards.
+                batch = await client.get_messages(source, limit=limit)
+                messages = list(reversed(batch))
+                iterator = _async_iter(messages)
+            else:
+                iterator = client.iter_messages(source, offset_date=cutoff, reverse=True)
+
+            async for message in iterator:
+                if state["cancel"]:
+                    break
+                if getattr(message, "action", None) is not None:
+                    state["skipped"] += 1  # service message, cannot be copied
+                    continue
+                text = message.message or ""
+                media = message.media
+                if isinstance(media, MessageMediaWebPage):
+                    media = None
+                if not text and media is None:
+                    state["skipped"] += 1
+                    continue
+
+                try:
+                    sent = await client.send_message(
+                        dest,
+                        message=text,
+                        file=media,
+                        formatting_entities=getattr(message, "entities", None) or None,
+                        link_preview=bool(message.web_preview),
+                    )
+                    if sent is not None:
+                        sent_one = sent[0] if isinstance(sent, list) else sent
+                        if dest_raw is not None:
+                            self._remember_send(dest_raw, sent_one.id)
+                    state["sent"] += 1
+                except errors.FloodWaitError as fw:
+                    wait = int(getattr(fw, "seconds", 0) or 0)
+                    logger.warning("Bulk transfer FloodWait %ss for user %s", wait, user_id)
+                    if wait > 600:
+                        state["error"] = f"Telegram asked to wait {wait}s — stopping."
+                        break
+                    await asyncio.sleep(wait + 2)
+                    continue
+                except Exception as exc:
+                    logger.info("Bulk transfer skipped a message for %s: %s", user_id, exc)
+                    state["skipped"] += 1
+
+                await asyncio.sleep(
+                    self.TRANSFER_MEDIA_DELAY if media is not None else self.TRANSFER_DELAY
+                )
+                if progress_cb is not None and state["sent"] % 15 == 0:
+                    with suppress(Exception):
+                        await progress_cb(state)
+        except Exception:
+            logger.exception("Bulk transfer failed for user %s", user_id)
+            state["error"] = "unexpected"
+        finally:
+            self._transfers.pop(user_id, None)
+
+        state["cancelled"] = state["cancel"]
+        return state
 
     # ==========================================
     # HELPERS
