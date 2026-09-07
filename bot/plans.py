@@ -129,6 +129,7 @@ F_PER_TARGET_HF         = "per_target_header_footer"
 F_ANTIBAN               = "antiban_speed"
 F_VIP_SUPPORT           = "vip_support"
 F_FAST_DELIVERY         = "fast_delivery"
+F_BULK_DELETE           = "bulk_delete"           # wipe a chat's history
 
 
 # ==========================================
@@ -165,6 +166,7 @@ _SILVER_ADDS: set[str] = {
 }
 
 _GOLD_ADDS: set[str] = {
+    F_BULK_DELETE,
     F_AUTO_DELETE,
     F_POST_EDIT_SYNC,
     F_TRIM_WORDS,
@@ -274,6 +276,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Replace Links",
         "Delay Timer Per Target",
         "Topics Forwarding",
+        "Bulk Delete Messages",
         "{daily}",
         "No BOT Watermark",
         "Anti-Ban Speed Forwarding",
@@ -301,6 +304,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Replace Links",
         "Delay Timer Per Target",
         "Topics Forwarding",
+        "Bulk Delete Messages",
         "{daily}",
         "Custom Image Watermark",
         "Watermark Position/Size/Opacity",
