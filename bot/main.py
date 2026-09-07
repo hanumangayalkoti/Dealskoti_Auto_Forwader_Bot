@@ -5,8 +5,9 @@ This file owns: onboarding, the channel gate, login, tasks, the chat picker,
 file upload, admin tools, the Razorpay webhook and the process bootstrap.
 
 Two large areas live in their own modules and are wired in as routers:
-  * settings_ui.py  — the whole /settings tree (27 per-task features)
-  * billing_ui.py   — plans, Razorpay / USDT / Stars, admin payment review
+  * settings_ui.py    — the whole /settings tree (27 per-task features)
+  * billing_ui.py     — plans, Razorpay / USDT / Stars, admin payment review
+  * bulk_delete_ui.py — /bulk_delete, the one irreversible operation
 
 Router order matters. settings_ui and billing_ui are included FIRST so their
 callbacks are matched before this module's catch-all message fallback.
@@ -59,6 +60,8 @@ import uvicorn
 
 from .billing import BillingError, RazorpayBilling
 from .billing_ui import router as billing_router
+from .bulk_delete_ui import job_state as bulk_delete_state
+from .bulk_delete_ui import router as bulk_delete_router
 from .config import ConfigurationError, Settings
 from .db import Database
 from .faq import FAQS
@@ -364,6 +367,7 @@ FLOW_LABELS: dict[str, str] = {
     "RestoreStates:waiting_confirm": "Database Restore",
     "BulkStates:waiting_source": "Bulk Transfer",
     "BulkStates:waiting_dest": "Bulk Transfer",
+    "BulkDeleteStates:waiting_confirm": "Bulk Delete",
     "AdminBroadcastStates:waiting_message": "Broadcast",
 }
 
@@ -2246,6 +2250,17 @@ async def bulk_transfer_command(
     connect_msg = await _require_connected(db, message.from_user.id, language)
     if connect_msg:
         return await message.answer(connect_msg, reply_markup=_connect_required_keyboard())
+
+    deleting = bulk_delete_state(message.from_user.id)
+    if deleting:
+        # Both jobs hammer the same Telegram account; running them together is
+        # the fastest way to get that account rate-limited.
+        return await message.answer(
+            safe_t(language, "bd_busy", deleted=f"{deleting.get('deleted', 0):,}"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
 
     running = forwarding.transfer_state(message.from_user.id)
     if running:
@@ -4901,6 +4916,7 @@ async def _run(settings: Settings) -> None:
     # whose catch-all message handler would otherwise swallow their input.
     dispatcher.include_router(settings_router)
     dispatcher.include_router(billing_router)
+    dispatcher.include_router(bulk_delete_router)
     dispatcher.include_router(router)
 
     # SAFETY: clear any stale webhook so polling cannot conflict after a restart.
