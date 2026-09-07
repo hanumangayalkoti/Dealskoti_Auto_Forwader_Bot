@@ -1441,6 +1441,14 @@ class ForwardingEngine:
                 if not task or int(task["user_id"]) != user_id:
                     continue
 
+                # A paused task must not deliver ANYTHING, edits included.
+                # Live forwarding already checked this, but edit sync is a
+                # separate path and was missing the check — so pausing a task
+                # stopped new posts while edits to old ones kept going through,
+                # which looked exactly like pause was broken.
+                if task["is_paused"]:
+                    continue
+
                 settings = self._json_field(task["settings"], {})
                 if not self._edit_sync_enabled(settings, plan_name):
                     continue
