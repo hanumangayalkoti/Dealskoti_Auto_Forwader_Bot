@@ -217,7 +217,10 @@ async def plan_details_cb(callback: CallbackQuery, db: Database) -> None:
         return await callback.answer("Invalid plan", show_alert=True)
 
     language = await _lang(db, callback.from_user.id)
-    details = plan_details_text(plan_name)
+    # Feature names come from the database so an admin's renames and channel
+    # links show up here without a redeploy.
+    links = await db.features_map()
+    details = plan_details_text(plan_name, links)
 
     if plan_name == "free":
         await _show(
@@ -229,7 +232,8 @@ async def plan_details_cb(callback: CallbackQuery, db: Database) -> None:
 
     await _show(
         callback.message,
-        safe_t(language, "plan_details", details=details),
+        safe_t(language, "plan_details", details=details)
+        + (safe_t(language, "features_hint") if any(v.get("link") for v in links.values()) else ""),
         cycles_keyboard(plan_name),
     )
     await callback.answer()
