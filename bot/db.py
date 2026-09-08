@@ -1505,6 +1505,14 @@ class Database:
                 )
                 if result.endswith("1"):
                     added += 1
+                else:
+                    # Existing row: refresh ONLY the display order and tier.
+                    # name and link are the admin's and are never overwritten,
+                    # but the ordering is ours to improve between releases.
+                    await conn.execute(
+                        "UPDATE features SET sort_order = $1, tier = $2 WHERE slug = $3",
+                        int(row.get("sort_order", 0)), row["tier"], row["slug"],
+                    )
         return added
 
     async def list_features(self) -> list[asyncpg.Record]:
