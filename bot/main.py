@@ -5217,7 +5217,18 @@ async def _run(settings: Settings) -> None:
         if added:
             logger.info("Seeded %s new features into the catalogue", added)
 
-    bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
+    bot = Bot(
+        settings.telegram_bot_token,
+        default=DefaultBotProperties(
+            parse_mode="HTML",
+            # Feature names are now hyperlinks, and Telegram was rendering a
+            # big preview card of the linked channel post under every plans
+            # screen. Previews are switched off for ALL bot messages: this bot
+            # never wants one, and forwarding uses Telethon, not this Bot, so
+            # forwarded posts are unaffected.
+            link_preview_is_disabled=True,
+        ),
+    )
     telethon = TelethonService(settings, db)
     billing = RazorpayBilling(settings)
 
