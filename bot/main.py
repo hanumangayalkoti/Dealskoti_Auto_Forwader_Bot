@@ -79,6 +79,7 @@ from .plans import (
     MIN_WITHDRAWAL_PAISE,
     PLANS,
     REFERRAL_RATE,
+    FEATURES_PAGE_SIZE,
     TIER_ICON,
     TIER_LABEL,
     all_features_text,
@@ -3664,39 +3665,53 @@ async def feature_unlink_cb(callback: CallbackQuery, db: Database, settings: Set
 # ✨ ALL FEATURES — public list
 # ==========================================
 
-@router.callback_query(F.data == "menu:features")
+def _all_features_markup(page: int, pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"menu:features:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"menu:features:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
+        InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("menu:features"))
 async def all_features_cb(callback: CallbackQuery, db: Database) -> None:
     """Open to everyone, connected or not — this is the shop window."""
     if callback.message is None:
         return
-    features = await db.list_features()
+    parts = callback.data.split(":")
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    features = [dict(f) for f in await db.list_features()]
     if not features:
         return await callback.answer("Features are still loading", show_alert=True)
+    pages = max(1, (len(features) + FEATURES_PAGE_SIZE - 1) // FEATURES_PAGE_SIZE)
     await _safe_edit(
         callback.message,
-        all_features_text([dict(f) for f in features]),
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
-             InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect")],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
-             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
+        all_features_text(features, page),
+        _all_features_markup(page, pages),
     )
     await callback.answer()
 
 
 @router.message(Command("allfeatures"))
 async def all_features_command(message: Message, db: Database) -> None:
-    features = await db.list_features()
+    features = [dict(f) for f in await db.list_features()]
     if not features:
         return await message.answer("Features are still loading, try again in a moment.")
+    pages = max(1, (len(features) + FEATURES_PAGE_SIZE - 1) // FEATURES_PAGE_SIZE)
     await message.answer(
-        all_features_text([dict(f) for f in features]),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
-             InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
+        all_features_text(features, 0), reply_markup=_all_features_markup(0, pages),
     )
 
 
