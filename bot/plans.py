@@ -321,6 +321,49 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
 }
 
 
+# Tier shown next to each feature on the public All Features list.
+TIER_ICON = {"basic": "🥉", "silver": "🥈", "gold": "🥇", "platinum": "💎"}
+TIER_LABEL = {
+    "basic": "Basic & Above", "silver": "Silver & Above",
+    "gold": "Gold & Above", "platinum": "Platinum Only",
+}
+
+
+def feature_slug(name: str) -> str:
+    """Stable id for a feature label.
+
+    Derived from the text so the seed can run repeatedly without creating
+    duplicates. Renaming a feature in the bot changes its NAME, never its
+    slug — which is what keeps the attached link pointing at the right thing.
+    """
+    out = []
+    for ch in name.lower():
+        out.append(ch if ch.isalnum() else "_")
+    return "_".join(part for part in "".join(out).split("_") if part)[:120]
+
+
+def seed_feature_rows() -> list[dict]:
+    """Every feature from the plan trees, with the LOWEST plan that has it.
+
+    Order is basic -> platinum, so the public list reads as a natural upgrade
+    path instead of a jumble.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for tier in ("basic", "silver", "gold", "platinum"):
+        for label in PLAN_FEATURE_TREE.get(tier, []):
+            if label.startswith("{"):
+                continue  # {tasks}/{limits}/{daily} are computed, not features
+            slug = feature_slug(label)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            rows.append({
+                "slug": slug, "name": label, "tier": tier, "sort_order": len(rows),
+            })
+    return rows
+
+
 def daily_label(plan_name: str) -> str:
     plan = PLANS.get(plan_name)
     if plan is None or plan.daily_messages is None:
@@ -346,20 +389,31 @@ def limits_label(plan_name: str) -> str:
     return f"{src} + {dst} per Task"
 
 
-def plan_feature_tree(plan_name: str) -> str:
-    """Renders the ┌─ ├─ └─ feature tree exactly as shown on the plan screen."""
+def plan_feature_tree(plan_name: str, links: dict[str, dict] | None = None) -> str:
+    """Renders the ┌─ ├─ └─ feature tree shown on a plan screen.
+
+    `links` is the admin-managed slug -> {name, link} map. When a feature has
+    a link, its name becomes tappable and opens the channel post explaining it.
+    No tier is shown here: on a plan screen the tier is already obvious.
+    """
     plan_name = (plan_name or "free").lower()
     items = PLAN_FEATURE_TREE.get(plan_name)
     if not items:
         return ""
-    rendered = [
-        item.format(
-            limits=limits_label(plan_name),
-            daily=daily_label(plan_name),
-            tasks=tasks_label(plan_name),
-        )
-        for item in items
-    ]
+    links = links or {}
+    rendered = []
+    for item in items:
+        if item.startswith("{"):
+            rendered.append(item.format(
+                limits=limits_label(plan_name),
+                daily=daily_label(plan_name),
+                tasks=tasks_label(plan_name),
+            ))
+            continue
+        entry = links.get(feature_slug(item))
+        label = (entry or {}).get("name") or item
+        url = (entry or {}).get("link")
+        rendered.append(f'<a href="{url}">{label}</a>' if url else label)
     lines = [f"┌─{rendered[0]}"]
     lines += [f"├─{item}" for item in rendered[1:-1]]
     lines.append(f"└─{rendered[-1]}")
@@ -379,7 +433,32 @@ def plan_price_block(plan_name: str) -> str:
     return "\n".join(lines)
 
 
-def plan_details_text(plan_name: str) -> str:
+def all_features_text(features: list[dict]) -> str:
+    """The public All Features list — every feature, tier icon, tappable name.
+
+    Sorted lowest tier first so a reader's eye travels up the upgrade path.
+    """
+    lines = [
+        "✨ <b>All Features</b>",
+        "",
+        "🥉 Basic  ·  🥈 Silver  ·  🥇 Gold  ·  💎 Platinum",
+        "Tap any blue name to see how it works",
+        "",
+        f"┌─📋 Up to {PLANS['platinum'].tasks} Tasks",
+        f"├─📥 {PLANS['platinum'].sources_per_task} Sources + "
+        f"{PLANS['platinum'].destinations_per_task} Targets per Task",
+    ]
+    for index, row in enumerate(features):
+        branch = "└─" if index == len(features) - 1 else "├─"
+        icon = TIER_ICON.get(str(row["tier"]), "🥈")
+        name = str(row["name"])
+        link = row["link"]
+        label = f'<a href="{link}">{name}</a>' if link else name
+        lines.append(f"{branch}{icon} {label}")
+    return "\n".join(lines)
+
+
+def plan_details_text(plan_name: str, links: dict[str, dict] | None = None) -> str:
     """Full plan detail screen body: title + prices + feature tree."""
     plan_name = (plan_name or "free").lower()
     plan = PLANS.get(plan_name)
@@ -403,7 +482,7 @@ def plan_details_text(plan_name: str) -> str:
         f"💎 <b>{plan.name} Plan</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"{plan_price_block(plan_name)}\n"
-        f"{plan_feature_tree(plan_name)}"
+        f"{plan_feature_tree(plan_name, links)}"
     )
 
 
