@@ -342,13 +342,35 @@ def feature_slug(name: str) -> str:
     return "_".join(part for part in "".join(out).split("_") if part)[:120]
 
 
+# The order the public All Features list is shown in. The strongest selling
+# points come first, because with pagination most people only ever read page 1.
+# Anything not listed here keeps its tier order after these.
+FEATURE_HIGHLIGHTS = [
+    "Auto Forwarding",
+    "Bulk Delete Messages",
+    "Topics Forwarding",
+    "Custom Image Watermark",
+    "Auto Reaction System",
+    "Automatic Post Edit Sync",
+    "Attach Custom File",
+    "Sender Filter",
+    "Replace Links",
+    "Blacklist Keywords",
+    "Custom Header/Footer Per Target",
+    "Delay Timer Per Target",
+    "Mono Text ON/OFF",
+    "Anti-Ban Speed Forwarding",
+    "Media Forwarding",
+]
+
+
 def seed_feature_rows() -> list[dict]:
     """Every feature from the plan trees, with the LOWEST plan that has it.
 
-    Order is basic -> platinum, so the public list reads as a natural upgrade
-    path instead of a jumble.
+    sort_order puts FEATURE_HIGHLIGHTS first, then everything else in tier
+    order, so page 1 of the public list carries the strongest features.
     """
-    rows: list[dict] = []
+    collected: list[dict] = []
     seen: set[str] = set()
     for tier in ("basic", "silver", "gold", "platinum"):
         for label in PLAN_FEATURE_TREE.get(tier, []):
@@ -358,10 +380,13 @@ def seed_feature_rows() -> list[dict]:
             if slug in seen:
                 continue
             seen.add(slug)
-            rows.append({
-                "slug": slug, "name": label, "tier": tier, "sort_order": len(rows),
-            })
-    return rows
+            collected.append({"slug": slug, "name": label, "tier": tier})
+
+    priority = {feature_slug(n): i for i, n in enumerate(FEATURE_HIGHLIGHTS)}
+    collected.sort(key=lambda r: priority.get(r["slug"], 1000 + len(collected)))
+    for index, row in enumerate(collected):
+        row["sort_order"] = index
+    return collected
 
 
 def daily_label(plan_name: str) -> str:
@@ -433,28 +458,44 @@ def plan_price_block(plan_name: str) -> str:
     return "\n".join(lines)
 
 
-def all_features_text(features: list[dict]) -> str:
-    """The public All Features list — every feature, tier icon, tappable name.
+FEATURES_PAGE_SIZE = 10
 
-    Sorted lowest tier first so a reader's eye travels up the upgrade path.
+
+def all_features_text(features: list[dict], page: int = 0) -> str:
+    """One page of the public All Features list.
+
+    Paginated at 10: the full 35-line list was a wall of text that people
+    scrolled past. Features that have a channel link are shown in BOLD so the
+    tappable ones stand out at a glance.
     """
+    pages = max(1, (len(features) + FEATURES_PAGE_SIZE - 1) // FEATURES_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = features[page * FEATURES_PAGE_SIZE:(page + 1) * FEATURES_PAGE_SIZE]
+
     lines = [
         "✨ <b>All Features</b>",
         "",
         "🥉 Basic  ·  🥈 Silver  ·  🥇 Gold  ·  💎 Platinum",
-        "Tap any blue name to see how it works",
+        "👆 Tap any feature to know about it",
         "",
-        f"┌─📋 Up to {PLANS['platinum'].tasks} Tasks",
-        f"├─📥 {PLANS['platinum'].sources_per_task} Sources + "
-        f"{PLANS['platinum'].destinations_per_task} Targets per Task",
     ]
-    for index, row in enumerate(features):
-        branch = "└─" if index == len(features) - 1 else "├─"
+    if page == 0:
+        lines.append(f"┌─📋 Up to {PLANS['platinum'].tasks} Tasks")
+        lines.append(
+            f"├─📥 {PLANS['platinum'].sources_per_task} Sources + "
+            f"{PLANS['platinum'].destinations_per_task} Targets per Task"
+        )
+
+    for index, row in enumerate(chunk):
+        branch = "└─" if index == len(chunk) - 1 else "├─"
         icon = TIER_ICON.get(str(row["tier"]), "🥈")
         name = str(row["name"])
         link = row["link"]
-        label = f'<a href="{link}">{name}</a>' if link else name
+        label = f'<a href="{link}"><b>{name}</b></a>' if link else name
         lines.append(f"{branch}{icon} {label}")
+
+    lines.append("")
+    lines.append(f"Page {page + 1} of {pages} · {len(features)} features")
     return "\n".join(lines)
 
 
