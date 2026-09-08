@@ -202,6 +202,22 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== FEATURE CATALOGUE =====
+-- The marketing feature list lives here, not in code, so an admin can rename
+-- a feature or attach a channel link from inside the bot and have it survive
+-- every redeploy. Seeded once from plans.py; admin edits are never overwritten.
+CREATE TABLE IF NOT EXISTS features (
+    id SERIAL PRIMARY KEY,
+    slug VARCHAR(120) UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    tier VARCHAR(20) NOT NULL,
+    link TEXT,
+    sort_order INTEGER DEFAULT 0,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_features_order ON features (sort_order, id);
+
 -- ===== STATS =====
 -- Per-task counters so /stats can show which task is actually working and
 -- which one has silently stopped. Updated on every successful send.
@@ -1388,6 +1404,9 @@ class Database:
         "users", "sessions", "tasks", "payments", "manual_payments",
         "usdt_payments", "withdrawals", "referrals", "usage_daily",
         "stored_files", "broadcasts",
+        # Included deliberately: without it, a restore would wipe every feature
+        # name and channel link the admin had set up by hand.
+        "features",
     ]
 
     async def export_backup(self) -> dict:
@@ -1461,6 +1480,79 @@ class Database:
                     # No id column on this table — nothing to reset.
                     continue
         return restored
+
+    # ==========================================
+    # FEATURE CATALOGUE
+    # ==========================================
+
+    async def seed_features(self, rows: list[dict]) -> int:
+        """Inserts any feature that is not in the table yet.
+
+        ON CONFLICT DO NOTHING is the whole point: an admin's renamed feature
+        or attached link must survive every deploy, so existing rows are never
+        touched. Only genuinely new features get added.
+        """
+        if self.pool is None or not rows:
+            return 0
+        added = 0
+        async with self.pool.acquire() as conn:
+            for row in rows:
+                result = await conn.execute(
+                    """INSERT INTO features (slug, name, tier, sort_order)
+                       VALUES ($1, $2, $3, $4)
+                       ON CONFLICT (slug) DO NOTHING""",
+                    row["slug"], row["name"], row["tier"], int(row.get("sort_order", 0)),
+                )
+                if result.endswith("1"):
+                    added += 1
+        return added
+
+    async def list_features(self) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT * FROM features ORDER BY sort_order ASC, id ASC",
+            )
+
+    async def get_feature(self, feature_id: int) -> asyncpg.Record | None:
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM features WHERE id = $1", feature_id)
+
+    async def update_feature(
+        self, feature_id: int, name: str | None = None, link: str | None = ...,
+    ) -> bool:
+        """Updates a feature's display name and/or its channel link.
+
+        `link` uses Ellipsis as "leave unchanged" so that passing None can
+        explicitly CLEAR the link — a plain default of None could not tell the
+        two apart.
+        """
+        if self.pool is None: return False
+        sets, args = [], []
+        if name is not None:
+            args.append(name)
+            sets.append(f"name = ${len(args)}")
+        if link is not Ellipsis:
+            args.append(link)
+            sets.append(f"link = ${len(args)}")
+        if not sets:
+            return False
+        args.append(feature_id)
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                f"UPDATE features SET {', '.join(sets)}, updated_at = CURRENT_TIMESTAMP "  # noqa: S608
+                f"WHERE id = ${len(args)}",
+                *args,
+            )
+        return result == "UPDATE 1"
+
+    async def features_map(self) -> dict[str, dict]:
+        """slug -> {name, link} for rendering the plan trees."""
+        out: dict[str, dict] = {}
+        for row in await self.list_features():
+            out[str(row["slug"])] = {"name": row["name"], "link": row["link"]}
+        return out
 
     async def stats(self) -> dict[str, Any]:
         if self.pool is None: return {}
