@@ -79,9 +79,13 @@ from .plans import (
     MIN_WITHDRAWAL_PAISE,
     PLANS,
     REFERRAL_RATE,
+    TIER_ICON,
+    TIER_LABEL,
+    all_features_text,
     duration_days,
     format_paise,
     plan_rank,
+    seed_feature_rows,
 )
 from .settings_ui import router as settings_router
 from .telethon_service import TelethonService
@@ -132,6 +136,11 @@ class BulkStates(StatesGroup):
     """One-time history transfer: pick a source chat, then a destination."""
     waiting_source = State()
     waiting_dest = State()
+
+
+class FeatureStates(StatesGroup):
+    waiting_name = State()
+    waiting_link = State()
 
 
 # ==========================================
@@ -368,6 +377,8 @@ FLOW_LABELS: dict[str, str] = {
     "BulkStates:waiting_source": "Bulk Transfer",
     "BulkStates:waiting_dest": "Bulk Transfer",
     "BulkDeleteStates:waiting_confirm": "Bulk Delete",
+    "FeatureStates:waiting_name": "Editing a Feature",
+    "FeatureStates:waiting_link": "Editing a Feature",
     "AdminBroadcastStates:waiting_message": "Broadcast",
 }
 
@@ -512,6 +523,7 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
         text = safe_t(language, "home_not_connected")
         rows = [
             [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
             [InlineKeyboardButton(text="🔐 Why connect?", callback_data="why:connect")],
             [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
              InlineKeyboardButton(text="❓ How it works", callback_data="faq:page:0")],
@@ -530,6 +542,7 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
         )
         rows = [
             [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create")],
+            [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
             [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
              InlineKeyboardButton(text="👤 Account", callback_data="menu:account")],
             [InlineKeyboardButton(text="❓ Help", callback_data="faq:page:0")],
@@ -3387,6 +3400,307 @@ async def restore_apply(
 
 
 # ==========================================
+# /update_feature — admin feature catalogue
+# ==========================================
+# Feature names and their channel links live in the DATABASE, not in code, so
+# an admin can change them from inside the bot and the change survives every
+# redeploy. plans.py only supplies the ORIGINAL list, once.
+
+FEATURE_PAGE_SIZE = 15
+TG_POST_LINK = re.compile(r"^https?://t\.me/(c/\d+|[A-Za-z0-9_]{3,})/\d+(\?.*)?$")
+
+
+async def _render_feature_list(message_obj, db: Database, language: str, page: int = 0) -> None:
+    features = await db.list_features()
+    if not features:
+        return await _show_or_edit(message_obj, safe_t(language, "feat_none"), admin_keyboard())
+
+    pages = max(1, (len(features) + FEATURE_PAGE_SIZE - 1) // FEATURE_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = features[page * FEATURE_PAGE_SIZE:(page + 1) * FEATURE_PAGE_SIZE]
+    linked = sum(1 for f in features if f["link"])
+
+    lines, rows, number_row = [], [], []
+    for idx, feat in enumerate(chunk):
+        number = idx + 1
+        mark = "✅" if feat["link"] else "⭕"
+        icon = TIER_ICON.get(str(feat["tier"]), "🥈")
+        lines.append(f"{number:2d}. {mark} {icon} {safe_html(feat['name'])}")
+        number_row.append(InlineKeyboardButton(
+            text=str(number), callback_data=f"feat:open:{page}:{feat['id']}",
+        ))
+        if len(number_row) == 5:
+            rows.append(number_row)
+            number_row = []
+    if number_row:
+        rows.append(number_row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"feat:page:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"feat:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
+
+    await _show_or_edit(
+        message_obj,
+        safe_t(
+            language, "feat_list", items="\n".join(lines), page=page + 1,
+            pages=pages, total=len(features), linked=linked,
+        ),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.message(Command("update_feature", "features"))
+async def update_feature_command(message: Message, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    language = await _language_for_message(db, message)
+    await _render_feature_list(message, db, language, 0)
+
+
+@router.callback_query(F.data.startswith("feat:page:"))
+async def feature_page_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await _render_feature_list(callback.message, db, language, int(callback.data.rsplit(":", 1)[1]))
+    await callback.answer()
+
+
+async def _render_feature_detail(
+    message_obj, db: Database, language: str, feature_id: int, page: int,
+) -> None:
+    feat = await db.get_feature(feature_id)
+    if feat is None:
+        return await _show_or_edit(message_obj, "⚠️ Feature not found.", admin_keyboard())
+
+    link = feat["link"]
+    name = safe_html(feat["name"])
+    preview = f'<a href="{link}">{name}</a>' if link else name
+
+    rows = [[
+        InlineKeyboardButton(text="✏️ Edit Name", callback_data=f"feat:name:{page}:{feature_id}"),
+        InlineKeyboardButton(text="🔗 Msg Link", callback_data=f"feat:link:{page}:{feature_id}"),
+    ]]
+    if link:
+        rows.append([InlineKeyboardButton(
+            text="🗑️ Remove Link", callback_data=f"feat:unlink:{page}:{feature_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="◀️ Back", callback_data=f"feat:page:{page}"),
+        InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home"),
+    ])
+
+    await _show_or_edit(
+        message_obj,
+        safe_t(
+            language, "feat_open", name=name,
+            link=safe_html(link) if link else "— not set —",
+            tier=TIER_LABEL.get(str(feat["tier"]), str(feat["tier"]).title()),
+            preview=preview,
+        ),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("feat:open:"))
+async def feature_open_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, _, page, feature_id = callback.data.split(":")
+    language = await _language_for_callback(db, callback)
+    await _render_feature_detail(callback.message, db, language, int(feature_id), int(page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("feat:name:") | F.data.startswith("feat:link:"))
+async def feature_edit_prompt_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, what, page, feature_id = callback.data.split(":")
+    feat = await db.get_feature(int(feature_id))
+    if feat is None:
+        return await callback.answer("Not found", show_alert=True)
+
+    language = await _language_for_callback(db, callback)
+    await state.update_data(feat_id=int(feature_id), feat_page=int(page))
+    if what == "name":
+        await state.set_state(FeatureStates.waiting_name)
+        text = safe_t(language, "feat_name_prompt", name=safe_html(feat["name"]))
+    else:
+        await state.set_state(FeatureStates.waiting_link)
+        text = safe_t(language, "feat_link_prompt", name=safe_html(feat["name"]))
+    await _safe_edit(callback.message, text, None)
+    await callback.answer()
+
+
+@router.message(FeatureStates.waiting_name)
+async def feature_name_input(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, message.from_user.id) or not message.text:
+        return
+    language = await _language_for_message(db, message)
+    raw = message.text.strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer("↩️ Cancelled.", reply_markup=admin_keyboard())
+    if not 2 <= len(raw) <= 80:
+        return await message.answer("⚠️ Name must be 2-80 characters.")
+
+    data = await state.get_data()
+    feat = await db.get_feature(int(data.get("feat_id", 0)))
+    if feat is None:
+        await state.clear()
+        return await message.answer("⚠️ Feature not found.", reply_markup=admin_keyboard())
+
+    await state.update_data(feat_new_name=raw)
+    await message.answer(
+        safe_t(language, "feat_confirm_name", old=safe_html(feat["name"]), new=safe_html(raw)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Save", callback_data="feat:save:name")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="feat:page:0")],
+        ]),
+    )
+
+
+@router.message(FeatureStates.waiting_link)
+async def feature_link_input(
+    message: Message, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, message.from_user.id) or not message.text:
+        return
+    language = await _language_for_message(db, message)
+    raw = message.text.strip()
+    data = await state.get_data()
+    feat = await db.get_feature(int(data.get("feat_id", 0)))
+    if feat is None:
+        await state.clear()
+        return await message.answer("⚠️ Feature not found.", reply_markup=admin_keyboard())
+
+    if raw == "/back":
+        await state.clear()
+        return await message.answer("↩️ Cancelled.", reply_markup=admin_keyboard())
+
+    if raw == "/clear":
+        await db.update_feature(int(feat["id"]), link=None)
+        await state.clear()
+        return await message.answer(
+            safe_t(language, "feat_link_removed", name=safe_html(feat["name"])),
+            reply_markup=admin_keyboard(),
+        )
+
+    # Validate the shape now rather than shipping a dead link to every user.
+    if not TG_POST_LINK.match(raw):
+        return await message.answer(safe_t(language, "feat_bad_link"), parse_mode="HTML")
+
+    await state.update_data(feat_new_link=raw)
+    await message.answer(
+        safe_t(language, "feat_confirm_link",
+               name=safe_html(feat["name"]), link=safe_html(raw)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Save", callback_data="feat:save:link")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="feat:page:0")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("feat:save:"))
+async def feature_save_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    what = callback.data.rsplit(":", 1)[1]
+    data = await state.get_data()
+    feature_id = int(data.get("feat_id", 0))
+    page = int(data.get("feat_page", 0))
+    await state.clear()
+
+    if what == "name":
+        new_name = str(data.get("feat_new_name") or "")
+        if not new_name:
+            return await callback.answer("Nothing to save", show_alert=True)
+        await db.update_feature(feature_id, name=new_name)
+    else:
+        new_link = str(data.get("feat_new_link") or "")
+        if not new_link:
+            return await callback.answer("Nothing to save", show_alert=True)
+        await db.update_feature(feature_id, link=new_link)
+
+    language = await _language_for_callback(db, callback)
+    await _render_feature_detail(callback.message, db, language, feature_id, page)
+    await callback.answer("Saved")
+
+
+@router.callback_query(F.data.startswith("feat:unlink:"))
+async def feature_unlink_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    _, _, page, feature_id = callback.data.split(":")
+    await db.update_feature(int(feature_id), link=None)
+    language = await _language_for_callback(db, callback)
+    await _render_feature_detail(callback.message, db, language, int(feature_id), int(page))
+    await callback.answer("Link removed")
+
+
+# ==========================================
+# ✨ ALL FEATURES — public list
+# ==========================================
+
+@router.callback_query(F.data == "menu:features")
+async def all_features_cb(callback: CallbackQuery, db: Database) -> None:
+    """Open to everyone, connected or not — this is the shop window."""
+    if callback.message is None:
+        return
+    features = await db.list_features()
+    if not features:
+        return await callback.answer("Features are still loading", show_alert=True)
+    await _safe_edit(
+        callback.message,
+        all_features_text([dict(f) for f in features]),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
+             InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(Command("allfeatures"))
+async def all_features_command(message: Message, db: Database) -> None:
+    features = await db.list_features()
+    if not features:
+        return await message.answer("Features are still loading, try again in a moment.")
+    await message.answer(
+        all_features_text([dict(f) for f in features]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
+             InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+
+
+# ==========================================
 # ADMIN
 # ==========================================
 
@@ -4896,6 +5210,12 @@ async def _run(settings: Settings) -> None:
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
     db = Database(settings.database_url)
     await db.connect()
+    # Load any feature that is not in the database yet. Existing rows — and so
+    # every name and link the admin has set — are never touched.
+    with suppress(Exception):
+        added = await db.seed_features(seed_feature_rows())
+        if added:
+            logger.info("Seeded %s new features into the catalogue", added)
 
     bot = Bot(settings.telegram_bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     telethon = TelethonService(settings, db)
