@@ -37,6 +37,7 @@ from telethon.tl.types import (
     MessageEntityCode,
     MessageEntityPre,
     MessageEntitySpoiler,
+    MessageMediaDocument,
     MessageMediaPhoto,
     MessageMediaWebPage,
     PeerChannel,
@@ -337,6 +338,26 @@ async def _async_iter(items):
     """Wraps a plain list so both transfer paths can use `async for`."""
     for item in items:
         yield item
+
+
+def _document_extension(message: Message) -> str:
+    """Lower-case extension of a message's DOCUMENT, or "".
+
+    Only documents count. Photos and videos are never replaced: swapping
+    someone's photo for an APK makes no sense, and matching on extension
+    would be meaningless for them anyway.
+    """
+    media = getattr(message, "media", None)
+    if not isinstance(media, MessageMediaDocument):
+        return ""
+    document = getattr(media, "document", None)
+    if document is None:
+        return ""
+    for attribute in getattr(document, "attributes", []) or []:
+        name = getattr(attribute, "file_name", None)
+        if name and "." in name:
+            return name.rsplit(".", 1)[1].lower()
+    return ""
 
 
 def _shift_entities(entities, shift: int):
@@ -818,8 +839,15 @@ class ForwardingEngine:
         settings: dict,
         plan_name: str,
         dest_raw: int | None = None,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, list | None]:
         """Runs the full text pipeline for ONE destination.
+
+        Returns (text, parse_mode, entities). The entities are RETURNED rather
+        than stashed on self: destinations are rendered in parallel, and with
+        per-target headers each one produces DIFFERENT offsets. Sharing one
+        attribute meant two coroutines could overwrite each other's entities
+        between build and send, which is how premium emoji ended up missing or
+        on the wrong word.
 
         Returns (text, parse_mode). parse_mode is "html" only when Mono Text is
         on, because that is the one case where we inject markup ourselves.
@@ -851,7 +879,7 @@ class ForwardingEngine:
         if mono:
             text = self.code_body(message, mode)
             if not text:
-                return "", None  # no code in the source — skip the message
+                return "", None, None  # no code in the source — skip it
             # A code filter rebuilds the body from scratch, so the original
             # entities describe text that no longer exists.
             rich = _Rich(text, None)
@@ -877,7 +905,7 @@ class ForwardingEngine:
 
         text = rich.text.strip()
         if mono and not text:
-            return "", None  # extracted code was blank
+            return "", None, None  # extracted code was blank
 
         header, footer = self._header_footer_for(settings, plan_name, dest_raw)
 
@@ -890,8 +918,7 @@ class ForwardingEngine:
             parts.append(f"<code>{html_lib.escape(text)}</code>")
             if footer:
                 parts.append(html_lib.escape(footer))
-            self._last_entities = None
-            return "\n\n".join(parts), "html"
+            return "\n\n".join(parts), "html", None
 
         parts = []
         if header:
@@ -910,13 +937,11 @@ class ForwardingEngine:
         stripped = rich.text.lstrip()
         if stripped != rich.text:
             shift -= _py_to_u16(rich.text, len(rich.text) - len(stripped))
-        self._last_entities = _shift_entities(rich.entities(), shift)
-
-        return "\n\n".join(parts), None
+        return "\n\n".join(parts), None, _shift_entities(rich.entities(), shift)
 
     def _clean_text(self, text: str, settings: dict, plan_name: str) -> str:
         """Backwards-compatible wrapper kept for any older call sites."""
-        built, _ = self.build_text(None, text, settings, plan_name)
+        built, _mode, _ents = self.build_text(None, text, settings, plan_name)
         return built
 
     # ==========================================
@@ -1114,7 +1139,15 @@ class ForwardingEngine:
             if mono_on and not self.code_body(message, code_mode):
                 continue
 
+            # Replace File: swap the source's document for the user's own when
+            # the extensions match. Previously this ATTACHED the file after
+            # every single message, so a plain "Hi" was followed by a file —
+            # which users read as spam, correctly.
             stored_file = await self._resolve_stored_file(user_id, settings, plan_name)
+            replacement_file = None
+            if stored_file is not None and _document_extension(message):
+                if _document_extension(message) == str(stored_file["extension"] or "").lower():
+                    replacement_file = stored_file
             # With the code filter on the user wants the code only, so media is
             # deliberately dropped rather than sent alongside it.
             media_file = (
@@ -1141,6 +1174,9 @@ class ForwardingEngine:
             # Free plan uses a native forward, which keeps the "Forwarded from"
             # tag. Every paid tier gets a clean copy — that IS "No BOT Watermark".
             clean_copy = plan_has(plan_name, F_NO_WATERMARK)
+            if replacement_file is not None and not clean_copy:
+                # A native forward carries the ORIGINAL file and cannot swap it.
+                replacement_file = None
 
             # Daily cap is applied UP FRONT so the parallel path can never
             # overshoot it mid-flight.
@@ -1150,16 +1186,11 @@ class ForwardingEngine:
                     continue
                 destinations = destinations[:remaining]
 
-            # The stored file is uploaded ONCE; every later destination reuses
-            # the returned file_id. Re-uploading the same file per destination
-            # meant a 5 MB attachment was sent 50 times for one post.
-            shared_file_id = None
             edit_rows: list[tuple] = []
             results: list[tuple[int, object]] = []
 
             async def _deliver(dest: dict):
                 """Sends one copy. Returns (dest_raw, sent_msg) or None."""
-                nonlocal shared_file_id
                 new_text, parse_mode, entities = "", None, None
                 if dest.get("id") is None:
                     return None
@@ -1177,17 +1208,20 @@ class ForwardingEngine:
                             forward_kwargs["from_peer"] = source_entity
                         sent_msg = await client.forward_messages(dest_peer, message, **forward_kwargs)
                     else:
-                        new_text, parse_mode = self.build_text(
+                        # Entities come back with the text, so this
+                        # destination's formatting can never be mixed up with
+                        # another destination's.
+                        new_text, parse_mode, entities = self.build_text(
                             message, message.message or "", settings, plan_name, dest_raw
                         )
                         if not new_text and media_file is None:
                             return None  # nothing to send (e.g. service message)
-                        # Carry the source formatting through when it is safe.
-                        # This includes CUSTOM (animated) emoji, which live in
-                        # the entities and are lost entirely without them.
-                        entities = self._last_entities
 
                         payload = media_file
+                        if replacement_file is not None:
+                            # The user's own file goes out instead of the
+                            # source's, with the original caption untouched.
+                            payload = str(replacement_file["local_path"])
                         if isinstance(payload, io.BytesIO):
                             # A BytesIO can only be read once, so each parallel
                             # send needs its own view of the same bytes.
@@ -1291,17 +1325,6 @@ class ForwardingEngine:
                 fail_key = (int(task["id"]), dest_raw)
                 self._dest_failures.pop(fail_key, None)
                 self._dest_reported.discard(fail_key)
-
-                # Attach Custom File — upload once, then reuse the file_id.
-                if stored_file is not None:
-                    with suppress(Exception):
-                        to_send = shared_file_id or str(stored_file["local_path"])
-                        extra = await client.send_file(dest_peer, to_send)
-                        if extra is not None:
-                            extra_msg = extra[0] if isinstance(extra, list) else extra
-                            self._remember_send(dest_raw, extra_msg.id)
-                            if shared_file_id is None and getattr(extra_msg, "media", None):
-                                shared_file_id = extra_msg.media
 
                 # Auto Delete and Auto Reaction are fire-and-forget. Awaiting a
                 # reaction added a full round-trip to EVERY destination for
@@ -1469,7 +1492,7 @@ class ForwardingEngine:
                     if dest_peer is None:
                         continue
 
-                    new_text, parse_mode = self.build_text(
+                    new_text, parse_mode, _edit_entities = self.build_text(
                         message, message.message or "", settings, plan_name, dest_raw
                     )
                     # Empty means the code filter found nothing in the edited
@@ -1481,6 +1504,7 @@ class ForwardingEngine:
                         await client.edit_message(
                             dest_peer, int(row["dest_message_id"]),
                             text=new_text, parse_mode=parse_mode,
+                            formatting_entities=_edit_entities,
                         )
                     except Exception as e:
                         # Telegram refuses edits older than 48h and rejects
