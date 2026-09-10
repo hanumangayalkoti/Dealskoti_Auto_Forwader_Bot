@@ -144,7 +144,7 @@ TRANSLATIONS = {
         "task_name": "📝 <b>New Task: Name</b>\n\nSend a short, recognizable name for this task (e.g. <code>Amazon Deals</code>):",
         "task_source": "📥 <b>New Task: Source Chat</b>\n\nForward a message from the Source chat, or send its public username/ID.\n\nYou can add multiple sources. Send <code>/done</code> when finished.",
         "task_destination": "📤 <b>New Task: Destination Chat</b>\n\nForward a message from the Destination chat, or send its public username/ID.\n\nYou can add multiple destinations. Send <code>/done</code> when finished.",
-        "task_created": "✅ Task <b>{task_name}</b> has been created successfully!\n\nYou can now configure its settings or resume it from the Tasks menu.",
+        "task_created": "✅ <b>Task Created Successfully!</b>\n\n📝 Name: <b>{task_name}</b>\n\n📥 <b>Sources ({src_count}):</b>\n{sources}\n\n📤 <b>Destinations ({dst_count}):</b>\n{destinations}\n\n▶️ Status: <b>Active</b> — forwarding starts now\n🕐 Created: {when}\n\n💡 Open Settings to add a header, filters or a watermark.",
         "task_creation_reminder": "👋 <b>Create your forwarding task</b>\n\nYou started the bot but haven't created a task yet. Create one and start forwarding.\n\nIf anything is unclear, ask the Support bot: {support}",
         "task_renamed": "✅ Task renamed to <b>{name}</b>.",
         "task_rename_prompt": "✏️ Send a new name for this task (max 120 characters).",
@@ -181,7 +181,7 @@ TRANSLATIONS = {
         "invalid_channel_format": "⚠️ Invalid format. Please send the channel in one of these formats:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
 
         # ---------- SETTINGS: NAVIGATION ----------
-        "flow_cancelled": "↩️ <b>Cancelled: {flow}</b>\n\n{hint}\nThat step has been cancelled — carrying on with your new command below 👇",
+        "flow_cancelled": "↩️ <b>Cancelled: {flow}</b>\n\n{hint}\nThat step was left unfinished, so it has been cancelled and cleared away.\n\nCarrying on with your new command below 👇",
         "home_first_time": "🎉 <b>Welcome to DealsKoti Auto Forwarder!</b>\n\nCopy posts from any channel to yours — automatically, 24/7.",
         "home_not_connected": "🏠 <b>Main Menu</b>\n\n🔌 Account: <b>not connected</b>\n\nConnect your Telegram account to create tasks and start forwarding.",
         "home_no_tasks": "🏠 <b>Main Menu</b>\n\n👤 {who}\n💎 Plan: <b>{plan}</b>\n📋 Tasks: none yet\n\n👉 Create your first task to start forwarding.",
@@ -433,7 +433,7 @@ TRANSLATIONS = {
         "task_name": "📝 <b>Naya Task: Naam</b>\n\nIs task ko pehchanne ke liye ek chota naam bhejein (jaise: <code>Amazon Deals</code>):",
         "task_source": "📥 <b>Naya Task: Source Chat (Jahan se aayega)</b>\n\nSource chat se koi bhi message yahan forward karein, ya uska Username/ID bhejein.\n\nAap ek se zyada source add kar sakte hain. Ho jaye to <code>/done</code> bhejein.",
         "task_destination": "📤 <b>Naya Task: Destination Chat (Jahan bhejna hai)</b>\n\nDestination chat se koi bhi message yahan forward karein, ya uska Username/ID bhejein.\n\nAap ek se zyada destination add kar sakte hain. Ho jaye to <code>/done</code> bhejein.",
-        "task_created": "✅ Task <b>{task_name}</b> successfully ban gaya hai!\n\nAb aap Tasks menu se iski settings set kar sakte hain ya isko Resume kar sakte hain.",
+        "task_created": "✅ <b>Task Ban Gaya!</b>\n\n📝 Naam: <b>{task_name}</b>\n\n📥 <b>Sources ({src_count}):</b>\n{sources}\n\n📤 <b>Destinations ({dst_count}):</b>\n{destinations}\n\n▶️ Status: <b>Active</b> — forwarding abhi se chalu\n🕐 Banaya: {when}\n\n💡 Header, filters ya watermark lagane ke liye Settings kholein.",
         "task_creation_reminder": "👋 <b>Apna forwarding task banayein</b>\n\nAapne bot start kiya tha, lekin abhi tak koi task nahi banaya. Task banakar forwarding start karein.\n\nKuch samajh na aaye to Support bot se poochhein: {support}",
         "task_renamed": "✅ Task ka naam <b>{name}</b> ho gaya.",
         "task_rename_prompt": "✏️ Task ke liye naya naam bhejein (max 120 characters).",
@@ -470,7 +470,7 @@ TRANSLATIONS = {
         "invalid_channel_format": "⚠️ Format galat hai. Channel in formats me bhejein:\n• <code>@Dealkoti</code>\n• <code>https://t.me/Dealkoti</code>",
 
         # ---------- SETTINGS: NAVIGATION ----------
-        "flow_cancelled": "↩️ <b>Cancel ho gaya: {flow}</b>\n\n{hint}\nWo step cancel kar diya gaya — ab aapki nayi command chal rahi hai 👇",
+        "flow_cancelled": "↩️ <b>Cancel ho gaya: {flow}</b>\n\n{hint}\nWo step adhoora reh gaya tha, isliye cancel karke hata diya gaya.\n\nAb aapki nayi command chal rahi hai 👇",
         "home_first_time": "🎉 <b>DealsKoti Auto Forwarder me swagat hai!</b>\n\nKisi bhi channel ki posts apne channel me copy karein — apne aap, 24/7.",
         "home_not_connected": "🏠 <b>Main Menu</b>\n\n🔌 Account: <b>connect nahi hai</b>\n\nTask banane aur forwarding shuru karne ke liye apna Telegram account connect karein.",
         "home_no_tasks": "🏠 <b>Main Menu</b>\n\n👤 {who}\n💎 Plan: <b>{plan}</b>\n📋 Tasks: abhi koi nahi\n\n👉 Forwarding shuru karne ke liye pehla task banayein.",
