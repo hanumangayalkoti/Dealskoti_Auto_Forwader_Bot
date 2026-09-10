@@ -256,8 +256,8 @@ _spec("wm_size", "🔎 Watermark Size", CAT_MEDIA, "choice", F_WATERMARK_STYLE,
       "watermark_size_prompt", "medium", tuple(WATERMARK_SIZES.keys()))
 _spec("wm_opacity", "🌫️ Watermark Opacity", CAT_MEDIA, "choice", F_WATERMARK_STYLE,
       "watermark_opacity_prompt", "70", tuple(str(o) for o in WATERMARK_OPACITIES))
-_spec("attach_stored_file", "📎 Attach Custom File", CAT_MEDIA, "toggle", F_ATTACH_FILE,
-      None, False)
+_spec("attach_stored_file", "📎 Replace File", CAT_MEDIA, "toggle", F_ATTACH_FILE,
+      "replace_file_prompt", False, display="Replace File")
 
 # --- Forwarding behaviour ---
 _spec("auto_delete_seconds", "🗑️ Auto Delete Messages", CAT_FORWARDING, "number",
