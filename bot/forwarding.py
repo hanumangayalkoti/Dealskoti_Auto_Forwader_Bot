@@ -449,8 +449,6 @@ class ForwardingEngine:
         self._peer_cache: dict[int, dict[int, object]] = {}
         # Users whose dialog list we already pulled once to warm the entity cache
         self._dialogs_synced: set[int] = set()
-        # user_id -> (stored_file_id, monotonic_check_time, exists)
-        self._stored_file_checks: dict[int, tuple[int, float, bool]] = {}
         # (task_id, dest_raw) -> consecutive failures, so one flaky send does
         # not spam the user but a genuinely broken destination does get flagged
         self._dest_failures: dict[tuple[int, int], int] = {}
@@ -588,7 +586,6 @@ class ForwardingEngine:
                 await client.disconnect()
         self._peer_cache.pop(user_id, None)
         self._dialogs_synced.discard(user_id)
-        self._stored_file_checks.pop(user_id, None)
 
     async def refresh_task(self, task_id: int) -> None:
         """Hot-reloads a user's client if a specific task was updated."""
@@ -1140,14 +1137,20 @@ class ForwardingEngine:
                 continue
 
             # Replace File: swap the source's document for the user's own when
-            # the extensions match. Previously this ATTACHED the file after
-            # every single message, so a plain "Hi" was followed by a file —
-            # which users read as spam, correctly.
-            stored_file = await self._resolve_stored_file(user_id, settings, plan_name)
+            # the extensions match.
+            #
+            # The message is inspected FIRST. Looking up the stored file before
+            # knowing whether the post even has a document meant a plain "Hi"
+            # triggered a database read — and, once a minute, a full MTProto
+            # client handshake — adding seconds to messages that could never
+            # be affected by this feature at all.
             replacement_file = None
-            if stored_file is not None and _document_extension(message):
-                if _document_extension(message) == str(stored_file["extension"] or "").lower():
-                    replacement_file = stored_file
+            source_ext = _document_extension(message)
+            if source_ext:
+                stored_file = await self._resolve_stored_file(user_id, settings, plan_name)
+                if stored_file is not None:
+                    if source_ext == str(stored_file["extension"] or "").lower():
+                        replacement_file = stored_file
             # With the code filter on the user wants the code only, so media is
             # deliberately dropped rather than sent alongside it.
             media_file = (
@@ -1727,26 +1730,16 @@ class ForwardingEngine:
 
         local_path = stored_file["local_path"]
         if local_path and os.path.exists(str(local_path)):
-            check = self._stored_file_checks.get(user_id)
-            now_mono = asyncio.get_running_loop().time()
-            if (
-                check is None
-                or check[0] != int(stored_file["id"])
-                or now_mono - check[1] >= 60
-            ):
-                exists = True
-                if self.bot_token and self.storage_channel_id and stored_file["channel_message_id"]:
-                    exists = await self.telethon.media_exists_big(
-                        self.bot_token,
-                        self.storage_channel_id,
-                        int(stored_file["channel_message_id"]),
-                    )
-                self._stored_file_checks[user_id] = (int(stored_file["id"]), now_mono, exists)
-                if not exists:
-                    with suppress(Exception):
-                        os.remove(str(local_path))
-                    await self.db.update_stored_file_path(user_id, None)
-                    return None
+            # The file is on disk, so it is usable — send it.
+            #
+            # There used to be a "does it still exist in the storage channel?"
+            # check here, running once a minute per user. It built an entire
+            # new MTProto client each time (connect, auth, query, disconnect),
+            # which cost 2-4 SECONDS and was the reason Platinum forwards
+            # stalled. The check bought almost nothing: the local copy is
+            # already proven present, and if the channel copy is ever missing
+            # the restore path below reports it the next time the disk is
+            # wiped. Correctness is unchanged; the stall is gone.
             return stored_file
 
         # Local cache missing — try to restore it from the storage channel.
@@ -1766,9 +1759,6 @@ class ForwardingEngine:
         await self.db.update_stored_file_path(user_id, restored_path)
         record = dict(stored_file)
         record["local_path"] = restored_path
-        self._stored_file_checks[user_id] = (
-            int(stored_file["id"]), asyncio.get_running_loop().time(), True,
-        )
         return record
 
     # ==========================================
