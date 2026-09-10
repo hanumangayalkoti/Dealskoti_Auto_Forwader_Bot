@@ -347,6 +347,108 @@ def language_keyboard() -> InlineKeyboardMarkup:
 
 
 # ==========================================
+# STALE MESSAGE CLEANUP
+# ==========================================
+# Tapping a button on an OLDER menu leaves the newer messages below it
+# orphaned, and the chat turns into a mess. When that happens the messages
+# below the tapped one are removed.
+#
+# Deliberately narrow:
+#   * at most CLEANUP_LOOKAHEAD messages are touched — never a whole history
+#   * only messages the bot has SEEN in this chat, tracked as they are sent
+#   * REPORT-type messages are protected: a "task created", "payment
+#     received" or "deletion complete" message is a record the user may want
+#     to scroll back to, and silently eating it would be worse than the mess
+
+CLEANUP_LOOKAHEAD = 3
+
+# Messages that are records, not UI. These are never cleaned up.
+PROTECTED_MARKERS = (
+    "Task </b>", "has been created", "Payment Successful", "Payment Received",
+    "Deletion Complete", "Transfer Complete", "Backup", "Restore complete",
+    "Granted", "Payout", "Congrats", "Account Connected",
+    "expired", "expires in", "Daily Limit Reached", "Forwarding Problem",
+    "Deleted:", "Sent:",
+)
+
+# chat_id -> [message_id, ...] recently sent by the bot (bounded)
+_recent_bot_msgs: dict[int, list[int]] = {}
+
+
+def _remember_bot_message(chat_id: int, message_id: int) -> None:
+    ids = _recent_bot_msgs.setdefault(chat_id, [])
+    if message_id in ids:
+        return
+    ids.append(message_id)
+    if len(ids) > 40:
+        del ids[:20]
+
+
+def _is_protected_text(text: str | None) -> bool:
+    if not text:
+        return False
+    return any(marker in text for marker in PROTECTED_MARKERS)
+
+
+async def _cleanup_below(callback: CallbackQuery) -> None:
+    """Removes the few messages that sit below the tapped one.
+
+    Best-effort throughout: Telegram refuses deletes older than 48 hours and
+    silently ignores ids that are already gone, and neither should ever
+    surface to the user mid-navigation.
+    """
+    if callback.message is None:
+        return
+    chat_id = callback.message.chat.id
+    tapped_id = callback.message.message_id
+
+    known = _recent_bot_msgs.get(chat_id, [])
+    below = sorted(mid for mid in known if mid > tapped_id)
+    if not below:
+        return
+    # Only act when the user really did scroll up past a couple of messages;
+    # tapping the newest menu should never delete anything.
+    if len(below) > CLEANUP_LOOKAHEAD:
+        below = below[-CLEANUP_LOOKAHEAD:]
+
+    if _is_protected_text(callback.message.html_text or callback.message.text):
+        return
+
+    for mid in below:
+        with suppress(Exception):
+            await callback.bot.delete_message(chat_id, mid)
+        with suppress(ValueError):
+            known.remove(mid)
+
+    # The user's own commands sitting in that range are removed too, otherwise
+    # orphan "/plans" lines are left behind and the chat still looks messy.
+    for offset in range(1, CLEANUP_LOOKAHEAD + 1):
+        candidate = tapped_id + offset
+        if candidate in known:
+            continue
+        with suppress(Exception):
+            await callback.bot.delete_message(chat_id, candidate)
+
+
+class MessageTrackerMiddleware(BaseMiddleware):
+    """Records the ids of messages the bot sends, so cleanup knows what exists.
+
+    Wrapping the Bot's send/edit calls is the only reliable way: handlers send
+    messages from dozens of places and none of them should have to remember to
+    register the id.
+    """
+
+    async def __call__(self, handler, event, data):
+        result = await handler(event, data)
+        with suppress(Exception):
+            if isinstance(result, Message) and result.from_user and result.from_user.is_bot:
+                _remember_bot_message(result.chat.id, result.message_id)
+            if isinstance(event, Message):
+                _remember_bot_message(event.chat.id, event.message_id)
+        return result
+
+
+# ==========================================
 # FLOW INTERRUPTION
 # ==========================================
 # A user halfway through /connect who suddenly sends /plans used to get the
@@ -396,6 +498,16 @@ FLOW_STEP_HINTS: dict[str, str] = {
     "AdminBroadcastStates:waiting_message": "You were writing a broadcast.",
     "PayoutStates:waiting_address": "You were setting your payout address.",
 }
+
+
+class CallbackCleanupMiddleware(BaseMiddleware):
+    """Tidies the chat when a button on an older message is tapped."""
+
+    async def __call__(self, handler, event, data):
+        if isinstance(event, CallbackQuery) and event.message is not None:
+            with suppress(Exception):
+                await _cleanup_below(event)
+        return await handler(event, data)
 
 
 class FlowInterruptMiddleware(BaseMiddleware):
@@ -2805,7 +2917,7 @@ def _config_text(task, plan_name: str, language: str) -> str:
     out.append(f"  ├─ {line('Code Filter', code_mode != CODE_FILTER_OFF, F_MONO_TEXT, code_label)}")
     out.append(f"  ├─ {line('Topics Forwarding', topic_count > 0, F_TOPICS, f' [{topic_count} topics]' if topic_count else ' [All topics]')}")
     out.append(f"  ├─ {line('Image Watermark', bool(settings.get('watermark')), F_WATERMARK_IMAGE)}")
-    out.append(f"  ├─ {line('Attach Custom File', bool(settings.get('attach_stored_file', False)), F_ATTACH_FILE)}")
+    out.append(f"  ├─ {line('Replace File', bool(settings.get('attach_stored_file', False)), F_ATTACH_FILE)}")
     out.append(f"  └─ {line('Auto Reaction', bool(reaction.get('enabled')), F_AUTO_REACTION, f" [{reaction.get('emoji')}]" if reaction.get('enabled') else '')}")
     out.append("")
 
@@ -5258,6 +5370,10 @@ async def _run(settings: Settings) -> None:
     # Outer middleware so it runs BEFORE a handler is chosen — otherwise the
     # state-specific handler would win and swallow the command.
     dispatcher.message.outer_middleware(FlowInterruptMiddleware())
+    # Tracks what the bot sent, and cleans up stale messages when an older
+    # menu is used.
+    dispatcher.message.middleware(MessageTrackerMiddleware())
+    dispatcher.callback_query.outer_middleware(CallbackCleanupMiddleware())
     # ORDER MATTERS: the feature routers must come before the main router,
     # whose catch-all message handler would otherwise swallow their input.
     dispatcher.include_router(settings_router)
