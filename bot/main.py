@@ -361,6 +361,8 @@ def language_keyboard() -> InlineKeyboardMarkup:
 #     to scroll back to, and silently eating it would be worse than the mess
 
 CLEANUP_LOOKAHEAD = 3
+# How many recent bot messages an abandoned flow may clear.
+FLOW_CLEAR_LIMIT = 4
 
 # Messages that are records, not UI. These are never cleaned up.
 PROTECTED_MARKERS = (
@@ -402,17 +404,16 @@ async def _cleanup_below(callback: CallbackQuery) -> None:
     chat_id = callback.message.chat.id
     tapped_id = callback.message.message_id
 
+    # Never clear away a record the user may want to scroll back to.
+    if _is_protected_text(callback.message.html_text or callback.message.text):
+        return
+
     known = _recent_bot_msgs.get(chat_id, [])
     below = sorted(mid for mid in known if mid > tapped_id)
     if not below:
         return
-    # Only act when the user really did scroll up past a couple of messages;
-    # tapping the newest menu should never delete anything.
     if len(below) > CLEANUP_LOOKAHEAD:
         below = below[-CLEANUP_LOOKAHEAD:]
-
-    if _is_protected_text(callback.message.html_text or callback.message.text):
-        return
 
     for mid in below:
         with suppress(Exception):
@@ -420,32 +421,23 @@ async def _cleanup_below(callback: CallbackQuery) -> None:
         with suppress(ValueError):
             known.remove(mid)
 
-    # The user's own commands sitting in that range are removed too, otherwise
-    # orphan "/plans" lines are left behind and the chat still looks messy.
-    for offset in range(1, CLEANUP_LOOKAHEAD + 1):
-        candidate = tapped_id + offset
-        if candidate in known:
-            continue
-        with suppress(Exception):
-            await callback.bot.delete_message(chat_id, candidate)
 
+async def _track_sent_messages(handler, bot: Bot, method):
+    """Session hook: records the id of EVERY message the bot sends.
 
-class MessageTrackerMiddleware(BaseMiddleware):
-    """Records the ids of messages the bot sends, so cleanup knows what exists.
+    This replaces an earlier attempt that read the handler's return value and
+    only listened on message events. It tracked almost nothing, because most
+    screens are sent from CALLBACK handlers and most handlers return None —
+    so the cleanup list stayed empty and cleanup silently never ran.
 
-    Wrapping the Bot's send/edit calls is the only reliable way: handlers send
-    messages from dozens of places and none of them should have to remember to
-    register the id.
+    Hooking the session catches every send and every edit no matter where in
+    the code it came from.
     """
-
-    async def __call__(self, handler, event, data):
-        result = await handler(event, data)
-        with suppress(Exception):
-            if isinstance(result, Message) and result.from_user and result.from_user.is_bot:
-                _remember_bot_message(result.chat.id, result.message_id)
-            if isinstance(event, Message):
-                _remember_bot_message(event.chat.id, event.message_id)
-        return result
+    result = await handler(bot, method)
+    with suppress(Exception):
+        if isinstance(result, Message) and result.chat is not None:
+            _remember_bot_message(result.chat.id, result.message_id)
+    return result
 
 
 # ==========================================
@@ -500,6 +492,34 @@ FLOW_STEP_HINTS: dict[str, str] = {
 }
 
 
+async def _clear_flow_messages(event: Message, state: FSMContext) -> None:
+    """Deletes the bot prompts belonging to an abandoned flow.
+
+    Two sources are used together:
+      * login_msg_ids — the login flow already tracks its own prompts exactly
+      * the recent bot-message list — for every other flow
+
+    Bounded to the last few and protected messages are skipped, so a record
+    like "task created" can never be swept away by an abandoned flow.
+    """
+    chat_id = event.chat.id
+    data = await state.get_data()
+
+    tracked = list(data.get("login_msg_ids") or [])
+    for message_id in tracked:
+        with suppress(Exception):
+            await event.bot.delete_message(chat_id, message_id)
+
+    known = _recent_bot_msgs.get(chat_id, [])
+    for message_id in list(known)[-FLOW_CLEAR_LIMIT:]:
+        if message_id in tracked:
+            continue
+        with suppress(Exception):
+            await event.bot.delete_message(chat_id, message_id)
+        with suppress(ValueError):
+            known.remove(message_id)
+
+
 class CallbackCleanupMiddleware(BaseMiddleware):
     """Tidies the chat when a button on an older message is tapped."""
 
@@ -512,6 +532,11 @@ class CallbackCleanupMiddleware(BaseMiddleware):
 
 class FlowInterruptMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        # The user's own commands are part of the clutter, so they are tracked
+        # too and can be swept up with the rest.
+        if isinstance(event, Message):
+            with suppress(Exception):
+                _remember_bot_message(event.chat.id, event.message_id)
         state: FSMContext | None = data.get("state")
         if state is None or not isinstance(event, Message) or not event.text:
             return await handler(event, data)
@@ -549,6 +574,12 @@ class FlowInterruptMiddleware(BaseMiddleware):
                 user = await db.get_user(event.from_user.id)
                 if user is not None:
                     language = language_for(user["preferred_language"])
+
+        # Remove the abandoned prompts. Leaving them behind meant the chat
+        # filled up with dead "Send your phone number" screens whose buttons
+        # no longer did anything.
+        with suppress(Exception):
+            await _clear_flow_messages(event, state)
 
         hint = FLOW_STEP_HINTS.get(current, "")
         with suppress(Exception):
@@ -2108,7 +2139,11 @@ async def _finish_destinations(
     # The user never sees the raw internal task id — just their own task name.
     await _reply_or_edit(
         message_obj,
-        safe_t(language, "task_created", task_name=safe_html(task_name_value)),
+        safe_t(
+            language, "task_created", task_name=safe_html(task_name_value),
+            src_count=len(source_list), dst_count=len(destinations),
+            sources=source_text, destinations=destination_text, when=_now_ist(),
+        ),
         InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚙️ Configure Settings", callback_data=f"st:task:{task_id}")],
             [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks"),
@@ -5372,8 +5407,10 @@ async def _run(settings: Settings) -> None:
     dispatcher.message.outer_middleware(FlowInterruptMiddleware())
     # Tracks what the bot sent, and cleans up stale messages when an older
     # menu is used.
-    dispatcher.message.middleware(MessageTrackerMiddleware())
     dispatcher.callback_query.outer_middleware(CallbackCleanupMiddleware())
+    # Track every outgoing message at the API layer, so cleanup always knows
+    # what is actually in the chat.
+    bot.session.middleware(_track_sent_messages)
     # ORDER MATTERS: the feature routers must come before the main router,
     # whose catch-all message handler would otherwise swallow their input.
     dispatcher.include_router(settings_router)
