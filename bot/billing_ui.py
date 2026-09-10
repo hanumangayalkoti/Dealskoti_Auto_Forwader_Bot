@@ -29,7 +29,14 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
 
 from .billing import BillingError, RazorpayBilling
 from .config import Settings
@@ -413,41 +420,166 @@ async def pay_usdt_cb(callback: CallbackQuery, db: Database, settings: Settings)
 
 @router.callback_query(F.data.startswith("pay:stars:"))
 async def pay_stars_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    """Native Telegram Stars checkout — instant, no admin approval.
+
+    Telegram collects the payment itself and calls back, so there is no
+    screenshot to verify and nothing to fake. The old flow made the user wait
+    for a manual approval; this activates the plan the moment payment lands.
+    """
     if callback.message is None:
         return
     parts = callback.data.split(":")
     if len(parts) != 4:
         return await callback.answer("Invalid option", show_alert=True)
     plan_name, cycle = parts[2], parts[3]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in CYCLES:
+    if plan_name not in PLANS or plan_name == "free" or cycle not in cycles_for(plan_name):
         return await callback.answer("Invalid option", show_alert=True)
 
     language = await _lang(db, callback.from_user.id)
-    if not settings.stars_enabled:
-        return await callback.answer(safe_t(language, "stars_receiver_missing"), show_alert=True)
     amount = stars_amount(plan_name, cycle)
     if amount <= 0:
         return await callback.answer(safe_t(language, "stars_unavailable"), show_alert=True)
     if not await _prepay_guard(callback, db, settings, language):
         return
 
+    days = duration_days(cycle)
     await _show(
         callback.message,
         safe_t(
-            language, "stars_instructions",
-            plan=PLANS[plan_name].name, cycle=cycle.title(), amount=amount,
-            receiver=safe_html(settings.stars_receiver),
+            language, "stars_intro", plan=PLANS[plan_name].name,
+            cycle=cycle.title(), amount=amount, days=days,
         ),
         InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=safe_t(language, "stars_paid_btn"),
-                callback_data=f"proof:stars:{plan_name}:{cycle}",
-            )],
             [InlineKeyboardButton(text="◀️ Back", callback_data=f"cycle:{plan_name}:{cycle}")],
             [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
     )
+
+    # The payload carries what we need to apply the plan on the callback.
+    await callback.bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=safe_t(language, "stars_invoice_title",
+                     plan=PLANS[plan_name].name, cycle=cycle.title())[:32],
+        description=safe_t(language, "stars_invoice_desc",
+                           plan=PLANS[plan_name].name, days=days)[:255],
+        payload=f"stars:{plan_name}:{cycle}:{callback.from_user.id}",
+        # Stars invoices use the XTR currency and NO provider token.
+        currency="XTR",
+        provider_token="",
+        prices=[LabeledPrice(label=f"{PLANS[plan_name].name} {cycle.title()}", amount=amount)],
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=safe_t(language, "stars_pay_button", amount=amount), pay=True,
+            ),
+        ]]),
+    )
     await callback.answer()
+
+
+@router.pre_checkout_query()
+async def stars_pre_checkout(query: PreCheckoutQuery) -> None:
+    """Telegram's last check before charging.
+
+    Answered ok=True for any payload we recognise. Rejecting here is the only
+    chance to stop a charge, so the shape is validated first.
+    """
+    parts = (query.invoice_payload or "").split(":")
+    valid = (
+        len(parts) == 4 and parts[0] == "stars"
+        and parts[1] in PLANS and parts[1] != "free"
+        and parts[2] in CYCLES
+    )
+    if not valid:
+        return await query.answer(
+            ok=False, error_message="This payment link is no longer valid. Please try again.",
+        )
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def stars_payment_done(
+    message: Message, db: Database, settings: Settings, forwarding: ForwardingEngine,
+) -> None:
+    """Payment landed — apply the plan immediately.
+
+    Recorded in manual_payments with status 'approved' so Stars purchases show
+    up in the same history as every other method, but with NO admin step.
+    """
+    payment = message.successful_payment
+    parts = (payment.invoice_payload or "").split(":")
+    if len(parts) != 4 or parts[0] != "stars":
+        return
+    plan_name, cycle = parts[1], parts[2]
+    if plan_name not in PLANS or plan_name == "free" or cycle not in CYCLES:
+        return
+
+    user_id = message.from_user.id
+    language = await _lang(db, user_id)
+    days = duration_days(cycle)
+    amount = int(payment.total_amount or 0)
+
+    request_id = None
+    with suppress(Exception):
+        request_id = await db.create_manual_payment(
+            user_id, "stars", plan_name, cycle, f"{amount} Stars",
+            reference=payment.telegram_payment_charge_id,
+        )
+        if request_id:
+            await db.set_manual_payment_status(request_id, "approved", 0)
+
+    applied = None
+    try:
+        if request_id:
+            applied = await db.apply_manual_plan(request_id, plan_name, days)
+        if applied is None:
+            # Never leave a paid user without their plan just because the
+            # bookkeeping row failed.
+            await db.set_plan(user_id, plan_name, days)
+    except Exception:
+        logger.exception("Could not apply Stars plan for %s", user_id)
+        await db.set_plan(user_id, plan_name, days)
+
+    with suppress(Exception):
+        await forwarding.refresh_user(user_id)
+
+    # Referral commission, same as every other payment method.
+    with suppress(Exception):
+        _o, _d, payable = _payable(plan_name, cycle)
+        credited = await db.credit_referral_commission(user_id, payable)
+        if credited is not None:
+            await _notify_referrer(message.bot, db, credited)
+
+    user = await db.get_user(user_id)
+    expiry = (
+        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        if user and user["plan_expiry"] else "—"
+    )
+    await message.answer(
+        safe_t(
+            language, "stars_paid", amount=amount,
+            plan=PLANS[plan_name].name, days=days, expiry=expiry,
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+        parse_mode="HTML",
+    )
+
+    for admin_id in settings.admin_telegram_ids:
+        with suppress(Exception):
+            await message.bot.send_message(
+                admin_id,
+                f"⭐ <b>Stars Payment Received</b>\n\n"
+                f"👤 {_display_name(user)}\n"
+                f"🆔 <code>{user_id}</code>\n\n"
+                f"💎 Plan: <b>{PLANS[plan_name].name}</b> ({cycle.title()})\n"
+                f"⭐ Amount: <b>{amount} Stars</b>\n"
+                f"📅 Duration: {days} days\n"
+                f"⏳ Expiry: {expiry}\n"
+                f"🧾 <code>{safe_html(payment.telegram_payment_charge_id)}</code>",
+                parse_mode="HTML",
+            )
 
 
 @router.callback_query(F.data.startswith("proof:"))
@@ -459,7 +591,8 @@ async def proof_prompt_cb(callback: CallbackQuery, state: FSMContext, db: Databa
     if len(parts) != 4:
         return await callback.answer("Invalid option", show_alert=True)
     method, plan_name, cycle = parts[1], parts[2], parts[3]
-    if method not in ("usdt", "stars") or plan_name not in PLANS or cycle not in CYCLES:
+    # Stars no longer needs a proof step — Telegram confirms it directly.
+    if method != "usdt" or plan_name not in PLANS or cycle not in CYCLES:
         return await callback.answer("Invalid option", show_alert=True)
 
     language = await _lang(db, callback.from_user.id)
@@ -487,7 +620,7 @@ async def proof_submit(
     method = data.get("method")
     plan_name = data.get("plan")
     cycle = data.get("cycle")
-    if method not in ("usdt", "stars") or plan_name not in PLANS or cycle not in CYCLES:
+    if method != "usdt" or plan_name not in PLANS or cycle not in CYCLES:
         await state.clear()
         return
 
