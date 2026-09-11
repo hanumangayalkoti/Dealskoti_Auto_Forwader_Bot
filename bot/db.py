@@ -771,6 +771,15 @@ class Database:
                     commission, int(row["id"]),
                 )
 
+    async def referrer_of(self, referred_id: int) -> int | None:
+        """Who referred this user, if anyone."""
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT referrer_id FROM referrals WHERE referred_id = $1 LIMIT 1",
+                referred_id,
+            )
+
     async def referral_summary(self, referrer_id: int) -> dict:
         """Totals for the /refer screen: how many joined and what is owed."""
         if self.pool is None:
