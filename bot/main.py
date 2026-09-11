@@ -85,7 +85,9 @@ from .plans import (
     all_features_text,
     duration_days,
     format_paise,
+    F_INLINE_BUTTONS,
     plan_feature_tree,
+    plan_has,
     plan_rank,
     seed_feature_rows,
 )
@@ -143,6 +145,11 @@ class BulkStates(StatesGroup):
 class FeatureStates(StatesGroup):
     waiting_name = State()
     waiting_link = State()
+
+
+class InlineButtonStates(StatesGroup):
+    waiting_label = State()
+    waiting_url = State()
 
 
 # ==========================================
@@ -473,6 +480,8 @@ FLOW_LABELS: dict[str, str] = {
     "BulkDeleteStates:waiting_confirm": "Bulk Delete",
     "FeatureStates:waiting_name": "Editing a Feature",
     "FeatureStates:waiting_link": "Editing a Feature",
+    "InlineButtonStates:waiting_label": "Inline Buttons",
+    "InlineButtonStates:waiting_url": "Inline Buttons",
 }
 
 FLOW_STEP_HINTS: dict[str, str] = {
@@ -491,6 +500,8 @@ FLOW_STEP_HINTS: dict[str, str] = {
     "BulkStates:waiting_dest": "You were selecting the destination channel.",
     "FeatureStates:waiting_name": "You were renaming a feature.",
     "FeatureStates:waiting_link": "You were setting a feature link.",
+    "InlineButtonStates:waiting_label": "You were renaming a button.",
+    "InlineButtonStates:waiting_url": "You were setting a button link.",
 }
 
 
@@ -1097,7 +1108,8 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
 def _account_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
-        [InlineKeyboardButton(text="📎 My File", callback_data="menu:myfile")],
+        [InlineKeyboardButton(text="📎 My File", callback_data="menu:myfile"),
+         InlineKeyboardButton(text="🎛️ Buttons", callback_data="ib:main")],
         [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect-ask")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
@@ -2993,6 +3005,237 @@ async def _offer_trial_after_connect(bot: Bot, db: Database, user_id: int, langu
             ]),
             parse_mode="HTML",
         )
+
+
+# ==========================================
+# /inline_button — 2 buttons under every post
+# ==========================================
+# Same shape as the Master Bot's /setbutton: two buttons, each with a name,
+# a link and an ON/OFF switch.
+#
+# A user account CANNOT attach inline buttons — Telegram only allows a bot to
+# do that. So a post only carries buttons when this bot is an admin in the
+# destination channel and can send it itself. The requirement is stated up
+# front rather than letting people wonder why nothing appears.
+
+URL_INPUT_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _ib_status(buttons: dict, language: str) -> str:
+    b1, b2 = buttons.get("btn1", {}), buttons.get("btn2", {})
+    return safe_t(
+        language, "ib_status",
+        s1="✅ ON" if b1.get("enabled") else "❌ OFF",
+        l1=safe_html(b1.get("label") or "—"),
+        u1=safe_html(b1.get("url") or "—"),
+        s2="✅ ON" if b2.get("enabled") else "❌ OFF",
+        l2=safe_html(b2.get("label") or "—"),
+        u2=safe_html(b2.get("url") or "—"),
+    )
+
+
+def _ib_main_kb(buttons: dict) -> InlineKeyboardMarkup:
+    b1 = buttons.get("btn1", {}).get("label") or "Button 1"
+    b2 = buttons.get("btn2", {}).get("label") or "Button 2"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✏️ {b1}", callback_data="ib:open:btn1")],
+        [InlineKeyboardButton(text=f"✏️ {b2}", callback_data="ib:open:btn2")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:account"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+
+
+def _ib_detail_kb(key: str, button: dict) -> InlineKeyboardMarkup:
+    ready = bool(button.get("label") and button.get("url"))
+    rows = [
+        [InlineKeyboardButton(text="📝 Rename", callback_data=f"ib:rename:{key}"),
+         InlineKeyboardButton(text="🔗 Set Link", callback_data=f"ib:link:{key}")],
+    ]
+    if ready:
+        rows.append([InlineKeyboardButton(
+            text="🔴 Turn OFF" if button.get("enabled") else "🟢 Turn ON",
+            callback_data=f"ib:toggle:{key}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="ib:main"),
+                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _ib_allowed(db: Database, user_id: int) -> bool:
+    user = await db.get_user(user_id)
+    return plan_has(str(user["plan"]) if user else "free", F_INLINE_BUTTONS)
+
+
+async def _ib_main(message_obj, db: Database, user_id: int, language: str) -> None:
+    buttons = await db.get_inline_buttons(user_id)
+    await _show_or_edit(
+        message_obj,
+        safe_t(language, "ib_main", status=_ib_status(buttons, language)),
+        _ib_main_kb(buttons),
+    )
+
+
+@router.message(Command("inline_button", "setbutton"))
+async def inline_button_command(message: Message, db: Database) -> None:
+    language = await _language_for_message(db, message)
+    if not await _ib_allowed(db, message.from_user.id):
+        return await message.answer(
+            safe_t(language, "ib_locked"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+    await _ib_main(message, db, message.from_user.id, language)
+
+
+@router.callback_query(F.data == "ib:main")
+async def ib_main_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
+    await _ib_main(callback.message, db, callback.from_user.id, language)
+    await callback.answer()
+
+
+async def _ib_detail(message_obj, db: Database, user_id: int, language: str, key: str) -> None:
+    buttons = await db.get_inline_buttons(user_id)
+    button = buttons.get(key, {})
+    label = button.get("label") or "—"
+    ready = bool(button.get("label") and button.get("url"))
+    preview = (
+        safe_t(language, "ib_preview_ready", label=safe_html(label)) if ready
+        else safe_t(language, "ib_preview_incomplete")
+    )
+    await _show_or_edit(
+        message_obj,
+        safe_t(
+            language, "ib_detail", num=key[-1], label=safe_html(label),
+            url=safe_html(button.get("url") or "—"),
+            status="✅ ON" if button.get("enabled") else "❌ OFF",
+            preview=preview,
+        ),
+        _ib_detail_kb(key, button),
+    )
+
+
+@router.callback_query(F.data.startswith("ib:open:"))
+async def ib_open_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
+    key = callback.data.rsplit(":", 1)[1]
+    if key not in ("btn1", "btn2"):
+        return await callback.answer("Invalid", show_alert=True)
+    language = await _language_for_callback(db, callback)
+    await _ib_detail(callback.message, db, callback.from_user.id, language, key)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ib:rename:") | F.data.startswith("ib:link:"))
+async def ib_edit_prompt_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database,
+) -> None:
+    if callback.message is None:
+        return
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
+    _, what, key = callback.data.split(":")
+    if key not in ("btn1", "btn2"):
+        return await callback.answer("Invalid", show_alert=True)
+
+    language = await _language_for_callback(db, callback)
+    buttons = await db.get_inline_buttons(callback.from_user.id)
+    await state.update_data(ib_key=key)
+    if what == "rename":
+        await state.set_state(InlineButtonStates.waiting_label)
+        text = safe_t(
+            language, "ib_rename_prompt", num=key[-1],
+            label=safe_html(buttons.get(key, {}).get("label") or "—"),
+        )
+    else:
+        await state.set_state(InlineButtonStates.waiting_url)
+        text = safe_t(language, "ib_link_prompt", num=key[-1])
+    await _safe_edit(callback.message, text, None)
+    await callback.answer()
+
+
+@router.message(InlineButtonStates.waiting_label)
+async def ib_label_input(message: Message, state: FSMContext, db: Database) -> None:
+    if not message.text:
+        return
+    language = await _language_for_message(db, message)
+    raw = message.text.strip()
+    if raw == "/back":
+        await state.clear()
+        return await _ib_main(message, db, message.from_user.id, language)
+    if not 1 <= len(raw) <= 30:
+        return await message.answer(safe_t(language, "ib_bad_label"), parse_mode="HTML")
+
+    data = await state.get_data()
+    key = str(data.get("ib_key", "btn1"))
+    await state.clear()
+    buttons = await db.get_inline_buttons(message.from_user.id)
+    buttons.setdefault(key, {})["label"] = raw
+    await db.save_inline_buttons(message.from_user.id, buttons)
+    await _ib_detail(message, db, message.from_user.id, language, key)
+
+
+@router.message(InlineButtonStates.waiting_url)
+async def ib_url_input(message: Message, state: FSMContext, db: Database) -> None:
+    if not message.text:
+        return
+    language = await _language_for_message(db, message)
+    raw = message.text.strip()
+    data = await state.get_data()
+    key = str(data.get("ib_key", "btn1"))
+
+    if raw == "/back":
+        await state.clear()
+        return await _ib_main(message, db, message.from_user.id, language)
+
+    buttons = await db.get_inline_buttons(message.from_user.id)
+    if raw == "/clear":
+        buttons.setdefault(key, {})["url"] = ""
+        # A button with no link cannot be shown, so it is switched off too.
+        buttons[key]["enabled"] = False
+        await db.save_inline_buttons(message.from_user.id, buttons)
+        await state.clear()
+        return await _ib_detail(message, db, message.from_user.id, language, key)
+
+    if not URL_INPUT_RE.match(raw):
+        return await message.answer(safe_t(language, "ib_bad_link"), parse_mode="HTML")
+
+    await state.clear()
+    buttons.setdefault(key, {})["url"] = raw
+    await db.save_inline_buttons(message.from_user.id, buttons)
+    await _ib_detail(message, db, message.from_user.id, language, key)
+
+
+@router.callback_query(F.data.startswith("ib:toggle:"))
+async def ib_toggle_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
+    key = callback.data.rsplit(":", 1)[1]
+    if key not in ("btn1", "btn2"):
+        return await callback.answer("Invalid", show_alert=True)
+
+    language = await _language_for_callback(db, callback)
+    buttons = await db.get_inline_buttons(callback.from_user.id)
+    button = buttons.setdefault(key, {})
+    if not (button.get("label") and button.get("url")):
+        return await callback.answer(
+            "Set a name and a link first", show_alert=True,
+        )
+    button["enabled"] = not button.get("enabled")
+    await db.save_inline_buttons(callback.from_user.id, buttons)
+    await _ib_detail(callback.message, db, callback.from_user.id, language, key)
+    await callback.answer("ON" if button["enabled"] else "OFF")
 
 
 # ==========================================
