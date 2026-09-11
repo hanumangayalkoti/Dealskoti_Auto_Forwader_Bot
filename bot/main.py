@@ -2914,7 +2914,8 @@ async def trial_ask_cb(callback: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data == "trial:go")
 async def trial_start_cb(
-    callback: CallbackQuery, db: Database, forwarding: ForwardingEngine,
+    callback: CallbackQuery, db: Database, settings: Settings,
+    forwarding: ForwardingEngine,
 ) -> None:
     if callback.message is None:
         return
@@ -2946,6 +2947,35 @@ async def trial_start_cb(
         ]),
     )
     await callback.answer("Trial started")
+
+    # Tell the admins. A trial is the moment a stranger becomes a real
+    # prospect, so it is worth knowing about while it is still running —
+    # there are only 7 days to follow up in.
+    total_users = await db.count_all_users()
+    referred_by = ""
+    with suppress(Exception):
+        row = await db.referrer_of(callback.from_user.id)
+        if row:
+            ref_user = await db.get_user(int(row))
+            referred_by = f"\n🎁 Referred by: {_format_name(ref_user)} (<code>{row}</code>)"
+
+    await _notify_admins(
+        callback.bot, settings,
+        f"🎁 <b>Gold Trial Started</b>\n\n"
+        f"👤 Name: {_format_name(user)}\n"
+        f"🔗 Username: {_handle(user)}\n"
+        f"🆔 User ID: <code>{callback.from_user.id}</code>\n"
+        f"🌐 Language: {safe_html(str(user['preferred_language'] or 'en')) if user else 'en'}\n"
+        f"📅 Joined: "
+        f"{user['created_at'].astimezone(IST).strftime('%d %b %Y, %I:%M %p IST') if user and user['created_at'] else '—'}"
+        f"{referred_by}\n\n"
+        f"💎 Plan: <b>Gold</b> (7-day trial)\n"
+        f"⏳ Ends: <b>{expiry}</b>\n"
+        f"🔌 Account connected: ✅\n"
+        f"📋 Tasks: {len(await db.list_tasks(callback.from_user.id))}\n\n"
+        f"👥 Total users: {total_users}\n"
+        f"🕐 {_now_ist()}",
+    )
 
 
 async def _offer_trial_after_connect(bot: Bot, db: Database, user_id: int, language: str) -> None:
