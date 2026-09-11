@@ -202,6 +202,11 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== INLINE BUTTONS =====
+-- Two buttons shown under every forwarded post. Stored per USER (not per
+-- task) to match how the stored file works, so there is one place to set them.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS inline_buttons JSONB;
+
 -- ===== FREE TRIAL =====
 -- One Gold trial per account, ever. The timestamp is what enforces it: a
 -- non-NULL value means the trial has already been claimed, so it can never
@@ -1554,6 +1559,38 @@ class Database:
     # ==========================================
     # FREE TRIAL
     # ==========================================
+
+    # ==========================================
+    # INLINE BUTTONS
+    # ==========================================
+
+    DEFAULT_BUTTONS = {
+        "btn1": {"label": "Button 1", "url": "", "enabled": False},
+        "btn2": {"label": "Button 2", "url": "", "enabled": False},
+    }
+
+    async def get_inline_buttons(self, user_id: int) -> dict:
+        if self.pool is None:
+            return json.loads(json.dumps(self.DEFAULT_BUTTONS))
+        async with self.pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT inline_buttons FROM users WHERE telegram_user_id = $1", user_id,
+            )
+        config = json.loads(json.dumps(self.DEFAULT_BUTTONS))
+        if raw:
+            stored = json.loads(raw) if isinstance(raw, str) else raw
+            for key in ("btn1", "btn2"):
+                if isinstance(stored.get(key), dict):
+                    config[key].update(stored[key])
+        return config
+
+    async def save_inline_buttons(self, user_id: int, config: dict) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET inline_buttons = $1 WHERE telegram_user_id = $2",
+                json.dumps(config), user_id,
+            )
 
     async def trial_claimed_at(self, user_id: int):
         if self.pool is None: return None
