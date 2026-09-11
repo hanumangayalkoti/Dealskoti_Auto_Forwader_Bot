@@ -364,12 +364,15 @@ async def _async_iter(items):
         yield item
 
 
+# Extensions that count as an image for replacement purposes.
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "heic", "heif"}
+
+
 def _document_extension(message: Message) -> str:
     """Lower-case extension of a message's DOCUMENT, or "".
 
-    Only documents count. Photos and videos are never replaced: swapping
-    someone's photo for an APK makes no sense, and matching on extension
-    would be meaningless for them anyway.
+    Returns "" for a compressed photo: Telegram strips the file name from
+    those, so there is no extension to compare.
     """
     media = getattr(message, "media", None)
     if not isinstance(media, MessageMediaDocument):
@@ -382,6 +385,33 @@ def _document_extension(message: Message) -> str:
         if name and "." in name:
             return name.rsplit(".", 1)[1].lower()
     return ""
+
+
+def _is_photo(message: Message) -> bool:
+    """True for a normal (compressed) photo."""
+    return isinstance(getattr(message, "media", None), MessageMediaPhoto)
+
+
+def replacement_matches(message: Message, stored_extension: str) -> bool:
+    """Should the user's file replace what this message carries?
+
+    Two separate rules, because Telegram treats the two cases differently:
+
+      * DOCUMENT — match on extension. A .apk is replaced by a .apk.
+      * PHOTO    — a compressed photo has NO file name and NO extension, so
+        extension matching can never fire for it. Instead any photo is
+        replaced when the user's own file is itself an image. This is why
+        uploading an image appeared to do nothing at all before.
+
+    Anything else (video, audio, sticker, plain text) is left alone.
+    """
+    stored_extension = (stored_extension or "").lower()
+    if not stored_extension:
+        return False
+    if _is_photo(message):
+        return stored_extension in IMAGE_EXTENSIONS
+    source_extension = _document_extension(message)
+    return bool(source_extension) and source_extension == stored_extension
 
 
 # Entity types that may be SENT back to Telegram.
@@ -1215,12 +1245,14 @@ class ForwardingEngine:
             # client handshake — adding seconds to messages that could never
             # be affected by this feature at all.
             replacement_file = None
-            source_ext = _document_extension(message)
-            if source_ext:
+            # Cheap local check first — a message with no document and no photo
+            # can never be affected, so the database is not touched at all.
+            if _document_extension(message) or _is_photo(message):
                 stored_file = await self._resolve_stored_file(user_id, settings, plan_name)
-                if stored_file is not None:
-                    if source_ext == str(stored_file["extension"] or "").lower():
-                        replacement_file = stored_file
+                if stored_file is not None and replacement_matches(
+                    message, str(stored_file["extension"] or "")
+                ):
+                    replacement_file = stored_file
             # With the code filter on the user wants the code only, so media is
             # deliberately dropped rather than sent alongside it.
             media_file = (
