@@ -85,6 +85,7 @@ from .plans import (
     all_features_text,
     duration_days,
     format_paise,
+    plan_feature_tree,
     plan_rank,
     seed_feature_rows,
 )
@@ -665,7 +666,10 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
 
     if not connected:
         text = safe_t(language, "home_not_connected")
-        rows = [
+        rows = []
+        if await _trial_available(db, user_id):
+            rows.append(_trial_button())
+        rows += [
             [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
             [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
             [InlineKeyboardButton(text="🔐 Why connect?", callback_data="why:connect")],
@@ -684,7 +688,10 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
         text = safe_t(
             language, "home_no_tasks", who=_who(user), plan=plan_line,
         )
-        rows = [
+        rows = []
+        if await _trial_available(db, user_id):
+            rows.append(_trial_button())
+        rows += [
             [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create")],
             [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
             [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
@@ -1223,6 +1230,9 @@ async def _finish_login_success(
         await forwarding.refresh_user(message.from_user.id)
     user = await db.get_user(message.from_user.id)
     tg_username_raw = account_info.get("username")
+    with suppress(Exception):
+        await _offer_trial_after_connect(message.bot, db, message.from_user.id, language)
+
     await _notify_admins(
         message.bot, settings,
         f"🔌 <b>Account Connected</b>\n\n"
@@ -2782,6 +2792,180 @@ async def myfile_cb(callback: CallbackQuery, db: Database) -> None:
     text, markup = await _myfile_screen(db, callback.from_user.id, language)
     await _safe_edit(callback.message, text, markup)
     await callback.answer()
+
+
+# ==========================================
+# 7-DAY GOLD TRIAL
+# ==========================================
+# Gold, not Platinum, and deliberately so. Dropping from Platinum (unlimited
+# messages, watermark, 50 targets) straight to Free is a big enough fall that
+# people leave rather than buy, and a week of unlimited forwarding is a real
+# hosting cost. From Gold, the paid tiers still look reachable.
+#
+# The trial starts when the account is CONNECTED, not when /start is pressed:
+# an unconnected user cannot forward anything, so their week would be spent
+# before they could use it.
+
+TRIAL_PLAN = "gold"
+TRIAL_DAYS = 7
+
+
+async def _trial_available(db: Database, user_id: int) -> bool:
+    """True only for a user who has never claimed it AND is not already paying.
+
+    Offering a Gold trial to a Platinum subscriber would DOWNGRADE them, which
+    is the worst possible outcome of a "free gift".
+    """
+    if await db.trial_claimed_at(user_id) is not None:
+        return False
+    user = await db.get_user(user_id)
+    if user is None:
+        return False
+    return str(user["plan"] or "free") == "free"
+
+
+def _trial_button() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="🎁 Try Gold FREE for 7 Days", callback_data="trial:offer")]
+
+
+@router.message(Command("trial"))
+async def trial_command(message: Message, db: Database) -> None:
+    language = await _language_for_message(db, message)
+    await _trial_offer(message, db, message.from_user.id, language)
+
+
+@router.callback_query(F.data == "trial:offer")
+async def trial_offer_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await _trial_offer(callback.message, db, callback.from_user.id, language)
+    await callback.answer()
+
+
+async def _trial_offer(message_obj, db: Database, user_id: int, language: str) -> None:
+    """Step 1 — show what Gold actually gives, before asking to confirm."""
+    claimed = await db.trial_claimed_at(user_id)
+    if claimed is not None:
+        return await _show_or_edit(
+            message_obj,
+            safe_t(language, "trial_used",
+                   when=claimed.astimezone(IST).strftime("%d %b %Y")),
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+
+    user = await db.get_user(user_id)
+    if user is not None and str(user["plan"] or "free") != "free":
+        return await _show_or_edit(
+            message_obj,
+            f"💎 You're already on <b>{str(user['plan']).title()}</b> — that is above "
+            f"the trial, so there is nothing to claim.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+
+    # The real Gold feature list, straight from plans.py.
+    links = await db.features_map()
+    features = plan_feature_tree(TRIAL_PLAN, links)
+    await _show_or_edit(
+        message_obj,
+        safe_t(language, "trial_offer", features=features),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Continue", callback_data="trial:ask")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "trial:ask")
+async def trial_ask_cb(callback: CallbackQuery, db: Database) -> None:
+    """Step 2 — connect first if needed, otherwise confirm."""
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    if not await _trial_available(db, callback.from_user.id):
+        return await _trial_offer(callback.message, db, callback.from_user.id, language)
+
+    if not await db.has_active_session(callback.from_user.id):
+        await _safe_edit(
+            callback.message,
+            safe_t(language, "trial_needs_connect"),
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+                [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+        return await callback.answer()
+
+    expiry = (datetime.now(IST) + timedelta(days=TRIAL_DAYS)).strftime("%d %b %Y, %I:%M %p IST")
+    await _safe_edit(
+        callback.message,
+        safe_t(language, "trial_confirm", expiry=expiry),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Yes, Start Trial", callback_data="trial:go")],
+            [InlineKeyboardButton(text="✖️ Not Now", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "trial:go")
+async def trial_start_cb(
+    callback: CallbackQuery, db: Database, forwarding: ForwardingEngine,
+) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    if not await _trial_available(db, callback.from_user.id):
+        return await _trial_offer(callback.message, db, callback.from_user.id, language)
+    if not await db.has_active_session(callback.from_user.id):
+        return await callback.answer("Connect your account first", show_alert=True)
+
+    if not await db.claim_trial(callback.from_user.id, TRIAL_PLAN, TRIAL_DAYS):
+        # Two taps in quick succession, or already claimed.
+        return await _trial_offer(callback.message, db, callback.from_user.id, language)
+
+    with suppress(Exception):
+        await forwarding.refresh_user(callback.from_user.id)
+
+    user = await db.get_user(callback.from_user.id)
+    expiry = (
+        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        if user and user["plan_expiry"] else "—"
+    )
+    await _safe_edit(
+        callback.message,
+        safe_t(language, "trial_started", expiry=expiry),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create")],
+            [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ]),
+    )
+    await callback.answer("Trial started")
+
+
+async def _offer_trial_after_connect(bot: Bot, db: Database, user_id: int, language: str) -> None:
+    """Nudges a freshly connected user who still has a trial waiting."""
+    if not await _trial_available(db, user_id):
+        return
+    with suppress(Exception):
+        await bot.send_message(
+            user_id,
+            safe_t(language, "trial_offer",
+                   features=plan_feature_tree(TRIAL_PLAN, await db.features_map())),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Continue", callback_data="trial:ask")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+            parse_mode="HTML",
+        )
 
 
 # ==========================================
