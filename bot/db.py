@@ -202,6 +202,12 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== FREE TRIAL =====
+-- One Gold trial per account, ever. The timestamp is what enforces it: a
+-- non-NULL value means the trial has already been claimed, so it can never
+-- be taken a second time.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_claimed_at TIMESTAMP WITH TIME ZONE;
+
 -- ===== BROADCAST RECALL =====
 -- Which message id a broadcast landed on, per user. Without this a wrong
 -- broadcast can never be taken back. Rows are pruned after 3 days because
@@ -1535,6 +1541,46 @@ class Database:
     # ==========================================
     # BROADCAST RECALL
     # ==========================================
+
+    # ==========================================
+    # FREE TRIAL
+    # ==========================================
+
+    async def trial_claimed_at(self, user_id: int):
+        if self.pool is None: return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT trial_claimed_at FROM users WHERE telegram_user_id = $1", user_id,
+            )
+
+    async def claim_trial(self, user_id: int, plan: str, days: int) -> bool:
+        """Starts the trial, once and only once.
+
+        The claim and the plan change happen in ONE transaction guarded on
+        trial_claimed_at IS NULL, so two taps in quick succession cannot
+        produce two trials.
+        """
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """UPDATE users SET trial_claimed_at = CURRENT_TIMESTAMP
+                       WHERE telegram_user_id = $1 AND trial_claimed_at IS NULL
+                       RETURNING telegram_user_id""",
+                    user_id,
+                )
+                if row is None:
+                    return False
+                await conn.execute(
+                    """UPDATE users
+                       SET plan = $1,
+                           plan_expiry = CURRENT_TIMESTAMP + ($2 || ' days')::INTERVAL,
+                           scheduled_plan = NULL, scheduled_days = NULL,
+                           expiry_reminder_stage = 0
+                       WHERE telegram_user_id = $3""",
+                    plan, str(int(days)), user_id,
+                )
+        return True
 
     async def record_broadcast_messages(self, broadcast_id: int, rows: list[tuple]) -> None:
         """Batch-stores (user_id, message_id) for a broadcast."""
