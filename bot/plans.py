@@ -130,6 +130,7 @@ F_ANTIBAN               = "antiban_speed"
 F_VIP_SUPPORT           = "vip_support"
 F_FAST_DELIVERY         = "fast_delivery"
 F_BULK_DELETE           = "bulk_delete"           # wipe a chat's history
+F_INLINE_BUTTONS        = "inline_buttons"        # 2 buttons under every post
 
 
 # ==========================================
@@ -167,6 +168,7 @@ _SILVER_ADDS: set[str] = {
 
 _GOLD_ADDS: set[str] = {
     F_BULK_DELETE,
+    F_INLINE_BUTTONS,
     F_AUTO_DELETE,
     F_POST_EDIT_SYNC,
     F_TRIM_WORDS,
@@ -277,6 +279,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Delay Timer Per Target",
         "Topics Forwarding",
         "Bulk Delete Messages",
+        "Set Inline Buttons",
         "{daily}",
         "No BOT Watermark",
         "Anti-Ban Speed Forwarding",
@@ -305,6 +308,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Delay Timer Per Target",
         "Topics Forwarding",
         "Bulk Delete Messages",
+        "Set Inline Buttons",
         "{daily}",
         "Custom Image Watermark",
         "Watermark Position/Size/Opacity",
