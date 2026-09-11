@@ -65,7 +65,7 @@ from .bulk_delete_ui import router as bulk_delete_router
 from .config import ConfigurationError, Settings
 from .db import Database
 from .faq import FAQS
-from .forwarding import ForwardingEngine
+from .forwarding import IMAGE_EXTENSIONS, ForwardingEngine
 from .gate import enforce_gate, user_is_member
 from .locales import (
     ADMIN_COMMANDS,
@@ -1093,6 +1093,7 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
 def _account_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
+        [InlineKeyboardButton(text="📎 My File", callback_data="menu:myfile")],
         [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect-ask")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
@@ -2705,6 +2706,85 @@ async def bulk_dest_input(
 
 
 # ==========================================
+# /myfile — see the file used by Replace File
+# ==========================================
+
+def _human_size(num: int) -> str:
+    size = float(num or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+async def _myfile_screen(db: Database, user_id: int, language: str):
+    """Shows the stored file, or says plainly that there isn't one.
+
+    Replace File silently does nothing without a file, so a user could switch
+    it on and never learn why nothing changed. This makes that state visible.
+    """
+    stored = await db.get_stored_file(user_id)
+    if stored is None:
+        return safe_t(language, "myfile_none"), InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Upload a File", callback_data="menu:uploadfile")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:account"),
+             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+        ])
+
+    extension = str(stored["extension"] or "").lower()
+    uploaded = (
+        stored["created_at"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+        if stored["created_at"] else "—"
+    )
+    replaces_key = (
+        "myfile_replaces_image" if extension in IMAGE_EXTENSIONS else "myfile_replaces_doc"
+    )
+    text = safe_t(
+        language, "myfile_info",
+        name=safe_html(stored["file_name"] or "file"),
+        extension=safe_html(extension or "?"),
+        size=_human_size(int(stored["file_size"] or 0)),
+        when=uploaded,
+        replaces=safe_t(language, replaces_key, extension=safe_html(extension or "?")),
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Replace This File", callback_data="menu:uploadfile")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:account"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+
+
+@router.callback_query(F.data == "menu:uploadfile")
+async def uploadfile_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+) -> None:
+    """Starts the upload flow from a button, reusing the command handler so
+    the plan check and prompts stay in exactly one place."""
+    if callback.message is None:
+        return
+    await callback.answer()
+    await upload_file_cmd(callback.message, state, db, settings)
+
+
+@router.message(Command("myfile"))
+async def myfile_command(message: Message, db: Database) -> None:
+    language = await _language_for_message(db, message)
+    text, markup = await _myfile_screen(db, message.from_user.id, language)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "menu:myfile")
+async def myfile_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    text, markup = await _myfile_screen(db, callback.from_user.id, language)
+    await _safe_edit(callback.message, text, markup)
+    await callback.answer()
+
+
+# ==========================================
 # TASK ACTIONS
 # ==========================================
 
@@ -3863,6 +3943,144 @@ async def all_features_command(message: Message, db: Database) -> None:
 
 
 # ==========================================
+# BROADCAST RECALL
+# ==========================================
+# Takes back a broadcast that should not have gone out.
+#
+# Honest limits, stated to the admin rather than hidden:
+#   * Telegram refuses deletes older than 48 HOURS
+#   * the notification has already been delivered — recall removes the
+#     message, it cannot unring the bell
+#   * some deletes fail (user blocked the bot, cleared the chat), and the
+#     real numbers are reported instead of a blanket "done"
+
+@router.message(Command("broadcasts", "recall"))
+async def broadcasts_command(message: Message, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, message.from_user.id):
+        return
+    await _render_broadcast_list(message, db)
+
+
+@router.callback_query(F.data == "admin:broadcasts")
+async def broadcasts_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    await _render_broadcast_list(callback.message, db)
+    await callback.answer()
+
+
+async def _render_broadcast_list(message_obj, db: Database) -> None:
+    rows = await db.recent_broadcasts()
+    if not rows:
+        return await _show_or_edit(
+            message_obj,
+            "📭 <b>No recent broadcasts</b>\n\nOnly broadcasts from the last 48 hours "
+            "can be recalled — Telegram will not delete anything older.",
+            admin_keyboard(),
+        )
+
+    lines = ["📣 <b>Recent Broadcasts</b>", ""]
+    buttons = []
+    for row in rows:
+        when = (
+            row["created_at"].astimezone(IST).strftime("%d %b, %I:%M %p")
+            if row["created_at"] else "—"
+        )
+        preview = safe_html(str(row["message_text"] or "")[:40]).replace("\n", " ")
+        recallable = int(row["recallable"] or 0)
+        lines.append(f"<b>#{row['id']}</b> · {when} · sent {row['sent'] or 0}")
+        lines.append(f"    “{preview}…”")
+        lines.append(f"    ↩️ recallable: {recallable}")
+        lines.append("")
+        if recallable:
+            buttons.append([InlineKeyboardButton(
+                text=f"↩️ Recall #{row['id']} ({recallable})",
+                callback_data=f"bc:recall:{row['id']}",
+            )])
+    buttons.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
+    await _show_or_edit(
+        message_obj, "\n".join(lines).rstrip(),
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("bc:recall:"))
+async def broadcast_recall_ask(
+    callback: CallbackQuery, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    broadcast_id = int(callback.data.rsplit(":", 1)[1])
+    rows = await db.broadcast_message_rows(broadcast_id)
+    if not rows:
+        return await callback.answer(
+            "Nothing left to recall for that broadcast", show_alert=True,
+        )
+    await _safe_edit(
+        callback.message,
+        f"↩️ <b>Recall Broadcast #{broadcast_id}?</b>\n\n"
+        f"This will delete the message from <b>{len(rows)}</b> chats.\n\n"
+        f"⚠️ <b>What recall cannot do</b>\n"
+        f"• Users who already read it have read it\n"
+        f"• The notification was already delivered\n"
+        f"• Chats where the bot is blocked will fail\n\n"
+        f"Go ahead?",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Yes, Recall", callback_data=f"bc:go:{broadcast_id}",
+            )],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:broadcasts")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bc:go:"))
+async def broadcast_recall_run(
+    callback: CallbackQuery, db: Database, settings: Settings,
+) -> None:
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    broadcast_id = int(callback.data.rsplit(":", 1)[1])
+    rows = await db.broadcast_message_rows(broadcast_id)
+    if not rows:
+        return await callback.answer("Nothing to recall", show_alert=True)
+
+    await _safe_edit(callback.message, f"↩️ Recalling from {len(rows)} chats…", None)
+    await callback.answer("Recalling")
+
+    removed = failed = 0
+    for index, row in enumerate(rows, 1):
+        try:
+            await callback.bot.delete_message(int(row["user_id"]), int(row["message_id"]))
+            removed += 1
+        except Exception:
+            failed += 1
+        if index % 20 == 0:
+            await asyncio.sleep(1)  # same rate limit as sending
+
+    await db.clear_broadcast_messages(broadcast_id)
+    await _safe_edit(
+        callback.message,
+        f"↩️ <b>Recall Finished</b>\n\n"
+        f"Broadcast: <code>#{broadcast_id}</code>\n"
+        f"✅ Removed: <b>{removed}</b>\n"
+        f"❌ Could not remove: {failed}\n\n"
+        + ("Those failures are chats where the bot is blocked or the message "
+           "was already gone — nothing more can be done about them.\n\n"
+           if failed else "")
+        + f"🕐 {_now_ist()}",
+        admin_keyboard(),
+    )
+
+
+# ==========================================
 # ADMIN
 # ==========================================
 
@@ -3876,6 +4094,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🎁 Grant Days", callback_data="admin:grantpicker")],
         [InlineKeyboardButton(text="➖ Reduce Days", callback_data="admin:reducepicker"),
          InlineKeyboardButton(text="📋 All Tasks", callback_data="admin:tasks:0")],
+        [InlineKeyboardButton(text="📣 Broadcasts", callback_data="admin:broadcasts")],
         [InlineKeyboardButton(text="💾 Backup Now", callback_data="admin:backup")],
         [InlineKeyboardButton(text="🏠 User Menu", callback_data="menu:home")],
     ])
@@ -5046,10 +5265,15 @@ async def _run_broadcast(
     with suppress(TelegramBadRequest):
         await callback.message.edit_text(f"📣 Sending to {len(users)} users…", reply_markup=None)
 
+    # Message ids are kept so a wrong broadcast can be recalled.
+    delivered: list[tuple[int, int]] = []
+
     for i, u in enumerate(users, 1):
         try:
-            await callback.bot.send_message(int(u["telegram_user_id"]), text)
+            posted = await callback.bot.send_message(int(u["telegram_user_id"]), text)
             sent += 1
+            if posted is not None:
+                delivered.append((int(u["telegram_user_id"]), int(posted.message_id)))
         except TelegramForbiddenError:
             blocked += 1
             await db.mark_user_inactive(int(u["telegram_user_id"]))
@@ -5062,11 +5286,23 @@ async def _run_broadcast(
             await asyncio.sleep(1)
 
     await db.finish_broadcast(broadcast_id, sent, failed, blocked)
+    with suppress(Exception):
+        await db.record_broadcast_messages(broadcast_id, delivered)
     await state.clear()
     with suppress(TelegramBadRequest):
         await callback.message.edit_text(
-            f"✅ Broadcast complete\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}",
-            reply_markup=admin_keyboard(),
+            f"✅ <b>Broadcast complete</b>\n\n"
+            f"Sent: {sent}\nFailed: {failed}\nBlocked: {blocked}\n\n"
+            f"🕐 {_now_ist()}\n\n"
+            f"↩️ Sent the wrong thing? You can recall it for the next 48 hours.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="↩️ Recall This Broadcast",
+                    callback_data=f"bc:recall:{broadcast_id}",
+                )],
+                [InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")],
+            ]),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -5518,6 +5754,12 @@ async def _run(settings: Settings) -> None:
     async def send_task_creation_reminders():
         await _send_task_creation_reminders(bot, db, settings)
 
+    async def prune_broadcast_map():
+        with suppress(Exception):
+            removed = await db.prune_broadcast_messages(3)
+            if removed:
+                logger.info("Pruned %s broadcast message rows", removed)
+
     async def nightly_backup():
         await _make_backup(bot, db, settings, reason="nightly")
 
@@ -5535,6 +5777,7 @@ async def _run(settings: Settings) -> None:
     scheduler.add_job(send_task_creation_reminders, CronTrigger(minute=15, timezone=scheduler_tz), replace_existing=True)
     scheduler.add_job(prune_edit_sync_map, CronTrigger(hour=4, minute=30, timezone=scheduler_tz), replace_existing=True)
     scheduler.add_job(nightly_backup, CronTrigger(hour=3, minute=0, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(prune_broadcast_map, CronTrigger(hour=4, minute=45, timezone=scheduler_tz), replace_existing=True)
     scheduler.start()
 
     forwarding_task = None
