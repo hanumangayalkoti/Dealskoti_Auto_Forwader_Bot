@@ -202,6 +202,23 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== BROADCAST RECALL =====
+-- Which message id a broadcast landed on, per user. Without this a wrong
+-- broadcast can never be taken back. Rows are pruned after 3 days because
+-- Telegram refuses deletes older than 48 hours anyway.
+CREATE TABLE IF NOT EXISTS broadcast_messages (
+    id SERIAL PRIMARY KEY,
+    broadcast_id INTEGER,
+    user_id BIGINT,
+    message_id BIGINT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_messages_bid
+    ON broadcast_messages (broadcast_id);
+CREATE INDEX IF NOT EXISTS idx_broadcast_messages_age
+    ON broadcast_messages (created_at);
+
 -- ===== FEATURE CATALOGUE =====
 -- The marketing feature list lives here, not in code, so an admin can rename
 -- a feature or attach a channel link from inside the bot and have it survive
@@ -1514,6 +1531,64 @@ class Database:
                         int(row.get("sort_order", 0)), row["tier"], row["slug"],
                     )
         return added
+
+    # ==========================================
+    # BROADCAST RECALL
+    # ==========================================
+
+    async def record_broadcast_messages(self, broadcast_id: int, rows: list[tuple]) -> None:
+        """Batch-stores (user_id, message_id) for a broadcast."""
+        if self.pool is None or not rows:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.executemany(
+                    """INSERT INTO broadcast_messages (broadcast_id, user_id, message_id)
+                       VALUES ($1, $2, $3)""",
+                    [(broadcast_id, u, m) for u, m in rows],
+                )
+        except Exception as exc:
+            logger.warning("Could not record broadcast messages: %s", exc)
+
+    async def recent_broadcasts(self, limit: int = 5) -> list[asyncpg.Record]:
+        """Broadcasts still young enough to be recalled."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT b.*, COUNT(bm.id) AS recallable
+                   FROM broadcasts b
+                   LEFT JOIN broadcast_messages bm ON bm.broadcast_id = b.id
+                   WHERE b.created_at > NOW() - INTERVAL '48 hours'
+                   GROUP BY b.id
+                   ORDER BY b.id DESC LIMIT $1""",
+                limit,
+            )
+
+    async def broadcast_message_rows(self, broadcast_id: int) -> list[asyncpg.Record]:
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT user_id, message_id FROM broadcast_messages WHERE broadcast_id = $1",
+                broadcast_id,
+            )
+
+    async def clear_broadcast_messages(self, broadcast_id: int) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM broadcast_messages WHERE broadcast_id = $1", broadcast_id,
+            )
+
+    async def prune_broadcast_messages(self, days: int = 3) -> int:
+        if self.pool is None: return 0
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                f"DELETE FROM broadcast_messages WHERE created_at < NOW() - INTERVAL '{int(days)} days'",  # noqa: S608
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
 
     async def list_features(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
