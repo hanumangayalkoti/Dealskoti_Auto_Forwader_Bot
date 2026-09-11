@@ -362,29 +362,28 @@ def language_keyboard() -> InlineKeyboardMarkup:
 #     to scroll back to, and silently eating it would be worse than the mess
 
 CLEANUP_LOOKAHEAD = 3
-# How many recent bot messages an abandoned flow may clear.
-FLOW_CLEAR_LIMIT = 4
+# An abandoned flow may clear the same number of messages.
+FLOW_CLEAR_LIMIT = 3
 
-# Messages that are records, not UI. These are never cleaned up.
+# Reports are records the user may want to scroll back to. Several of them DO
+# carry buttons, so "has buttons" alone is not enough to tell UI from record —
+# both signals are needed.
 PROTECTED_MARKERS = (
-    "Task </b>", "has been created", "Payment Successful", "Payment Received",
-    "Deletion Complete", "Transfer Complete", "Backup", "Restore complete",
-    "Granted", "Payout", "Congrats", "Account Connected",
-    "expired", "expires in", "Daily Limit Reached", "Forwarding Problem",
-    "Deleted:", "Sent:",
+    "has been created", "Task Created", "Payment Successful", "Payment Received",
+    "Deletion Complete", "Transfer Complete", "Recall Finished", "Backup",
+    "Restore complete", "Granted", "Payout", "Congrats", "Account Connected",
+    "New User Joined", "Trial is Active", "expired", "expires in",
+    "Daily Limit Reached", "Forwarding Problem", "Broadcast complete",
+    "Deleted:", "Sent:", "Bulk Delete Job", "Stars Payment",
 )
 
-# chat_id -> [message_id, ...] recently sent by the bot (bounded)
-_recent_bot_msgs: dict[int, list[int]] = {}
-
-
-def _remember_bot_message(chat_id: int, message_id: int) -> None:
-    ids = _recent_bot_msgs.setdefault(chat_id, [])
-    if message_id in ids:
-        return
-    ids.append(message_id)
-    if len(ids) > 40:
-        del ids[:20]
+# chat_id -> {message_id: True if it may be cleaned}
+#
+# The decision is stored WHEN THE MESSAGE IS SENT. By the time cleanup runs
+# only the id is known, not the text, so an earlier version checked the text
+# of the TAPPED message and then deleted the ones below it unchecked — which
+# is exactly how report messages were being swept away.
+_recent_bot_msgs: dict[int, dict[int, bool]] = {}
 
 
 def _is_protected_text(text: str | None) -> bool:
@@ -393,24 +392,43 @@ def _is_protected_text(text: str | None) -> bool:
     return any(marker in text for marker in PROTECTED_MARKERS)
 
 
-async def _cleanup_below(callback: CallbackQuery) -> None:
-    """Removes the few messages that sit below the tapped one.
+def _remember_bot_message(chat_id: int, message_id: int, cleanable: bool = True) -> None:
+    seen = _recent_bot_msgs.setdefault(chat_id, {})
+    seen[message_id] = cleanable
+    if len(seen) > 40:
+        for old_id in sorted(seen)[:20]:
+            seen.pop(old_id, None)
 
-    Best-effort throughout: Telegram refuses deletes older than 48 hours and
-    silently ignores ids that are already gone, and neither should ever
-    surface to the user mid-navigation.
+
+def _classify_sent(result) -> bool:
+    """May this message be cleaned up later?
+
+    Two conditions, both required:
+      * it carries inline buttons — screens do, reports mostly do not
+      * it is not a report — some reports DO carry buttons ("Task created"
+        offers Settings), and those must survive
+
+    Anything that fails either test is kept.
+    """
+    has_buttons = bool(getattr(getattr(result, "reply_markup", None), "inline_keyboard", None))
+    if not has_buttons:
+        return False
+    return not _is_protected_text(result.html_text or result.text or result.caption)
+
+
+async def _cleanup_below(callback: CallbackQuery) -> None:
+    """Removes the few messages below the tapped one.
+
+    Only messages marked cleanable when they were sent are touched, so a
+    record can never be deleted by navigating above it.
     """
     if callback.message is None:
         return
     chat_id = callback.message.chat.id
     tapped_id = callback.message.message_id
 
-    # Never clear away a record the user may want to scroll back to.
-    if _is_protected_text(callback.message.html_text or callback.message.text):
-        return
-
-    known = _recent_bot_msgs.get(chat_id, [])
-    below = sorted(mid for mid in known if mid > tapped_id)
+    seen = _recent_bot_msgs.get(chat_id, {})
+    below = sorted(mid for mid, cleanable in seen.items() if mid > tapped_id and cleanable)
     if not below:
         return
     if len(below) > CLEANUP_LOOKAHEAD:
@@ -419,39 +437,18 @@ async def _cleanup_below(callback: CallbackQuery) -> None:
     for mid in below:
         with suppress(Exception):
             await callback.bot.delete_message(chat_id, mid)
-        with suppress(ValueError):
-            known.remove(mid)
+        seen.pop(mid, None)
 
 
 async def _track_sent_messages(handler, bot: Bot, method):
-    """Session hook: records the id of EVERY message the bot sends.
-
-    This replaces an earlier attempt that read the handler's return value and
-    only listened on message events. It tracked almost nothing, because most
-    screens are sent from CALLBACK handlers and most handlers return None —
-    so the cleanup list stayed empty and cleanup silently never ran.
-
-    Hooking the session catches every send and every edit no matter where in
-    the code it came from.
-    """
+    """Session hook: records every message the bot sends, and whether it is
+    safe to clean up later."""
     result = await handler(bot, method)
     with suppress(Exception):
         if isinstance(result, Message) and result.chat is not None:
-            _remember_bot_message(result.chat.id, result.message_id)
+            _remember_bot_message(result.chat.id, result.message_id, _classify_sent(result))
     return result
 
-
-# ==========================================
-# FLOW INTERRUPTION
-# ==========================================
-# A user halfway through /connect who suddenly sends /plans used to get the
-# plans screen while the bot silently stayed in "waiting for phone number"
-# state — their next ordinary message was then read as a phone number and
-# rejected, with no explanation anywhere. This middleware cancels the pending
-# flow FIRST and says what was cancelled, so nothing is ever ignored silently.
-#
-# Living in one middleware means every flow is covered — including the ones in
-# settings_ui and billing_ui — without touching a single handler.
 
 # Commands that are PART of a flow rather than an escape from it.
 FLOW_INTERNAL_COMMANDS = {"back", "done", "clear", "cancel", "skip"}
@@ -468,6 +465,7 @@ FLOW_LABELS: dict[str, str] = {
     "ManualPayStates:waiting_proof": "Payment Proof",
     "AdminStates:waiting_grant_days": "Grant Days",
     "AdminGrantStates:waiting_custom_days": "Grant Days",
+    "AdminBroadcastStates:waiting_message": "Broadcast",
     "PayoutStates:waiting_address": "Payment Method",
     "RestoreStates:waiting_confirm": "Database Restore",
     "BulkStates:waiting_source": "Bulk Transfer",
@@ -475,7 +473,6 @@ FLOW_LABELS: dict[str, str] = {
     "BulkDeleteStates:waiting_confirm": "Bulk Delete",
     "FeatureStates:waiting_name": "Editing a Feature",
     "FeatureStates:waiting_link": "Editing a Feature",
-    "AdminBroadcastStates:waiting_message": "Broadcast",
 }
 
 FLOW_STEP_HINTS: dict[str, str] = {
@@ -490,18 +487,19 @@ FLOW_STEP_HINTS: dict[str, str] = {
     "ManualPayStates:waiting_proof": "You were submitting payment proof.",
     "AdminBroadcastStates:waiting_message": "You were writing a broadcast.",
     "PayoutStates:waiting_address": "You were setting your payout address.",
+    "BulkStates:waiting_source": "You were selecting the source channel.",
+    "BulkStates:waiting_dest": "You were selecting the destination channel.",
+    "FeatureStates:waiting_name": "You were renaming a feature.",
+    "FeatureStates:waiting_link": "You were setting a feature link.",
 }
 
 
 async def _clear_flow_messages(event: Message, state: FSMContext) -> None:
     """Deletes the bot prompts belonging to an abandoned flow.
 
-    Two sources are used together:
-      * login_msg_ids — the login flow already tracks its own prompts exactly
-      * the recent bot-message list — for every other flow
-
-    Bounded to the last few and protected messages are skipped, so a record
-    like "task created" can never be swept away by an abandoned flow.
+    login_msg_ids is exact where the login flow tracked its own prompts; for
+    every other flow the recent cleanable messages are used. Reports are never
+    in that list, so they cannot be swept up here either.
     """
     chat_id = event.chat.id
     data = await state.get_data()
@@ -511,14 +509,12 @@ async def _clear_flow_messages(event: Message, state: FSMContext) -> None:
         with suppress(Exception):
             await event.bot.delete_message(chat_id, message_id)
 
-    known = _recent_bot_msgs.get(chat_id, [])
-    for message_id in list(known)[-FLOW_CLEAR_LIMIT:]:
-        if message_id in tracked:
-            continue
+    seen = _recent_bot_msgs.get(chat_id, {})
+    cleanable = [mid for mid, ok in seen.items() if ok and mid not in tracked]
+    for message_id in sorted(cleanable)[-FLOW_CLEAR_LIMIT:]:
         with suppress(Exception):
             await event.bot.delete_message(chat_id, message_id)
-        with suppress(ValueError):
-            known.remove(message_id)
+        seen.pop(message_id, None)
 
 
 class CallbackCleanupMiddleware(BaseMiddleware):
@@ -537,7 +533,8 @@ class FlowInterruptMiddleware(BaseMiddleware):
         # too and can be swept up with the rest.
         if isinstance(event, Message):
             with suppress(Exception):
-                _remember_bot_message(event.chat.id, event.message_id)
+                # The user's own commands are always clutter.
+                _remember_bot_message(event.chat.id, event.message_id, True)
         state: FSMContext | None = data.get("state")
         if state is None or not isinstance(event, Message) or not event.text:
             return await handler(event, data)
