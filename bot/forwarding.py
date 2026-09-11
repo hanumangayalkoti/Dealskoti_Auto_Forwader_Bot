@@ -63,6 +63,7 @@ from .plans import (
     F_FOOTER,
     F_HEADER,
     F_HIDDEN_LINKS,
+    F_INLINE_BUTTONS,
     F_LINK_PREVIEW,
     F_MONO_TEXT,
     F_NO_WATERMARK,
@@ -551,6 +552,9 @@ class ForwardingEngine:
         self._floodwaits = 0
         # user_id -> live bulk-transfer state (progress + cancel flag)
         self._transfers: dict[int, dict] = {}
+        # dest_raw -> (bot_can_post, checked_at) — avoids a Telegram round-trip
+        # on every forward just to learn something that rarely changes
+        self._bot_admin_cache: dict[int, tuple[bool, float]] = {}
         # user_id -> monotonic time before which this account should not send
         # again. Enforced BEFORE taking a lane slot, so a user's own anti-ban
         # delay never consumes shared capacity.
@@ -1279,6 +1283,14 @@ class ForwardingEngine:
             # Free plan uses a native forward, which keeps the "Forwarded from"
             # tag. Every paid tier gets a clean copy — that IS "No BOT Watermark".
             clean_copy = plan_has(plan_name, F_NO_WATERMARK)
+
+            # Inline Buttons (Gold+). Loaded once per message, not per target.
+            button_markup = None
+            if plan_has(plan_name, F_INLINE_BUTTONS):
+                with suppress(Exception):
+                    button_markup = self._button_markup(
+                        await self.db.get_inline_buttons(user_id)
+                    )
             if replacement_file is not None and not clean_copy:
                 # A native forward carries the ORIGINAL file and cannot swap it.
                 replacement_file = None
@@ -1343,14 +1355,24 @@ class ForwardingEngine:
                             source_name = getattr(payload, "name", None) or "photo.jpg"
                             payload = io.BytesIO(payload.getvalue())
                             payload.name = source_name
-                        sent_msg = await client.send_message(
-                            dest_peer,
-                            message=new_text,
-                            file=payload,
-                            link_preview=link_preview,
-                            parse_mode=parse_mode,
-                            formatting_entities=entities,
-                        )
+                        # With buttons configured, try the bot first — only a
+                        # bot can attach them. If it is not an admin there, we
+                        # fall straight through to the user's own account so
+                        # the post still goes out, just without buttons.
+                        sent_msg = None
+                        if button_markup and await self._bot_can_post(dest_raw):
+                            sent_msg = await self._send_with_buttons(
+                                dest_raw, new_text, button_markup, message,
+                            )
+                        if sent_msg is None:
+                            sent_msg = await client.send_message(
+                                dest_peer,
+                                message=new_text,
+                                file=payload,
+                                link_preview=link_preview,
+                                parse_mode=parse_mode,
+                                formatting_entities=entities,
+                            )
                 except errors.FloodWaitError as fw:
                     # Temporary rate limit, NOT a broken destination. Wait it
                     # out once and repeat the EXACT same send — the previous
@@ -1513,6 +1535,75 @@ class ForwardingEngine:
                 self._cooldowns[user_id] = (
                     asyncio.get_running_loop().time() + antiban_delay
                 )
+
+    # ==========================================
+    # INLINE BUTTONS
+    # ==========================================
+    # Telegram only lets a BOT attach inline buttons, so a post can carry them
+    # only when this bot is an admin in the destination and sends it itself.
+    # Everything else still goes through the user's own account as before.
+
+    def _button_markup(self, buttons: dict):
+        """The reply markup for a post, or None when nothing is configured."""
+        if not buttons:
+            return None
+        row = []
+        for key in ("btn1", "btn2"):
+            button = buttons.get(key) or {}
+            if button.get("enabled") and button.get("label") and button.get("url"):
+                row.append({"text": str(button["label"]), "url": str(button["url"])})
+        return {"inline_keyboard": [row]} if row else None
+
+    async def _bot_can_post(self, dest_raw: int) -> bool:
+        """Is this bot an admin with posting rights in that chat?
+
+        Cached: asking Telegram on every message would add a round-trip to
+        every single forward.
+        """
+        if self.bot is None or dest_raw is None:
+            return False
+        cached = self._bot_admin_cache.get(dest_raw)
+        now = asyncio.get_running_loop().time()
+        if cached is not None and now - cached[1] < 600:
+            return cached[0]
+        allowed = False
+        try:
+            me = await self.bot.get_me()
+            member = await self.bot.get_chat_member(dest_raw, me.id)
+            allowed = getattr(member, "can_post_messages", None) is True or (
+                member.status == "creator"
+            )
+            if member.status == "administrator" and getattr(member, "can_post_messages", None) is None:
+                # Groups have no can_post_messages; being an admin is enough.
+                allowed = True
+        except Exception as exc:
+            logger.debug("Bot cannot post in %s: %s", dest_raw, exc)
+            allowed = False
+        self._bot_admin_cache[dest_raw] = (allowed, now)
+        return allowed
+
+    async def _send_with_buttons(self, dest_raw: int, text: str, markup, media_message):
+        """Sends the post from the BOT so buttons can be attached.
+
+        Returns the sent message, or None if the bot could not do it — in
+        which case the caller falls back to the user's own account, so a
+        misconfigured channel never means a lost post.
+        """
+        if self.bot is None:
+            return None
+        try:
+            if media_message is not None and getattr(media_message, "photo", None):
+                # Re-uploading media through the Bot API would mean downloading
+                # it first; sending text with the caption is not equivalent, so
+                # media posts keep the user-account path and lose only the
+                # buttons.
+                return None
+            return await self.bot.send_message(
+                dest_raw, text, parse_mode="HTML", reply_markup=markup,
+            )
+        except Exception as exc:
+            logger.debug("Bot send with buttons failed for %s: %s", dest_raw, exc)
+            return None
 
     async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
         """Best-effort user warning. Never raises — a blocked user or a network
