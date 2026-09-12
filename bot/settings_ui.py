@@ -59,6 +59,7 @@ from .plans import (
     F_FOOTER,
     F_HEADER,
     F_HIDDEN_LINKS,
+    F_INLINE_BUTTONS,
     F_LINK_PREVIEW,
     F_MONO_TEXT,
     F_PER_TARGET_HF,
@@ -222,7 +223,8 @@ _spec("remove_usernames", "🙈 Remove Usernames", CAT_CLEANUP, "toggle", F_REMO
 _spec("remove_links", "🚫 Remove Links", CAT_CLEANUP, "toggle", F_REMOVE_LINKS,
       "remove_links_prompt", False)
 _spec("disable_hidden_links", "🕵️ Disable Hidden Links", CAT_CLEANUP, "toggle",
-      F_HIDDEN_LINKS, "hidden_links_prompt", False)
+      F_HIDDEN_LINKS,
+    F_INLINE_BUTTONS, "hidden_links_prompt", False)
 _spec("trim_words", "✂️ Trim Words/Lines", CAT_CLEANUP, "list", F_TRIM_WORDS,
       "trim_words_prompt", [])
 
@@ -444,6 +446,12 @@ async def settings_task_menu(callback: CallbackQuery, db: Database) -> None:
                 text=f"🔒 {label}",
                 callback_data=f"st:lock:{task_id}:{specs[0].key}" if specs else "menu:plans",
             )])
+
+    # Inline Buttons live in this task's settings, so the way in is from here.
+    if plan_has(plan_name, F_INLINE_BUTTONS):
+        rows.append([InlineKeyboardButton(
+            text="🎛️ Inline Buttons", callback_data=f"ib:main:{task_id}",
+        )])
 
     rows.append([
         InlineKeyboardButton(
