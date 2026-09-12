@@ -1284,12 +1284,13 @@ class ForwardingEngine:
             # tag. Every paid tier gets a clean copy — that IS "No BOT Watermark".
             clean_copy = plan_has(plan_name, F_NO_WATERMARK)
 
-            # Inline Buttons (Gold+). Loaded once per message, not per target.
+            # Inline Buttons (Gold+), configured PER TASK — one channel may
+            # want "Join Channel" while another wants "Buy Now".
             button_markup = None
             if plan_has(plan_name, F_INLINE_BUTTONS):
                 with suppress(Exception):
                     button_markup = self._button_markup(
-                        await self.db.get_inline_buttons(user_id)
+                        self._json_field(settings.get("inline_buttons"), {})
                     )
             if replacement_file is not None and not clean_copy:
                 # A native forward carries the ORIGINAL file and cannot swap it.
@@ -1360,10 +1361,12 @@ class ForwardingEngine:
                         # fall straight through to the user's own account so
                         # the post still goes out, just without buttons.
                         sent_msg = None
-                        if button_markup and await self._bot_can_post(dest_raw):
-                            sent_msg = await self._send_with_buttons(
-                                dest_raw, new_text, button_markup, message,
-                            )
+                        if button_markup:
+                            bot_chat_id = self._bot_api_chat_id(dest_raw, dest)
+                            if bot_chat_id and await self._bot_can_post(bot_chat_id):
+                                sent_msg = await self._send_with_buttons(
+                                    bot_chat_id, new_text, button_markup, message,
+                                )
                         if sent_msg is None:
                             sent_msg = await client.send_message(
                                 dest_peer,
@@ -1543,6 +1546,28 @@ class ForwardingEngine:
     # only when this bot is an admin in the destination and sends it itself.
     # Everything else still goes through the user's own account as before.
 
+    @staticmethod
+    def _bot_api_chat_id(dest_raw: int, dest_ref: dict) -> int | None:
+        """Converts an internal peer id into the form the Bot API expects.
+
+        raw_peer_id() strips the -100 prefix because Telethon works with the
+        bare id — but the Bot API needs it back. Passing the bare id made every
+        permission check fail, which is why buttons never appeared.
+        """
+        if dest_raw is None:
+            return None
+        original = dest_ref.get("id")
+        try:
+            original = int(original)
+        except (TypeError, ValueError):
+            original = None
+        if original is not None and original < 0:
+            return original  # already in Bot API form
+        kind = str(dest_ref.get("type") or "").lower()
+        if "channel" in kind or "chat" in kind:
+            return int(f"-100{dest_raw}")
+        return int(f"-100{dest_raw}")
+
     def _button_markup(self, buttons: dict):
         """The reply markup for a post, or None when nothing is configured."""
         if not buttons:
@@ -1554,22 +1579,22 @@ class ForwardingEngine:
                 row.append({"text": str(button["label"]), "url": str(button["url"])})
         return {"inline_keyboard": [row]} if row else None
 
-    async def _bot_can_post(self, dest_raw: int) -> bool:
+    async def _bot_can_post(self, chat_id: int) -> bool:
         """Is this bot an admin with posting rights in that chat?
 
         Cached: asking Telegram on every message would add a round-trip to
         every single forward.
         """
-        if self.bot is None or dest_raw is None:
+        if self.bot is None or chat_id is None:
             return False
-        cached = self._bot_admin_cache.get(dest_raw)
+        cached = self._bot_admin_cache.get(chat_id)
         now = asyncio.get_running_loop().time()
         if cached is not None and now - cached[1] < 600:
             return cached[0]
         allowed = False
         try:
             me = await self.bot.get_me()
-            member = await self.bot.get_chat_member(dest_raw, me.id)
+            member = await self.bot.get_chat_member(chat_id, me.id)
             allowed = getattr(member, "can_post_messages", None) is True or (
                 member.status == "creator"
             )
@@ -1577,12 +1602,12 @@ class ForwardingEngine:
                 # Groups have no can_post_messages; being an admin is enough.
                 allowed = True
         except Exception as exc:
-            logger.debug("Bot cannot post in %s: %s", dest_raw, exc)
+            logger.debug("Bot cannot post in %s: %s", chat_id, exc)
             allowed = False
-        self._bot_admin_cache[dest_raw] = (allowed, now)
+        self._bot_admin_cache[chat_id] = (allowed, now)
         return allowed
 
-    async def _send_with_buttons(self, dest_raw: int, text: str, markup, media_message):
+    async def _send_with_buttons(self, chat_id: int, text: str, markup, media_message):
         """Sends the post from the BOT so buttons can be attached.
 
         Returns the sent message, or None if the bot could not do it — in
@@ -1599,10 +1624,10 @@ class ForwardingEngine:
                 # buttons.
                 return None
             return await self.bot.send_message(
-                dest_raw, text, parse_mode="HTML", reply_markup=markup,
+                chat_id, text, parse_mode="HTML", reply_markup=markup,
             )
         except Exception as exc:
-            logger.debug("Bot send with buttons failed for %s: %s", dest_raw, exc)
+            logger.debug("Bot send with buttons failed for %s: %s", chat_id, exc)
             return None
 
     async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
