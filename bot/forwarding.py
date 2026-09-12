@@ -1366,6 +1366,7 @@ class ForwardingEngine:
                             if bot_chat_id and await self._bot_can_post(bot_chat_id):
                                 sent_msg = await self._send_with_buttons(
                                     bot_chat_id, new_text, button_markup, message,
+                                    entities=entities,
                                 )
                         if sent_msg is None:
                             sent_msg = await client.send_message(
@@ -1607,28 +1608,79 @@ class ForwardingEngine:
         self._bot_admin_cache[chat_id] = (allowed, now)
         return allowed
 
-    async def _send_with_buttons(self, chat_id: int, text: str, markup, media_message):
+    async def _send_with_buttons(self, chat_id: int, text: str, markup, media_message, entities=None):
         """Sends the post from the BOT so buttons can be attached.
 
-        Returns the sent message, or None if the bot could not do it — in
-        which case the caller falls back to the user's own account, so a
-        misconfigured channel never means a lost post.
+        The entities are carried across too. Sending only the text stripped
+        every bit of formatting — bold, italic and premium emoji — so turning
+        buttons on silently made posts worse everywhere else.
+
+        Returns the sent message, or None if the bot could not do it, in which
+        case the caller falls back to the user's own account so a
+        misconfigured channel never costs a post.
         """
         if self.bot is None:
             return None
         try:
-            if media_message is not None and getattr(media_message, "photo", None):
+            if media_message is not None and getattr(media_message, "media", None):
                 # Re-uploading media through the Bot API would mean downloading
-                # it first; sending text with the caption is not equivalent, so
-                # media posts keep the user-account path and lose only the
-                # buttons.
+                # it first, so media posts keep the user-account path and lose
+                # only the buttons.
                 return None
+
+            bot_entities = self._to_bot_entities(entities)
             return await self.bot.send_message(
-                chat_id, text, parse_mode="HTML", reply_markup=markup,
+                chat_id, text,
+                entities=bot_entities,
+                parse_mode=None if bot_entities else "HTML",
+                reply_markup=markup,
             )
         except Exception as exc:
             logger.debug("Bot send with buttons failed for %s: %s", chat_id, exc)
             return None
+
+    @staticmethod
+    def _to_bot_entities(entities):
+        """Converts Telethon entities into the Bot API's shape.
+
+        The two libraries name the same things differently (MessageEntityBold
+        vs type="bold"), so they cannot be passed across as-is.
+        """
+        if not entities:
+            return None
+        from aiogram.types import MessageEntity
+
+        mapping = {
+            "MessageEntityBold": "bold",
+            "MessageEntityItalic": "italic",
+            "MessageEntityUnderline": "underline",
+            "MessageEntityStrike": "strikethrough",
+            "MessageEntitySpoiler": "spoiler",
+            "MessageEntityCode": "code",
+            "MessageEntityPre": "pre",
+            "MessageEntityTextUrl": "text_link",
+            "MessageEntityCustomEmoji": "custom_emoji",
+            "MessageEntityBlockquote": "blockquote",
+        }
+        out = []
+        for entity in entities:
+            kind = mapping.get(type(entity).__name__)
+            if kind is None:
+                continue
+            payload = {
+                "type": kind,
+                "offset": int(entity.offset),
+                "length": int(entity.length),
+            }
+            if kind == "text_link":
+                payload["url"] = getattr(entity, "url", None)
+            elif kind == "custom_emoji":
+                payload["custom_emoji_id"] = str(getattr(entity, "document_id", "") or "")
+            elif kind == "pre":
+                payload["language"] = getattr(entity, "language", None)
+            with suppress(Exception):
+                out.append(MessageEntity(**payload))
+        return out or None
 
     async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
         """Best-effort user warning. Never raises — a blocked user or a network
