@@ -1108,8 +1108,7 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
 def _account_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
-        [InlineKeyboardButton(text="📎 My File", callback_data="menu:myfile"),
-         InlineKeyboardButton(text="🎛️ Buttons", callback_data="ib:main")],
+        [InlineKeyboardButton(text="📎 My File", callback_data="menu:myfile")],
         [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect-ask")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
@@ -3034,31 +3033,52 @@ def _ib_status(buttons: dict, language: str) -> str:
     )
 
 
-def _ib_main_kb(buttons: dict) -> InlineKeyboardMarkup:
+def _ib_main_kb(buttons: dict, task_id: int) -> InlineKeyboardMarkup:
     b1 = buttons.get("btn1", {}).get("label") or "Button 1"
     b2 = buttons.get("btn2", {}).get("label") or "Button 2"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✏️ {b1}", callback_data="ib:open:btn1")],
-        [InlineKeyboardButton(text=f"✏️ {b2}", callback_data="ib:open:btn2")],
-        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:account"),
+        [InlineKeyboardButton(text=f"✏️ {b1}", callback_data=f"ib:open:{task_id}:btn1")],
+        [InlineKeyboardButton(text=f"✏️ {b2}", callback_data=f"ib:open:{task_id}:btn2")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data=f"st:task:{task_id}"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
 
 
-def _ib_detail_kb(key: str, button: dict) -> InlineKeyboardMarkup:
+def _ib_detail_kb(key: str, button: dict, task_id: int) -> InlineKeyboardMarkup:
     ready = bool(button.get("label") and button.get("url"))
     rows = [
-        [InlineKeyboardButton(text="📝 Rename", callback_data=f"ib:rename:{key}"),
-         InlineKeyboardButton(text="🔗 Set Link", callback_data=f"ib:link:{key}")],
+        [InlineKeyboardButton(text="📝 Rename", callback_data=f"ib:rename:{task_id}:{key}"),
+         InlineKeyboardButton(text="🔗 Set Link", callback_data=f"ib:link:{task_id}:{key}")],
     ]
     if ready:
         rows.append([InlineKeyboardButton(
             text="🔴 Turn OFF" if button.get("enabled") else "🟢 Turn ON",
-            callback_data=f"ib:toggle:{key}",
+            callback_data=f"ib:toggle:{task_id}:{key}",
         )])
-    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="ib:main"),
+    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data=f"ib:main:{task_id}"),
                  InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _ib_load(db: Database, user_id: int, task_id: int) -> dict:
+    """Buttons live in the TASK settings, so each task can have its own."""
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != user_id:
+        return {}
+    settings = _json_field(task["settings"], {})
+    stored = _json_field(settings.get("inline_buttons"), {})
+    config = {
+        "btn1": {"label": "Button 1", "url": "", "enabled": False},
+        "btn2": {"label": "Button 2", "url": "", "enabled": False},
+    }
+    for key in ("btn1", "btn2"):
+        if isinstance(stored.get(key), dict):
+            config[key].update(stored[key])
+    return config
+
+
+async def _ib_save(db: Database, user_id: int, task_id: int, config: dict) -> None:
+    await db.update_task_settings(user_id, task_id, {"inline_buttons": config})
 
 
 async def _ib_allowed(db: Database, user_id: int) -> bool:
@@ -3066,42 +3086,23 @@ async def _ib_allowed(db: Database, user_id: int) -> bool:
     return plan_has(str(user["plan"]) if user else "free", F_INLINE_BUTTONS)
 
 
-async def _ib_main(message_obj, db: Database, user_id: int, language: str) -> None:
-    buttons = await db.get_inline_buttons(user_id)
+async def _ib_main(message_obj, db: Database, user_id: int, language: str, task_id: int) -> None:
+    task = await db.get_task(task_id)
+    if task is None or int(task["user_id"]) != user_id:
+        return await _show_or_edit(message_obj, "⚠️ Task not found.", _nav_keyboard())
+    buttons = await _ib_load(db, user_id, task_id)
     await _show_or_edit(
         message_obj,
-        safe_t(language, "ib_main", status=_ib_status(buttons, language)),
-        _ib_main_kb(buttons),
+        f"📋 Task: <b>{safe_html(task['task_name'])}</b>\n\n"
+        + safe_t(language, "ib_main", status=_ib_status(buttons, language)),
+        _ib_main_kb(buttons, task_id),
     )
 
 
-@router.message(Command("inline_button", "setbutton"))
-async def inline_button_command(message: Message, db: Database) -> None:
-    language = await _language_for_message(db, message)
-    if not await _ib_allowed(db, message.from_user.id):
-        return await message.answer(
-            safe_t(language, "ib_locked"),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
-                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-            ]),
-        )
-    await _ib_main(message, db, message.from_user.id, language)
-
-
-@router.callback_query(F.data == "ib:main")
-async def ib_main_cb(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None:
-        return
-    language = await _language_for_callback(db, callback)
-    if not await _ib_allowed(db, callback.from_user.id):
-        return await callback.answer("Gold and above only", show_alert=True)
-    await _ib_main(callback.message, db, callback.from_user.id, language)
-    await callback.answer()
-
-
-async def _ib_detail(message_obj, db: Database, user_id: int, language: str, key: str) -> None:
-    buttons = await db.get_inline_buttons(user_id)
+async def _ib_detail(
+    message_obj, db: Database, user_id: int, language: str, key: str, task_id: int,
+) -> None:
+    buttons = await _ib_load(db, user_id, task_id)
     button = buttons.get(key, {})
     label = button.get("label") or "—"
     ready = bool(button.get("label") and button.get("url"))
@@ -3117,8 +3118,57 @@ async def _ib_detail(message_obj, db: Database, user_id: int, language: str, key
             status="✅ ON" if button.get("enabled") else "❌ OFF",
             preview=preview,
         ),
-        _ib_detail_kb(key, button),
+        _ib_detail_kb(key, button, task_id),
     )
+
+
+@router.message(Command("inline_button", "setbutton"))
+async def inline_button_command(message: Message, db: Database) -> None:
+    """Buttons are per TASK, so the task is chosen first."""
+    language = await _language_for_message(db, message)
+    if not await _ib_allowed(db, message.from_user.id):
+        return await message.answer(
+            safe_t(language, "ib_locked"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+        )
+
+    tasks = await db.list_tasks(message.from_user.id)
+    if not tasks:
+        return await message.answer(
+            "📭 <b>No tasks yet</b>\n\nCreate a task first — buttons are set per task, "
+            "so each of your channels can have its own.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+            ]),
+            parse_mode="HTML",
+        )
+    if len(tasks) == 1:
+        return await _ib_main(message, db, message.from_user.id, language, int(tasks[0]["id"]))
+
+    rows = [[InlineKeyboardButton(
+        text=f"🎛️ {t_['task_name'][:30]}", callback_data=f"ib:main:{t_['id']}",
+    )] for t_ in tasks]
+    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    await message.answer(
+        "🎛️ <b>Inline Buttons</b>\n\nWhich task should the buttons apply to?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("ib:main:"))
+async def ib_main_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
+    task_id = int(callback.data.rsplit(":", 1)[1])
+    language = await _language_for_callback(db, callback)
+    await _ib_main(callback.message, db, callback.from_user.id, language, task_id)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("ib:open:"))
@@ -3127,11 +3177,11 @@ async def ib_open_cb(callback: CallbackQuery, db: Database) -> None:
         return
     if not await _ib_allowed(db, callback.from_user.id):
         return await callback.answer("Gold and above only", show_alert=True)
-    key = callback.data.rsplit(":", 1)[1]
+    _, _, task_id, key = callback.data.split(":")
     if key not in ("btn1", "btn2"):
         return await callback.answer("Invalid", show_alert=True)
     language = await _language_for_callback(db, callback)
-    await _ib_detail(callback.message, db, callback.from_user.id, language, key)
+    await _ib_detail(callback.message, db, callback.from_user.id, language, key, int(task_id))
     await callback.answer()
 
 
@@ -3143,13 +3193,13 @@ async def ib_edit_prompt_cb(
         return
     if not await _ib_allowed(db, callback.from_user.id):
         return await callback.answer("Gold and above only", show_alert=True)
-    _, what, key = callback.data.split(":")
+    _, what, task_id, key = callback.data.split(":")
     if key not in ("btn1", "btn2"):
         return await callback.answer("Invalid", show_alert=True)
 
     language = await _language_for_callback(db, callback)
-    buttons = await db.get_inline_buttons(callback.from_user.id)
-    await state.update_data(ib_key=key)
+    buttons = await _ib_load(db, callback.from_user.id, int(task_id))
+    await state.update_data(ib_key=key, ib_task=int(task_id))
     if what == "rename":
         await state.set_state(InlineButtonStates.waiting_label)
         text = safe_t(
@@ -3169,19 +3219,21 @@ async def ib_label_input(message: Message, state: FSMContext, db: Database) -> N
         return
     language = await _language_for_message(db, message)
     raw = message.text.strip()
+    data = await state.get_data()
+    key = str(data.get("ib_key", "btn1"))
+    task_id = int(data.get("ib_task", 0))
+
     if raw == "/back":
         await state.clear()
-        return await _ib_main(message, db, message.from_user.id, language)
+        return await _ib_main(message, db, message.from_user.id, language, task_id)
     if not 1 <= len(raw) <= 30:
         return await message.answer(safe_t(language, "ib_bad_label"), parse_mode="HTML")
 
-    data = await state.get_data()
-    key = str(data.get("ib_key", "btn1"))
     await state.clear()
-    buttons = await db.get_inline_buttons(message.from_user.id)
+    buttons = await _ib_load(db, message.from_user.id, task_id)
     buttons.setdefault(key, {})["label"] = raw
-    await db.save_inline_buttons(message.from_user.id, buttons)
-    await _ib_detail(message, db, message.from_user.id, language, key)
+    await _ib_save(db, message.from_user.id, task_id, buttons)
+    await _ib_detail(message, db, message.from_user.id, language, key, task_id)
 
 
 @router.message(InlineButtonStates.waiting_url)
@@ -3192,27 +3244,28 @@ async def ib_url_input(message: Message, state: FSMContext, db: Database) -> Non
     raw = message.text.strip()
     data = await state.get_data()
     key = str(data.get("ib_key", "btn1"))
+    task_id = int(data.get("ib_task", 0))
 
     if raw == "/back":
         await state.clear()
-        return await _ib_main(message, db, message.from_user.id, language)
+        return await _ib_main(message, db, message.from_user.id, language, task_id)
 
-    buttons = await db.get_inline_buttons(message.from_user.id)
+    buttons = await _ib_load(db, message.from_user.id, task_id)
     if raw == "/clear":
         buttons.setdefault(key, {})["url"] = ""
         # A button with no link cannot be shown, so it is switched off too.
         buttons[key]["enabled"] = False
-        await db.save_inline_buttons(message.from_user.id, buttons)
+        await _ib_save(db, message.from_user.id, task_id, buttons)
         await state.clear()
-        return await _ib_detail(message, db, message.from_user.id, language, key)
+        return await _ib_detail(message, db, message.from_user.id, language, key, task_id)
 
     if not URL_INPUT_RE.match(raw):
         return await message.answer(safe_t(language, "ib_bad_link"), parse_mode="HTML")
 
     await state.clear()
     buttons.setdefault(key, {})["url"] = raw
-    await db.save_inline_buttons(message.from_user.id, buttons)
-    await _ib_detail(message, db, message.from_user.id, language, key)
+    await _ib_save(db, message.from_user.id, task_id, buttons)
+    await _ib_detail(message, db, message.from_user.id, language, key, task_id)
 
 
 @router.callback_query(F.data.startswith("ib:toggle:"))
@@ -3221,20 +3274,18 @@ async def ib_toggle_cb(callback: CallbackQuery, db: Database) -> None:
         return
     if not await _ib_allowed(db, callback.from_user.id):
         return await callback.answer("Gold and above only", show_alert=True)
-    key = callback.data.rsplit(":", 1)[1]
+    _, _, task_id, key = callback.data.split(":")
     if key not in ("btn1", "btn2"):
         return await callback.answer("Invalid", show_alert=True)
 
     language = await _language_for_callback(db, callback)
-    buttons = await db.get_inline_buttons(callback.from_user.id)
+    buttons = await _ib_load(db, callback.from_user.id, int(task_id))
     button = buttons.setdefault(key, {})
     if not (button.get("label") and button.get("url")):
-        return await callback.answer(
-            "Set a name and a link first", show_alert=True,
-        )
+        return await callback.answer("Set a name and a link first", show_alert=True)
     button["enabled"] = not button.get("enabled")
-    await db.save_inline_buttons(callback.from_user.id, buttons)
-    await _ib_detail(callback.message, db, callback.from_user.id, language, key)
+    await _ib_save(db, callback.from_user.id, int(task_id), buttons)
+    await _ib_detail(callback.message, db, callback.from_user.id, language, key, int(task_id))
     await callback.answer("ON" if button["enabled"] else "OFF")
 
 
