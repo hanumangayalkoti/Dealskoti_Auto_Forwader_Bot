@@ -552,6 +552,9 @@ class ForwardingEngine:
         self._floodwaits = 0
         # user_id -> live bulk-transfer state (progress + cancel flag)
         self._transfers: dict[int, dict] = {}
+        # (user_id, tag) -> when that notice was last sent, so a repeating
+        # condition does not produce a repeating message
+        self._notice_sent: dict[tuple[int, str], float] = {}
         # dest_raw -> (bot_can_post, checked_at) — avoids a Telegram round-trip
         # on every forward just to learn something that rarely changes
         self._bot_admin_cache: dict[int, tuple[bool, float]] = {}
@@ -590,8 +593,14 @@ class ForwardingEngine:
                 await self.refresh_user(user_id)
                 if len(self.clients) == before and await self.db.has_active_session(user_id):
                     # refresh_user refused to register the client, so the stored
-                    # session must be invalid — count it so we log a useful number.
+                    # session must be invalid.
                     bad_sessions += 1
+                    # This is the single most important thing to tell a user:
+                    # their forwarding has stopped completely and nothing in
+                    # the bot will show them why.
+                    await self._warn_once(
+                        user_id, "session_dead", "notify_session_dead", hours=24,
+                    )
         logger.info(
             f"Forwarding Engine started. Active clients: {len(self.clients)}. "
             f"Invalid sessions cleared: {bad_sessions}"
@@ -1170,8 +1179,16 @@ class ForwardingEngine:
         # A Message received from an event may only contain a bare peer ID.
         # Native forwarding needs the source entity/access hash explicitly.
         source_entity = None
-        with suppress(Exception):
+        try:
             source_entity = await event.get_chat()
+        except Exception as exc:
+            # The account can no longer read this source, so nothing will ever
+            # forward from it. Saying so beats a silently dead task.
+            logger.info("Source %s unreadable for user %s: %s", source_raw, user_id, exc)
+            await self._warn_once(
+                user_id, f"srclost:{source_raw}", "notify_source_lost",
+                hours=24, task="one of your tasks", source=str(source_raw),
+            )
 
         # Never re-forward something this engine itself just delivered, otherwise
         # A -> B and B -> A task pairs ping-pong forever.
@@ -1228,6 +1245,13 @@ class ForwardingEngine:
                     )
                 continue
 
+            if plan.daily_messages and usage >= int(plan.daily_messages * 0.8):
+                # A heads-up before the wall, so the day can be planned.
+                await self._warn_once(
+                    user_id, "limit_soon", "notify_limit_soon",
+                    hours=12, used=usage, cap=plan.daily_messages,
+                )
+
             destinations = [d for d in self._json_field(task["destinations"], []) if isinstance(d, dict)]
             if not destinations:
                 continue
@@ -1257,6 +1281,12 @@ class ForwardingEngine:
                     message, str(stored_file["extension"] or "")
                 ):
                     replacement_file = stored_file
+                    if not os.path.exists(str(stored_file["local_path"] or "")):
+                        # Silently falling back would leave the user believing
+                        # Replace File still works.
+                        await self._warn_once(
+                            user_id, "file_missing", "notify_file_missing", hours=24,
+                        )
             # With the code filter on the user wants the code only, so media is
             # deliberately dropped rather than sent alongside it.
             media_file = (
@@ -1336,7 +1366,9 @@ class ForwardingEngine:
                             return None  # nothing to send (e.g. service message)
 
                         payload = media_file
-                        if replacement_file is not None:
+                        if replacement_file is not None and os.path.exists(
+                            str(replacement_file["local_path"])
+                        ):
                             # The user's own file goes out instead of the
                             # source's, with the original caption untouched.
                             #
@@ -1345,7 +1377,13 @@ class ForwardingEngine:
                             # the on-disk basename, so subscribers received
                             # "8844066493_a1b2c3d4_MyApp.apk" instead of
                             # "MyApp.apk".
-                            payload = _named_file(replacement_file)
+                            # Guarded by the exists() check above: the disk is
+                            # wiped on every deploy, and without this a missing
+                            # file raised and the WHOLE message was skipped —
+                            # the post silently never arrived. Now the post
+                            # goes out with the source's own file instead.
+                            with suppress(Exception):
+                                payload = _named_file(replacement_file)
                         if isinstance(payload, io.BytesIO):
                             # A BytesIO can only be read once, so each parallel
                             # send needs its own view of the same bytes.
@@ -1368,6 +1406,15 @@ class ForwardingEngine:
                                     bot_chat_id, new_text, button_markup, message,
                                     entities=entities,
                                 )
+                            else:
+                                # The user set buttons up and they are not
+                                # appearing — they need to know why.
+                                await self._warn_once(
+                                    user_id, f"nobtn:{dest_raw}",
+                                    "notify_buttons_skipped", hours=24,
+                                    task=str(task["task_name"]),
+                                    dest=str(dest.get("title") or dest_raw),
+                                )
                         if sent_msg is None:
                             sent_msg = await client.send_message(
                                 dest_peer,
@@ -1389,6 +1436,13 @@ class ForwardingEngine:
                         wait, user_id, task["id"], dest_raw,
                     )
                     self._floodwaits += 1
+                    if wait >= 60:
+                        # Anything this long is a visible stall, so say so
+                        # rather than letting the user think it broke.
+                        await self._warn_once(
+                            user_id, "flood", "notify_flood",
+                            hours=6, minutes=max(1, wait // 60),
+                        )
                     if wait > 300:
                         return None  # too long to hold a slot for
                     await asyncio.sleep(wait + 1)
@@ -1681,6 +1735,22 @@ class ForwardingEngine:
             with suppress(Exception):
                 out.append(MessageEntity(**payload))
         return out or None
+
+    async def _warn_once(self, user_id: int, tag: str, key: str, hours: int = 12, **kwargs) -> None:
+        """Warns a user, but at most once per `hours` for the same thing.
+
+        Every one of these conditions repeats on EVERY message — a dead
+        session, a rate limit, a missing file. Without this guard a user with
+        a busy channel would get hundreds of identical warnings, which is
+        worse than no warning at all.
+        """
+        now = asyncio.get_running_loop().time()
+        marker = (user_id, tag)
+        last = self._notice_sent.get(marker)
+        if last is not None and now - last < hours * 3600:
+            return
+        self._notice_sent[marker] = now
+        await self._warn_user(user_id, key, **kwargs)
 
     async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
         """Best-effort user warning. Never raises — a blocked user or a network
