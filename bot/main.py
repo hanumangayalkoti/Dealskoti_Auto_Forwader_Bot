@@ -141,6 +141,8 @@ class BulkStates(StatesGroup):
     waiting_source = State()
     waiting_dest = State()
     waiting_date = State()
+    waiting_range_start = State()
+    waiting_range_end = State()
 
 
 class FeatureStates(StatesGroup):
@@ -382,6 +384,72 @@ def progress_line(done: int, total: int) -> str:
     return f"{progress_bar(done, total)}  {pct}%"
 
 
+class LiveLoader:
+    """A loading message that updates itself while work happens.
+
+    Two modes, chosen by whether a total is known:
+      * total given    -> a real percentage
+      * no total       -> a moving bar and a running count
+
+    A fake percentage would sit at 99% and look broken, so it is never shown
+    for work whose size cannot be known in advance.
+
+    Telegram rate-limits edits to roughly one per second, so updates are
+    throttled — pushing harder just gets them dropped.
+    """
+
+    def __init__(self, message: Message, key: str, language: str,
+                 total: int = 0, interval: float = 1.1, **extra):
+        self.message = message
+        self.key = key
+        self.language = language
+        self.total = total
+        self.interval = interval
+        self.extra = extra
+        self.done = 0
+        self._frame = 0
+        self._last_edit = 0.0
+        self._task: asyncio.Task | None = None
+
+    def _render(self) -> str:
+        if self.total > 0:
+            bar = progress_line(self.done, self.total)
+        else:
+            bar = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
+        return safe_t(
+            self.language, self.key, bar=bar,
+            found=f"{self.done:,}", done=f"{self.done:,}",
+            total=f"{self.total:,}", **self.extra,
+        )
+
+    async def _paint(self) -> None:
+        with suppress(Exception):
+            await self.message.edit_text(self._render(), parse_mode="HTML")
+
+    async def _run(self) -> None:
+        while True:
+            self._frame += 1
+            await self._paint()
+            await asyncio.sleep(self.interval)
+
+    def advance(self, by: int = 1, **extra) -> None:
+        """Called from the working loop; the painting happens on its own."""
+        self.done += by
+        if extra:
+            self.extra.update(extra)
+
+    async def __aenter__(self) -> "LiveLoader":
+        await self._paint()
+        self._task = asyncio.create_task(self._run())
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._task
+
+
 class Spinner:
     """An indeterminate loader, for work whose size cannot be known.
 
@@ -546,6 +614,10 @@ FLOW_LABELS: dict[str, str] = {
     "BulkStates:waiting_source": "Bulk Transfer",
     "BulkStates:waiting_dest": "Bulk Transfer",
     "BulkStates:waiting_date": "Bulk Transfer",
+    "BulkStates:waiting_range_start": "Bulk Transfer",
+    "BulkStates:waiting_range_end": "Bulk Transfer",
+    "BulkDeleteStates:waiting_range_start": "Bulk Delete",
+    "BulkDeleteStates:waiting_range_end": "Bulk Delete",
     "BulkDeleteStates:waiting_date": "Bulk Delete",
     "BulkDeleteStates:waiting_keyword": "Bulk Delete",
     "BulkDeleteStates:waiting_user": "Bulk Delete",
@@ -1775,7 +1847,11 @@ async def upload_receive(
         )
 
     await state.clear()
-    progress = await message.answer("⏳ <b>Uploading your file…</b>", parse_mode="HTML")
+    progress = await message.answer(
+        safe_t(language, "load_uploading", bar=SPINNER_FRAMES[0],
+               size=_human_size(getattr(message.document, "file_size", 0) or 0)),
+        parse_mode="HTML",
+    )
     async with _busy(message.bot, message.chat.id):
         await _do_store_upload(
             message.bot, db, telethon, settings, message.from_user.id,
@@ -1809,7 +1885,10 @@ async def upload_replace_cb(
         return await callback.answer()
 
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text("⏳ <b>Uploading your file…</b>", reply_markup=None)
+        await callback.message.edit_text(
+            safe_t("en", "load_uploading", bar=SPINNER_FRAMES[0], size="—"),
+            reply_markup=None, parse_mode="HTML",
+        )
     async with _busy(callback.bot, callback.message.chat.id):
         await _do_store_upload(
             callback.bot, db, telethon, settings, callback.from_user.id,
@@ -2041,7 +2120,11 @@ async def _render_chat_picker(
         # seconds; show a spinner so the screen never looks frozen.
         if edit and hasattr(message_obj, "edit_text"):
             with suppress(Exception):
-                await _safe_edit(message_obj, "⏳ <b>Loading your chats…</b>", None)
+                await _safe_edit(
+                    message_obj,
+                    safe_t(language, "load_chats", bar=SPINNER_FRAMES[0], found="0"),
+                    None,
+                )
         async with _busy(message_obj.bot, message_obj.chat.id):
             dialogs = await telethon.get_top_dialogs(user_id, limit=PICKER_DIALOG_LIMIT)
         await state.update_data(picker_dialogs=dialogs)
@@ -2363,11 +2446,18 @@ async def task_source(
         )
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
+    checking = await message.answer(
+        safe_t(language, "load_validating", bar=SPINNER_FRAMES[0]), parse_mode="HTML",
+    )
     try:
-        async with _busy(message.bot, message.chat.id):
+        async with Spinner(checking, safe_t(language, "load_validating", bar="").strip()):
             entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
+        with suppress(Exception):
+            await checking.delete()
         return await message.answer(f"⚠️ {safe_html(exc)}")
+    with suppress(Exception):
+        await checking.delete()
     if _is_protected(entity):
         return await message.answer(
             safe_t(language, "protected_source_blocked",
@@ -2581,7 +2671,8 @@ async def _bulk_after_dest(message_obj, state: FSMContext, db: Database,
         [InlineKeyboardButton(text="📆 Last 90 days", callback_data="bulk:range:90"),
          InlineKeyboardButton(text="🔢 Last 500 msgs", callback_data="bulk:range:500")],
         [InlineKeyboardButton(text="📚 Everything", callback_data="bulk:range:all")],
-        [InlineKeyboardButton(text="📅 After a date", callback_data="bulk:range:after")],
+        [InlineKeyboardButton(text="📅 After a date", callback_data="bulk:range:after"),
+         InlineKeyboardButton(text="📆 Between dates", callback_data="bulk:range:between")],
         [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
     ]
     await message_obj.answer(
@@ -2601,6 +2692,13 @@ async def bulk_range_cb(
     if callback.message is None:
         return
     key = callback.data.rsplit(":", 1)[1]
+    # Resolved up front: both the date branches below need it, and reading it
+    # only after them left `language` undefined on those paths.
+    language = await _language_for_callback(db, callback)
+
+    if key == "between":
+        await state.set_state(BulkStates.waiting_range_start)
+        return await _safe_edit(callback.message, safe_t(language, "bt_range_start"), None)
 
     if key == "after":
         # Same 10sep26 format as bulk delete, so there is one thing to learn.
@@ -2616,17 +2714,15 @@ async def bulk_range_cb(
     if key not in BULK_RANGES:
         return await callback.answer("Invalid option", show_alert=True)
     label, days, limit = BULK_RANGES[key]
-
-    language = await _language_for_callback(db, callback)
     data = await state.get_data()
     source, dest = data.get("bulk_source"), data.get("bulk_dest")
     if not source or not dest:
         return await callback.answer("Start again with /bulk_transfer", show_alert=True)
 
-    await _safe_edit(callback.message, "🔍 <b>Counting messages…</b>", None)
-    async with _busy(callback.bot, callback.message.chat.id):
+    async with LiveLoader(callback.message, "load_counting", language) as loader:
         count = await forwarding.count_transfer_messages(
             callback.from_user.id, source, days, limit,
+            progress_cb=lambda n: loader.advance(0, found=f"{n:,}") or setattr(loader, "done", n),
         )
 
     if count <= 0:
@@ -2689,8 +2785,14 @@ async def bulk_date_input(
     if not source or not dest:
         return await message.answer("⚠️ Please start again with /bulk_transfer")
 
-    notice = await message.answer("🔍 <b>Counting messages…</b>", parse_mode="HTML")
-    count = await forwarding.count_transfer_messages(message.from_user.id, source, days, None)
+    notice = await message.answer(
+        safe_t(language, "load_counting", bar=SPINNER_FRAMES[0], found="0"), parse_mode="HTML",
+    )
+    async with LiveLoader(notice, "load_counting", language) as loader:
+        count = await forwarding.count_transfer_messages(
+            message.from_user.id, source, days, None,
+            progress_cb=lambda n: setattr(loader, "done", n),
+        )
     with suppress(Exception):
         await notice.delete()
 
@@ -2712,6 +2814,108 @@ async def bulk_date_input(
     )
 
 
+@router.message(BulkStates.waiting_range_start)
+async def bulk_range_start(message: Message, state: FSMContext, db: Database) -> None:
+    """Transfer date range, step 1 of 2."""
+    from .bulk_delete_ui import parse_short_date
+
+    language = await _language_for_message(db, message)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.set_state(None)
+        return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
+
+    parsed = parse_short_date(raw)
+    if parsed is None:
+        return await message.answer(
+            "⚠️ <b>That date could not be read</b>\n\nPlease use this format: "
+            "<code>10sep26</code>", parse_mode="HTML",
+        )
+    if parsed > datetime.now(timezone.utc):
+        return await message.answer(
+            "⚠️ <b>That date is in the future</b>\n\nPlease send an earlier date.",
+            parse_mode="HTML",
+        )
+    await state.update_data(bulk_range_start=parsed.isoformat())
+    await state.set_state(BulkStates.waiting_range_end)
+    await message.answer(
+        safe_t(language, "bt_range_end", start=parsed.strftime("%d %b %Y")),
+        parse_mode="HTML",
+    )
+
+
+@router.message(BulkStates.waiting_range_end)
+async def bulk_range_end(
+    message: Message, state: FSMContext, db: Database, forwarding: ForwardingEngine,
+) -> None:
+    """Transfer date range, step 2 of 2 — then count and confirm."""
+    from .bulk_delete_ui import parse_short_date
+
+    language = await _language_for_message(db, message)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.set_state(None)
+        return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
+
+    parsed = parse_short_date(raw)
+    if parsed is None:
+        return await message.answer(
+            "⚠️ <b>That date could not be read</b>\n\nPlease use this format: "
+            "<code>15sep26</code>", parse_mode="HTML",
+        )
+
+    data = await state.get_data()
+    start = datetime.fromisoformat(str(data.get("bulk_range_start")))
+    end = parsed + timedelta(days=1)  # the end date is inclusive
+    if end <= start:
+        return await message.answer(
+            "⚠️ <b>The end date is before the start date</b>\n\n"
+            f"Start: <b>{start.strftime('%d %b %Y')}</b>\n"
+            f"End: <b>{parsed.strftime('%d %b %Y')}</b>\n\n"
+            "Please send an end date that comes after the start date.",
+            parse_mode="HTML",
+        )
+
+    label = f"Posts between {start.strftime('%d %b %Y')} and {parsed.strftime('%d %b %Y')}"
+    await state.set_state(None)
+    await state.update_data(
+        bulk_range="between", bulk_label=label,
+        bulk_start=start.isoformat(), bulk_end=end.isoformat(),
+    )
+
+    source, dest = data.get("bulk_source"), data.get("bulk_dest")
+    if not source or not dest:
+        return await message.answer("⚠️ Please start again with /bulk_transfer")
+
+    notice = await message.answer(
+        safe_t(language, "load_counting", bar=SPINNER_FRAMES[0], found="0"), parse_mode="HTML",
+    )
+    days = max(1, (datetime.now(timezone.utc) - start).days)
+    async with LiveLoader(notice, "load_counting", language) as loader:
+        count = await forwarding.count_transfer_messages(
+            message.from_user.id, source, days, None,
+            progress_cb=lambda n: setattr(loader, "done", n),
+        )
+    with suppress(Exception):
+        await notice.delete()
+
+    if count <= 0:
+        return await message.answer(safe_t(language, "bulk_empty"), reply_markup=_nav_keyboard())
+
+    await message.answer(
+        safe_t(
+            language, "bulk_confirm",
+            source=safe_html(source.get("title") or source.get("id")),
+            dest=safe_html(dest.get("title") or dest.get("id")),
+            range=label, count=f"{count:,}", eta=_eta_text(count, language),
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
+        ]),
+    )
+
+
 @router.callback_query(F.data == "bulk:go")
 async def bulk_go_cb(
     callback: CallbackQuery, state: FSMContext, db: Database, forwarding: ForwardingEngine,
@@ -2723,12 +2927,15 @@ async def bulk_go_cb(
     source, dest = data.get("bulk_source"), data.get("bulk_dest")
     key = str(data.get("bulk_range", "30"))
     await state.clear()
-    if not source or not dest or (key not in BULK_RANGES and key != "after"):
+    if not source or not dest or (key not in BULK_RANGES and key not in ("after", "between")):
         return await callback.answer("Start again with /bulk_transfer", show_alert=True)
 
-    if key == "after":
+    if key in ("after", "between"):
         days, limit = int(data.get("bulk_days") or 30), None
         label = str(data.get("bulk_label") or "Custom range")
+        if key == "between":
+            start = datetime.fromisoformat(str(data.get("bulk_start")))
+            days = max(1, (datetime.now(timezone.utc) - start).days)
     else:
         label, days, limit = BULK_RANGES[key]
     total = await forwarding.count_transfer_messages(callback.from_user.id, source, days, limit)
@@ -2764,8 +2971,12 @@ async def bulk_go_cb(
     )
     await callback.answer("Transfer started")
 
+    until = None
+    if key == "between" and data.get("bulk_end"):
+        until = datetime.fromisoformat(str(data.get("bulk_end")))
     result = await forwarding.run_bulk_transfer(
-        callback.from_user.id, source, dest, days, limit, progress_cb=progress,
+        callback.from_user.id, source, dest, days, limit,
+        progress_cb=progress, until=until,
     )
 
     if result.get("error") == "already_running":
@@ -2826,11 +3037,18 @@ async def bulk_source_input(
         )
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
+    checking = await message.answer(
+        safe_t(language, "load_validating", bar=SPINNER_FRAMES[0]), parse_mode="HTML",
+    )
     try:
-        async with _busy(message.bot, message.chat.id):
+        async with Spinner(checking, safe_t(language, "load_validating", bar="").strip()):
             entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
+        with suppress(Exception):
+            await checking.delete()
         return await message.answer(f"⚠️ {safe_html(exc)}")
+    with suppress(Exception):
+        await checking.delete()
     if _is_protected(entity):
         return await message.answer(
             safe_t(language, "protected_source_blocked",
@@ -4098,7 +4316,10 @@ def _json_revive(obj):
     return obj
 
 
-async def _make_backup(bot: Bot, db: Database, settings: Settings, reason: str = "nightly") -> str | None:
+async def _make_backup(
+    bot: Bot, db: Database, settings: Settings, reason: str = "nightly",
+    loader_message: Message | None = None,
+) -> str | None:
     """Writes a full database backup to the private backup channel.
 
     Returns the filename on success. Never raises — a failed backup must not
@@ -4108,8 +4329,20 @@ async def _make_backup(bot: Bot, db: Database, settings: Settings, reason: str =
     if not settings.backup_channel_id:
         return None
     try:
+        if loader_message is not None:
+            with suppress(Exception):
+                await loader_message.edit_text(
+                    safe_t("en", "load_backup", bar=progress_line(1, 3),
+                           step="reading the database"), parse_mode="HTML",
+                )
         data = await db.export_backup()
         counts = {k: len(v) for k, v in data.items()}
+        if loader_message is not None:
+            with suppress(Exception):
+                await loader_message.edit_text(
+                    safe_t("en", "load_backup", bar=progress_line(2, 3),
+                           step="writing the file"), parse_mode="HTML",
+                )
         stamp = datetime.now(IST).strftime("%Y-%m-%d_%H%M")
         name = f"dealkoti_backup_{stamp}.json"
         path = Path("uploads") / name
@@ -4155,8 +4388,12 @@ async def backup_command(message: Message, db: Database, settings: Settings) -> 
             "<code>BACKUP_CHANNEL_ID</code> in your environment variables.",
             parse_mode="HTML",
         )
-    notice = await message.answer("💾 Creating backup…")
-    name = await _make_backup(message.bot, db, settings, reason="manual")
+    language = await _language_for_message(db, message)
+    notice = await message.answer(
+        safe_t(language, "load_backup", bar=progress_line(0, 1), step="starting"),
+        parse_mode="HTML",
+    )
+    name = await _make_backup(message.bot, db, settings, reason="manual", loader_message=notice)
     with suppress(Exception):
         await notice.delete()
     await message.answer(
@@ -4253,7 +4490,11 @@ async def restore_apply(
 
     try:
         with suppress(TelegramBadRequest):
-            await callback.message.edit_text("♻️ Restoring…", reply_markup=None)
+            await callback.message.edit_text(
+                safe_t("en", "load_restore", bar=progress_line(1, 2),
+                       step="writing the tables"),
+                reply_markup=None, parse_mode="HTML",
+            )
         tg_file = await callback.bot.get_file(file_id)
         buf = await callback.bot.download_file(tg_file.file_path)
         payload = json.loads(buf.read().decode("utf-8"), object_hook=_json_revive)
@@ -4706,18 +4947,22 @@ async def broadcast_recall_run(
     if not rows:
         return await callback.answer("Nothing to recall", show_alert=True)
 
-    await _safe_edit(callback.message, f"↩️ Recalling from {len(rows)} chats…", None)
+    language = await _language_for_callback(db, callback)
     await callback.answer("Recalling")
 
     removed = failed = 0
-    for index, row in enumerate(rows, 1):
-        try:
-            await callback.bot.delete_message(int(row["user_id"]), int(row["message_id"]))
-            removed += 1
-        except Exception:
-            failed += 1
-        if index % 20 == 0:
-            await asyncio.sleep(1)  # same rate limit as sending
+    async with LiveLoader(
+        callback.message, "load_recall", language, total=len(rows),
+    ) as loader:
+        for index, row in enumerate(rows, 1):
+            try:
+                await callback.bot.delete_message(int(row["user_id"]), int(row["message_id"]))
+                removed += 1
+            except Exception:
+                failed += 1
+            loader.advance()
+            if index % 20 == 0:
+                await asyncio.sleep(1)  # same rate limit as sending
 
     await db.clear_broadcast_messages(broadcast_id)
     await _safe_edit(
@@ -4843,8 +5088,14 @@ async def admin_backup_cb(callback: CallbackQuery, db: Database, settings: Setti
             admin_keyboard(),
         )
         return await callback.answer()
-    await _safe_edit(callback.message, "💾 Creating backup…", None)
-    name = await _make_backup(callback.bot, db, settings, reason="manual")
+    language = await _language_for_callback(db, callback)
+    await _safe_edit(
+        callback.message,
+        safe_t(language, "load_backup", bar=progress_line(0, 1), step="starting"), None,
+    )
+    name = await _make_backup(
+        callback.bot, db, settings, reason="manual", loader_message=callback.message,
+    )
     await _safe_edit(
         callback.message,
         f"✅ Backup sent.\n\n<code>{safe_html(name)}</code>" if name
@@ -5922,10 +6173,15 @@ async def _run_broadcast(
     # Message ids are kept so a wrong broadcast can be recalled.
     delivered: list[tuple[int, int]] = []
 
+    language = await _language_for_callback(db, callback)
+    loader = LiveLoader(callback.message, "load_broadcast", language, total=len(users))
+    await loader.__aenter__()
+
     for i, u in enumerate(users, 1):
         try:
             posted = await callback.bot.send_message(int(u["telegram_user_id"]), text)
             sent += 1
+            loader.advance()
             if posted is not None:
                 delivered.append((int(u["telegram_user_id"]), int(posted.message_id)))
         except TelegramForbiddenError:
@@ -5939,6 +6195,7 @@ async def _run_broadcast(
         if i % 20 == 0:
             await asyncio.sleep(1)
 
+    await loader.__aexit__()
     await db.finish_broadcast(broadcast_id, sent, failed, blocked)
     with suppress(Exception):
         await db.record_broadcast_messages(broadcast_id, delivered)
