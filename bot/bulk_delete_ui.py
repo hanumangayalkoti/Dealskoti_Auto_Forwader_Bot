@@ -408,7 +408,26 @@ async def bulk_delete_list_cb(
     chats = data.get(f"bd_chats_{kind}")
 
     if not chats:
-        client, owned = await _acquire_client(callback.from_user.id, telethon, forwarding)
+        # The loader starts BEFORE the client is acquired. Connecting a client
+        # itself takes a second or two, and starting the animation after it
+        # left the screen frozen during exactly the part people notice.
+        client = None
+        owned = False
+        async with Loader(callback.message, "load_chats", language) as loader:
+            client, owned = await _acquire_client(
+                callback.from_user.id, telethon, forwarding,
+            )
+            if client is not None:
+                try:
+                    chats = await _collect_chats(
+                        client, kind, progress_cb=lambda n: setattr(loader, "done", n),
+                    )
+                except Exception:
+                    logger.exception("Could not list chats for %s", callback.from_user.id)
+                    chats = []
+                finally:
+                    await _release_client(client, owned)
+
         if client is None:
             return await _show(
                 callback.message, safe_t(language, "connect_required"),
@@ -416,16 +435,6 @@ async def bulk_delete_list_cb(
                     [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
                 ]),
             )
-        try:
-            async with Loader(callback.message, "load_chats", language) as loader:
-                chats = await _collect_chats(
-                    client, kind, progress_cb=lambda n: setattr(loader, "done", n),
-                )
-        except Exception:
-            logger.exception("Could not list chats for %s", callback.from_user.id)
-            chats = []
-        finally:
-            await _release_client(client, owned)
         await state.update_data({f"bd_chats_{kind}": chats})
 
     if not chats:
