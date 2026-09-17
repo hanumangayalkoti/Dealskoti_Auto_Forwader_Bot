@@ -2116,17 +2116,33 @@ async def _render_chat_picker(
     data = await state.get_data()
     selected, dialogs = _picker_field_state(data, field)
     if refresh or not dialogs:
-        # Reading the dialog list is a Telegram round-trip and can take a few
-        # seconds; show a spinner so the screen never looks frozen.
-        if edit and hasattr(message_obj, "edit_text"):
-            with suppress(Exception):
-                await _safe_edit(
-                    message_obj,
-                    safe_t(language, "load_chats", bar=SPINNER_FRAMES[0], found="0"),
-                    None,
+        # Reading the dialog list is a Telegram round-trip and can take several
+        # seconds. A single static frame looked frozen, so the loader animates
+        # for the whole wait — this is the longest pause in the whole bot.
+        loader = None
+        if hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
+            loader = LiveLoader(message_obj, "load_chats", language)
+        else:
+            holder = await message_obj.answer(
+                safe_t(language, "load_chats", bar=SPINNER_FRAMES[0], found="0"),
+                parse_mode="HTML",
+            )
+            loader = LiveLoader(holder, "load_chats", language)
+
+        await loader.__aenter__()
+        try:
+            async with _busy(message_obj.bot, message_obj.chat.id):
+                dialogs = await telethon.get_top_dialogs(
+                    user_id, limit=PICKER_DIALOG_LIMIT,
+                    progress_cb=lambda n: setattr(loader, "done", n),
                 )
-        async with _busy(message_obj.bot, message_obj.chat.id):
-            dialogs = await telethon.get_top_dialogs(user_id, limit=PICKER_DIALOG_LIMIT)
+        finally:
+            await loader.__aexit__()
+            # A freshly sent holder is removed; an edited screen is reused by
+            # the picker that follows.
+            if loader.message is not message_obj:
+                with suppress(Exception):
+                    await loader.message.delete()
         await state.update_data(picker_dialogs=dialogs)
 
     user = await db.get_user(user_id)
