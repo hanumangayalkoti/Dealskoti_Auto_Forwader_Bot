@@ -342,7 +342,9 @@ class TelethonService:
     # RECENT CHATS (PICKER)
     # ==========================================
 
-    async def get_top_dialogs(self, user_id: int, limit: int = 20) -> list[dict]:
+    async def get_top_dialogs(
+        self, user_id: int, limit: int = 20, progress_cb=None,
+    ) -> list[dict]:
         """The user's most recent chats/channels, in Telegram's own order
         (pinned first). Bots, groups, channels and private chats are ALL
         included — the only omissions are chats Telegram itself won't show
@@ -357,7 +359,14 @@ class TelethonService:
             if not await client.is_user_authorized():
                 logger.warning(f"get_top_dialogs: session for user {user_id} is not authorized")
                 return []
+            scanned = 0
             async for dialog in client.iter_dialogs(limit=limit):
+                scanned += 1
+                # Reported live so the loader shows a growing count instead of
+                # a bar that moves with no information behind it.
+                if progress_cb is not None and scanned % 5 == 0:
+                    with suppress(Exception):
+                        progress_cb(scanned)
                 entity = dialog.entity
                 results.append({
                     "id": entity.id,
