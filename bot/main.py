@@ -1,5 +1,5 @@
 """
-DealsKoti Auto Forwarder — bot entrypoint.
+DealKoti Auto Forwarder — bot entrypoint.
 
 This file owns: onboarding, the channel gate, login, tasks, the chat picker,
 file upload, admin tools, the Razorpay webhook and the process bootstrap.
@@ -140,6 +140,7 @@ class BulkStates(StatesGroup):
     """One-time history transfer: pick a source chat, then a destination."""
     waiting_source = State()
     waiting_dest = State()
+    waiting_date = State()
 
 
 class FeatureStates(StatesGroup):
@@ -355,6 +356,73 @@ def language_keyboard() -> InlineKeyboardMarkup:
 
 
 # ==========================================
+# LOADING ANIMATION
+# ==========================================
+# Telegram has no real animation — the illusion comes from editing one message
+# repeatedly, and it rate-limits edits to roughly one per second. So "smooth"
+# has a hard ceiling; these helpers aim for readable rather than frantic.
+
+SPINNER_FRAMES = ("▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱",
+                  "▱▰▰▰▰▱▱▱", "▱▱▰▰▰▰▱▱", "▱▱▱▰▰▰▰▱", "▱▱▱▱▰▰▰▰",
+                  "▱▱▱▱▱▰▰▰", "▱▱▱▱▱▱▰▰", "▱▱▱▱▱▱▱▰", "▱▱▱▱▱▱▱▱")
+
+PROGRESS_WIDTH = 12
+
+
+def progress_bar(done: int, total: int, width: int = PROGRESS_WIDTH) -> str:
+    if total <= 0:
+        return "▱" * width
+    filled = max(0, min(width, round(width * done / total)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def progress_line(done: int, total: int) -> str:
+    """A bar WITH a percentage — only for work whose total is actually known."""
+    pct = min(100, int(100 * done / total)) if total else 0
+    return f"{progress_bar(done, total)}  {pct}%"
+
+
+class Spinner:
+    """An indeterminate loader, for work whose size cannot be known.
+
+    Reading a user's dialog list has no total, so there is no honest
+    percentage to show — a made-up one would sit at 99% and look broken.
+    This shows motion instead, which is the truthful version.
+    """
+
+    def __init__(self, message: Message, label: str, interval: float = 1.2):
+        self.message = message
+        self.label = label
+        self.interval = interval
+        self._task: asyncio.Task | None = None
+
+    async def _run(self) -> None:
+        index = 0
+        while True:
+            frame = SPINNER_FRAMES[index % len(SPINNER_FRAMES)]
+            with suppress(Exception):
+                await self.message.edit_text(
+                    f"{self.label}\n\n{frame}", parse_mode="HTML",
+                )
+            index += 1
+            await asyncio.sleep(self.interval)
+
+    async def __aenter__(self) -> "Spinner":
+        with suppress(Exception):
+            await self.message.edit_text(
+                f"{self.label}\n\n{SPINNER_FRAMES[0]}", parse_mode="HTML",
+            )
+        self._task = asyncio.create_task(self._run())
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._task
+
+
+# ==========================================
 # STALE MESSAGE CLEANUP
 # ==========================================
 # Tapping a button on an OLDER menu leaves the newer messages below it
@@ -477,6 +545,10 @@ FLOW_LABELS: dict[str, str] = {
     "RestoreStates:waiting_confirm": "Database Restore",
     "BulkStates:waiting_source": "Bulk Transfer",
     "BulkStates:waiting_dest": "Bulk Transfer",
+    "BulkStates:waiting_date": "Bulk Transfer",
+    "BulkDeleteStates:waiting_date": "Bulk Delete",
+    "BulkDeleteStates:waiting_keyword": "Bulk Delete",
+    "BulkDeleteStates:waiting_user": "Bulk Delete",
     "BulkDeleteStates:waiting_confirm": "Bulk Delete",
     "FeatureStates:waiting_name": "Editing a Feature",
     "FeatureStates:waiting_link": "Editing a Feature",
@@ -2509,6 +2581,7 @@ async def _bulk_after_dest(message_obj, state: FSMContext, db: Database,
         [InlineKeyboardButton(text="📆 Last 90 days", callback_data="bulk:range:90"),
          InlineKeyboardButton(text="🔢 Last 500 msgs", callback_data="bulk:range:500")],
         [InlineKeyboardButton(text="📚 Everything", callback_data="bulk:range:all")],
+        [InlineKeyboardButton(text="📅 After a date", callback_data="bulk:range:after")],
         [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
     ]
     await message_obj.answer(
@@ -2528,6 +2601,18 @@ async def bulk_range_cb(
     if callback.message is None:
         return
     key = callback.data.rsplit(":", 1)[1]
+
+    if key == "after":
+        # Same 10sep26 format as bulk delete, so there is one thing to learn.
+        await state.set_state(BulkStates.waiting_date)
+        return await _safe_edit(
+            callback.message,
+            "📅 <b>Send a date</b>\n\nFormat: <code>10sep26</code>\n\n"
+            "Posts made <b>after</b> this date will be copied. Anything older "
+            "is left behind.\n\nPlease send the date, or /back to cancel.",
+            None,
+        )
+
     if key not in BULK_RANGES:
         return await callback.answer("Invalid option", show_alert=True)
     label, days, limit = BULK_RANGES[key]
@@ -2567,6 +2652,66 @@ async def bulk_range_cb(
     await callback.answer()
 
 
+@router.message(BulkStates.waiting_date)
+async def bulk_date_input(
+    message: Message, state: FSMContext, db: Database, forwarding: ForwardingEngine,
+) -> None:
+    """A custom start date for the transfer, in the same 10sep26 format."""
+    from .bulk_delete_ui import parse_short_date
+
+    language = await _language_for_message(db, message)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.set_state(None)
+        return await message.answer("↩️ Cancelled.", reply_markup=_nav_keyboard())
+
+    parsed = parse_short_date(raw)
+    if parsed is None:
+        return await message.answer(
+            "⚠️ <b>That date could not be read</b>\n\nPlease use this format: "
+            "<code>10sep26</code>\n\nThat means 10 September 2026.",
+            parse_mode="HTML",
+        )
+    if parsed > datetime.now(timezone.utc):
+        return await message.answer(
+            "⚠️ <b>That date is in the future</b>\n\nNothing was posted after it, "
+            "so there would be nothing to copy.\n\nPlease send an earlier date.",
+            parse_mode="HTML",
+        )
+
+    days = max(1, (datetime.now(timezone.utc) - parsed).days)
+    pretty = parsed.strftime("%d %b %Y")
+    await state.set_state(None)
+    await state.update_data(bulk_range="after", bulk_days=days, bulk_label=f"Posts after {pretty}")
+
+    data = await state.get_data()
+    source, dest = data.get("bulk_source"), data.get("bulk_dest")
+    if not source or not dest:
+        return await message.answer("⚠️ Please start again with /bulk_transfer")
+
+    notice = await message.answer("🔍 <b>Counting messages…</b>", parse_mode="HTML")
+    count = await forwarding.count_transfer_messages(message.from_user.id, source, days, None)
+    with suppress(Exception):
+        await notice.delete()
+
+    if count <= 0:
+        return await message.answer(safe_t(language, "bulk_empty"), reply_markup=_nav_keyboard())
+
+    await message.answer(
+        safe_t(
+            language, "bulk_confirm",
+            source=safe_html(source.get("title") or source.get("id")),
+            dest=safe_html(dest.get("title") or dest.get("id")),
+            range=f"Posts after {pretty}", count=f"{count:,}",
+            eta=_eta_text(count, language),
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go")],
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
+        ]),
+    )
+
+
 @router.callback_query(F.data == "bulk:go")
 async def bulk_go_cb(
     callback: CallbackQuery, state: FSMContext, db: Database, forwarding: ForwardingEngine,
@@ -2578,10 +2723,14 @@ async def bulk_go_cb(
     source, dest = data.get("bulk_source"), data.get("bulk_dest")
     key = str(data.get("bulk_range", "30"))
     await state.clear()
-    if not source or not dest or key not in BULK_RANGES:
+    if not source or not dest or (key not in BULK_RANGES and key != "after"):
         return await callback.answer("Start again with /bulk_transfer", show_alert=True)
 
-    label, days, limit = BULK_RANGES[key]
+    if key == "after":
+        days, limit = int(data.get("bulk_days") or 30), None
+        label = str(data.get("bulk_label") or "Custom range")
+    else:
+        label, days, limit = BULK_RANGES[key]
     total = await forwarding.count_transfer_messages(callback.from_user.id, source, days, limit)
     src_name = safe_html(source.get("title") or source.get("id"))
     dst_name = safe_html(dest.get("title") or dest.get("id"))
@@ -3962,7 +4111,7 @@ async def _make_backup(bot: Bot, db: Database, settings: Settings, reason: str =
         data = await db.export_backup()
         counts = {k: len(v) for k, v in data.items()}
         stamp = datetime.now(IST).strftime("%Y-%m-%d_%H%M")
-        name = f"dealskoti_backup_{stamp}.json"
+        name = f"dealkoti_backup_{stamp}.json"
         path = Path("uploads") / name
         path.parent.mkdir(exist_ok=True)
         payload = {"version": 1, "created_at": datetime.now(timezone.utc).isoformat(), "data": data}
@@ -4023,7 +4172,7 @@ async def restore_command(message: Message, settings: Settings) -> None:
         return
     await message.answer(
         "♻️ <b>Restore from Backup</b>\n\n"
-        "Forward or upload a <code>dealskoti_backup_*.json</code> file here.\n\n"
+        "Forward or upload a <code>dealkoti_backup_*.json</code> file here.\n\n"
         "⚠️ This <b>replaces everything</b> currently in the database.\n"
         "A safety backup of the current data is taken first, automatically.",
         parse_mode="HTML", reply_markup=admin_keyboard(),
@@ -4044,7 +4193,7 @@ async def restore_receive(
     if await state.get_state() is not None:
         return  # a different flow owns this message
     name = (message.document.file_name or "").lower()
-    if not (name.startswith("dealskoti_backup") and name.endswith(".json")):
+    if not (name.startswith("dealkoti_backup") and name.endswith(".json")):
         return
 
     notice = await message.answer("🔍 Reading backup…")
@@ -4054,7 +4203,7 @@ async def restore_receive(
         payload = json.loads(buf.read().decode("utf-8"), object_hook=_json_revive)
         data = payload.get("data") or {}
         if not isinstance(data, dict) or "users" not in data:
-            raise ValueError("This does not look like a DealsKoti backup")
+            raise ValueError("This does not look like a DealKoti backup")
     except Exception as exc:
         with suppress(Exception):
             await notice.delete()
@@ -5932,7 +6081,7 @@ def build_app(
     bot: Bot, db: Database, settings: Settings,
     billing: RazorpayBilling, forwarding: ForwardingEngine,
 ) -> FastAPI:
-    app = FastAPI(title="Dealskoti Forwarder", version="1.0.0", docs_url=None, redoc_url=None)
+    app = FastAPI(title="DealKoti Forwarder", version="1.0.0", docs_url=None, redoc_url=None)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
