@@ -1,5 +1,5 @@
 """
-Plan definitions, pricing and feature gating for the DealsKoti forwarder bot.
+Plan definitions, pricing and feature gating for the DealKoti forwarder bot.
 
 This module is the SINGLE SOURCE OF TRUTH for:
   * what each plan costs (INR / USDT / Telegram Stars)
@@ -326,7 +326,10 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
 
 
 # Tier shown next to each feature on the public All Features list.
-TIER_ICON = {"basic": "🥉", "silver": "🥈", "gold": "🥇", "platinum": "💎"}
+# Tier emoji. The KEYS ("basic", "silver"…) are never renamed — every existing
+# user row stores one of them, so changing a key would break their plan. Only
+# the emoji and display names are cosmetic and safe to change.
+TIER_ICON = {"basic": "🌱", "silver": "⚡", "gold": "🚀", "platinum": "💎"}
 TIER_LABEL = {
     "basic": "Basic & Above", "silver": "Silver & Above",
     "gold": "Gold & Above", "platinum": "Platinum Only",
@@ -346,26 +349,57 @@ def feature_slug(name: str) -> str:
     return "_".join(part for part in "".join(out).split("_") if part)[:120]
 
 
-# The order the public All Features list is shown in. The strongest selling
-# points come first, because with pagination most people only ever read page 1.
-# Anything not listed here keeps its tier order after these.
-FEATURE_HIGHLIGHTS = [
-    "Auto Forwarding",
-    "Bulk Delete Messages",
-    "Topics Forwarding",
+# The public All Features list is ordered TOP TIER FIRST: Platinum-only
+# features, then Gold and above, then Silver, then Basic.
+#
+# The reasoning is deliberate. With pagination most people only read page 1,
+# so page 1 has to carry what makes this bot different from every other
+# forwarder — the Platinum-only work. Within each tier the strongest features
+# come first.
+FEATURE_PRIORITY = [
+    # 💎 Platinum only — the actual USP
     "Custom Image Watermark",
     "Auto Reaction System",
-    "Automatic Post Edit Sync",
     "Replace File",
     "Sender Filter",
-    "Replace Links",
-    "Blacklist Keywords",
+    "Automatic Post Edit Sync",
+    "Watermark Position/Size/Opacity",
     "Custom Header/Footer Per Target",
+    "Advanced Text Replacement",
+    "Advanced Link Replacement",
+    # 🚀 Gold and above
+    "Bulk Delete Messages",
+    "Bulk Transfer Messages",
+    "Set Inline Buttons",
+    "Topics Forwarding",
     "Delay Timer Per Target",
+    "Post Edit Sync ON/OFF",
+    "Auto Delete Messages ON/OFF",
+    "Trim Single Words/Lines",
+    "Replace Links",
+    "Instant VIP Support",
+    "Header & Footer Control",
+    # ⚡ Silver and above
     "Mono Text ON/OFF",
+    "Blacklist Keywords",
+    "Whitelist Keywords",
+    "Replace Usernames",
+    "Replace Words (Text)",
+    "Remove Links ON/OFF",
+    "Remove Usernames ON/OFF",
+    "Disable Hidden Links ON/OFF",
+    "Add Header Text",
+    "Add Footer Text",
+    "Link Preview ON/OFF",
     "Anti-Ban Speed Forwarding",
+    "Super Fast Message Delivery",
+    # 🌱 Basic
+    "Auto Forwarding",
     "Media Forwarding",
+    "No BOT Watermark",
 ]
+
+TIER_WEIGHT = {"platinum": 0, "gold": 1, "silver": 2, "basic": 3}
 
 
 def seed_feature_rows() -> list[dict]:
@@ -386,8 +420,13 @@ def seed_feature_rows() -> list[dict]:
             seen.add(slug)
             collected.append({"slug": slug, "name": label, "tier": tier})
 
-    priority = {feature_slug(n): i for i, n in enumerate(FEATURE_HIGHLIGHTS)}
-    collected.sort(key=lambda r: priority.get(r["slug"], 1000 + len(collected)))
+    # Sort by tier (Platinum first), then by the curated order inside it.
+    priority = {feature_slug(n): i for i, n in enumerate(FEATURE_PRIORITY)}
+    collected.sort(key=lambda r: (
+        TIER_WEIGHT.get(r["tier"], 9),
+        priority.get(r["slug"], 500),
+        r["name"],
+    ))
     for index, row in enumerate(collected):
         row["sort_order"] = index
     return collected
