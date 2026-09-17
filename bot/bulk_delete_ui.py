@@ -32,8 +32,10 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -73,6 +75,40 @@ CONFIRM_WORD = "DELETE"
 
 class BulkDeleteStates(StatesGroup):
     waiting_confirm = State()
+    waiting_date = State()
+    waiting_keyword = State()
+    waiting_user = State()
+
+
+# ==========================================
+# FILTERS
+# ==========================================
+# Each filter narrows WHAT gets deleted. The label is carried through to the
+# confirmation and the final report, so the admin and the user can both see
+# exactly what was removed rather than a bare count.
+
+DATE_INPUT_RE = re.compile(r"^(\d{1,2})([a-z]{3})(\d{2,4})$", re.IGNORECASE)
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def parse_short_date(raw: str):
+    """Parses 10sep26 -> date(2026, 9, 10). Returns None if unreadable."""
+    match = DATE_INPUT_RE.match(raw.strip())
+    if not match:
+        return None
+    day, month_name, year = match.groups()
+    month = MONTHS.get(month_name.lower())
+    if month is None:
+        return None
+    year_num = int(year)
+    if year_num < 100:
+        year_num += 2000
+    try:
+        return datetime(year_num, month, int(day), tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 # user_id -> live job state {cancel, deleted, failed, chat, started}
@@ -369,13 +405,7 @@ async def bulk_delete_intro_cb(callback: CallbackQuery, db: Database) -> None:
 async def bulk_delete_pick_cb(
     callback: CallbackQuery, state: FSMContext, db: Database,
 ) -> None:
-    """Straight to confirmation.
-
-    The original design offered "delete only MY messages", but in a broadcast
-    channel every post belongs to the CHANNEL, not to a user, so that filter
-    would match nothing and report "0 deleted" — which reads like a broken
-    bot. The scope is therefore always the whole history.
-    """
+    """Chat chosen — now pick what to delete."""
     if callback.message is None:
         return
     _, _, kind, index_str = callback.data.split(":")
@@ -387,21 +417,259 @@ async def bulk_delete_pick_cb(
         return await callback.answer("Please open the list again", show_alert=True)
 
     chat = chats[index]
-    await state.set_state(BulkDeleteStates.waiting_confirm)
     await state.update_data(
-        bd_chat_id=chat["id"], bd_chat_title=chat["title"], bd_asked_at=time.time(),
+        bd_chat_id=chat["id"], bd_chat_title=chat["title"], bd_kind=kind,
     )
+    rows = [
+        [InlineKeyboardButton(text="🗑️ Everything", callback_data="bd:f:all")],
+        [InlineKeyboardButton(text="🕐 Last 24 hours", callback_data="bd:f:24h")],
+        [InlineKeyboardButton(text="📅 After a date", callback_data="bd:f:after"),
+         InlineKeyboardButton(text="📅 Before a date", callback_data="bd:f:before")],
+        [InlineKeyboardButton(text="🖼️ Only media", callback_data="bd:f:media")],
+        [InlineKeyboardButton(text="🔤 Containing a word", callback_data="bd:f:keyword")],
+        [InlineKeyboardButton(text="👤 By a specific user", callback_data="bd:f:user")],
+        [InlineKeyboardButton(text="🧹 Service messages", callback_data="bd:f:service")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="menu:home")],
+    ]
     await _show(
         callback.message,
-        safe_t(
-            language, "bd_confirm",
-            chat=safe_html(chat["title"]), scope="All messages",
-        ),
+        safe_t(language, "bd_pick_filter", chat=safe_html(chat["title"])),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+FILTER_LABELS = {
+    "all": "All messages",
+    "24h": "Messages from the last 24 hours",
+    "media": "Only photos, videos and files",
+    "service": "Only service messages (joined / left / pinned)",
+}
+
+
+@router.callback_query(F.data.startswith("bd:f:"))
+async def bulk_delete_filter_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database,
+    telethon: TelethonService, forwarding: ForwardingEngine,
+) -> None:
+    """A filter was chosen. Some need a follow-up value first."""
+    if callback.message is None:
+        return
+    choice = callback.data.rsplit(":", 1)[1]
+    language = await _lang(db, callback.from_user.id)
+    data = await state.get_data()
+    chat_title = str(data.get("bd_chat_title") or "")
+
+    if choice in ("after", "before"):
+        await state.set_state(BulkDeleteStates.waiting_date)
+        await state.update_data(bd_filter=choice)
+        return await _ask(
+            callback,
+            safe_t(
+                language, "bd_date_prompt",
+                explain=safe_t(language, f"bd_date_{choice}"),
+            ),
+        )
+
+    if choice == "keyword":
+        await state.set_state(BulkDeleteStates.waiting_keyword)
+        await state.update_data(bd_filter=choice)
+        return await _ask(callback, safe_t(language, "bd_keyword_prompt"))
+
+    if choice == "user":
+        return await _bulk_delete_user_step(
+            callback, state, db, telethon, forwarding, language, chat_title,
+        )
+
+    if choice not in FILTER_LABELS:
+        return await callback.answer("Invalid option", show_alert=True)
+
+    await state.update_data(bd_filter=choice, bd_filter_value=None)
+    await _bulk_delete_confirm_screen(
+        callback.message, state, db, language, FILTER_LABELS[choice],
+    )
+    await callback.answer()
+
+
+async def _ask(callback: CallbackQuery, text: str) -> None:
+    await _show(
+        callback.message, text,
         InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Cancel", callback_data="bd:cancel")],
         ]),
     )
     await callback.answer()
+
+
+async def _bulk_delete_user_step(
+    callback: CallbackQuery, state: FSMContext, db: Database,
+    telethon: TelethonService, forwarding: ForwardingEngine,
+    language: str, chat_title: str,
+) -> None:
+    """Offers an admin list for channels, or asks for a username in groups.
+
+    In a CHANNEL every post belongs to the channel unless "Sign messages" is
+    on — so when it is off, filtering by user genuinely cannot work and the
+    user is told that instead of being handed a job that finds nothing.
+    """
+    data = await state.get_data()
+    kind = str(data.get("bd_kind") or "gr")
+    chat_id = int(data.get("bd_chat_id") or 0)
+    await state.update_data(bd_filter="user")
+
+    if kind == "ch":
+        client, owned = await _acquire_client(callback.from_user.id, telethon, forwarding)
+        if client is None:
+            return await _ask(callback, safe_t(language, "bd_user_prompt"))
+        try:
+            entity = await client.get_entity(chat_id)
+            signed = bool(getattr(entity, "signatures", False))
+            admins = []
+            if signed:
+                async for participant in client.iter_participants(entity, filter=None, limit=60):
+                    if getattr(participant, "bot", False):
+                        continue
+                    admins.append(participant)
+        except Exception:
+            logger.exception("Could not read channel admins")
+            return await _ask(callback, safe_t(language, "bd_no_admins"))
+        finally:
+            await _release_client(client, owned)
+
+        if not signed:
+            await _show(
+                callback.message,
+                safe_t(language, "bd_user_unsigned", chat=safe_html(chat_title)),
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Back", callback_data="bd:intro")],
+                    [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+                ]),
+            )
+            return await callback.answer()
+
+        if admins:
+            await state.update_data(
+                bd_admins=[{"id": a.id,
+                            "name": (a.first_name or a.username or str(a.id))}
+                           for a in admins[:20]],
+            )
+            rows = [[InlineKeyboardButton(
+                text=f"👤 {(a.first_name or a.username or a.id)}"[:40],
+                callback_data=f"bd:u:{i}",
+            )] for i, a in enumerate(admins[:20])]
+            rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data="bd:cancel")])
+            await _show(
+                callback.message,
+                safe_t(language, "bd_pick_admin", chat=safe_html(chat_title)),
+                InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+            return await callback.answer()
+
+    await state.set_state(BulkDeleteStates.waiting_user)
+    await _ask(callback, safe_t(language, "bd_user_prompt"))
+
+
+@router.callback_query(F.data.startswith("bd:u:"))
+async def bulk_delete_admin_pick_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database,
+) -> None:
+    if callback.message is None:
+        return
+    index = int(callback.data.rsplit(":", 1)[1])
+    data = await state.get_data()
+    admins = data.get("bd_admins") or []
+    if index < 0 or index >= len(admins):
+        return await callback.answer("Please start again", show_alert=True)
+    chosen = admins[index]
+    language = await _lang(db, callback.from_user.id)
+    await state.update_data(bd_filter="user", bd_filter_value=chosen["id"])
+    await _bulk_delete_confirm_screen(
+        callback.message, state, db, language,
+        f"Only posts by {chosen['name']}",
+    )
+    await callback.answer()
+
+
+@router.message(BulkDeleteStates.waiting_date)
+async def bulk_delete_date_input(
+    message: Message, state: FSMContext, db: Database,
+) -> None:
+    language = await _lang(db, message.from_user.id)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer(safe_t(language, "bd_cancelled"), parse_mode="HTML")
+
+    parsed = parse_short_date(raw)
+    if parsed is None:
+        return await message.answer(safe_t(language, "bd_date_bad"), parse_mode="HTML")
+    if parsed > datetime.now(timezone.utc):
+        return await message.answer(safe_t(language, "bd_date_future"), parse_mode="HTML")
+
+    data = await state.get_data()
+    which = str(data.get("bd_filter") or "after")
+    await state.update_data(bd_filter_value=parsed.isoformat())
+    # The PARSED date is echoed back: this is irreversible, and one typo
+    # could mean a completely different range.
+    pretty = parsed.strftime("%d %b %Y")
+    label = (
+        f"Posts after {pretty}" if which == "after" else f"Posts before {pretty}"
+    )
+    await _bulk_delete_confirm_screen(message, state, db, language, label)
+
+
+@router.message(BulkDeleteStates.waiting_keyword)
+async def bulk_delete_keyword_input(
+    message: Message, state: FSMContext, db: Database,
+) -> None:
+    language = await _lang(db, message.from_user.id)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer(safe_t(language, "bd_cancelled"), parse_mode="HTML")
+    if not 1 <= len(raw) <= 100:
+        return await message.answer("⚠️ Please send between 1 and 100 characters.")
+    await state.update_data(bd_filter_value=raw)
+    await _bulk_delete_confirm_screen(
+        message, state, db, language, f'Posts containing "{raw}"',
+    )
+
+
+@router.message(BulkDeleteStates.waiting_user)
+async def bulk_delete_user_input(
+    message: Message, state: FSMContext, db: Database,
+) -> None:
+    language = await _lang(db, message.from_user.id)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer(safe_t(language, "bd_cancelled"), parse_mode="HTML")
+    value = raw.lstrip("@")
+    if not value:
+        return await message.answer(safe_t(language, "bd_user_prompt"), parse_mode="HTML")
+    await state.update_data(bd_filter_value=int(value) if value.isdigit() else value)
+    await _bulk_delete_confirm_screen(
+        message, state, db, language, f"Only posts by {raw}",
+    )
+
+
+async def _bulk_delete_confirm_screen(
+    message_obj, state: FSMContext, db: Database, language: str, scope_label: str,
+) -> None:
+    data = await state.get_data()
+    chat_title = str(data.get("bd_chat_title") or "")
+    await state.set_state(BulkDeleteStates.waiting_confirm)
+    await state.update_data(bd_asked_at=time.time(), bd_scope_label=scope_label)
+    await _show(
+        message_obj,
+        safe_t(
+            language, "bd_confirm",
+            chat=safe_html(chat_title), scope=safe_html(scope_label),
+        ),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="bd:cancel")],
+        ]),
+    )
 
 
 @router.callback_query(F.data == "bd:cancel")
@@ -479,6 +747,8 @@ async def bulk_delete_confirm(
     await _run_delete_job(
         message.bot, db, settings, telethon, forwarding,
         message.from_user.id, int(chat_id), chat_title, language, status,
+        str(data.get("bd_filter") or "all"), data.get("bd_filter_value"),
+        str(data.get("bd_scope_label") or "All messages"),
     )
 
 
@@ -486,8 +756,10 @@ async def _run_delete_job(
     bot: Bot, db: Database, settings: Settings, telethon: TelethonService,
     forwarding: ForwardingEngine, user_id: int, chat_id: int, chat_title: str,
     language: str, status: Message,
+    filter_kind: str = "all", filter_value=None, scope_label: str = "All messages",
 ) -> None:
-    job = {"cancel": False, "deleted": 0, "failed": 0, "chat": chat_title}
+    job = {"cancel": False, "deleted": 0, "failed": 0, "chat": chat_title,
+           "scope": scope_label}
     _JOBS[user_id] = job
     started = time.time()
     client, owned = None, False
@@ -514,6 +786,40 @@ async def _run_delete_job(
 
         with_total = await client.get_messages(entity, limit=1)
         total_hint = int(getattr(with_total, "total", 0) or 0)
+
+        # Server-side narrowing wherever Telegram supports it — iterating the
+        # whole history and discarding most of it would be far slower.
+        iter_kwargs: dict = {}
+        if filter_kind == "24h":
+            iter_kwargs["offset_date"] = datetime.now(timezone.utc) - timedelta(hours=24)
+            iter_kwargs["reverse"] = True
+        elif filter_kind == "after" and filter_value:
+            iter_kwargs["offset_date"] = datetime.fromisoformat(str(filter_value))
+            iter_kwargs["reverse"] = True
+        elif filter_kind == "before" and filter_value:
+            # offset_date walks BACKWARDS from this point, which is exactly
+            # "everything older than this".
+            iter_kwargs["offset_date"] = datetime.fromisoformat(str(filter_value))
+        elif filter_kind == "keyword" and filter_value:
+            iter_kwargs["search"] = str(filter_value)
+        elif filter_kind == "user" and filter_value:
+            iter_kwargs["from_user"] = filter_value
+        elif filter_kind == "media":
+            from telethon.tl.types import InputMessagesFilterPhotoVideoDocuments
+            iter_kwargs["filter"] = InputMessagesFilterPhotoVideoDocuments()
+
+        def keep(msg) -> bool:
+            """The last word on whether a message matches the filter."""
+            if filter_kind == "service":
+                return getattr(msg, "action", None) is not None
+            if getattr(msg, "action", None) is not None:
+                # Service messages are only removed when explicitly asked for.
+                return False
+            if filter_kind == "media":
+                return getattr(msg, "media", None) is not None
+            if filter_kind == "keyword" and filter_value:
+                return str(filter_value).lower() in (msg.message or "").lower()
+            return True
 
         delay = BATCH_DELAY
         batch: list[int] = []
@@ -549,9 +855,11 @@ async def _run_delete_job(
         # Streamed, not collected. Holding every message id of a large channel
         # in memory would be a real cost on a small host, and streaming also
         # starts deleting immediately instead of after a full scan.
-        async for msg in client.iter_messages(entity):
+        async for msg in client.iter_messages(entity, **iter_kwargs):
             if job["cancel"]:
                 break
+            if not keep(msg):
+                continue
             batch.append(msg.id)
             if len(batch) >= DELETE_BATCH:
                 await flush()
@@ -585,7 +893,7 @@ async def _run_delete_job(
         )
     else:
         text = safe_t(language, "bd_done", chat=safe_html(chat_title),
-                      deleted=deleted, took=took)
+                      scope=safe_html(scope_label), deleted=deleted, took=took)
 
     await _show(
         status, text,
@@ -647,7 +955,7 @@ async def _log_to_admins(
         f"💎 Plan: {plan}\n\n"
         f"📛 Chat: <b>{safe_html(chat_title)}</b>\n"
         f"🆔 Chat ID: <code>{chat_id}</code>\n"
-        f"🗑️ Scope: All messages\n\n"
+        f"🗑️ Filter: <b>{safe_html(job.get('scope') or 'All messages')}</b>\n\n"
         f"🗑️ Deleted: <b>{job['deleted']:,}</b>\n"
         f"❌ Refused: {job['failed']:,}\n"
         f"⏱️ Took: {took}\n"
