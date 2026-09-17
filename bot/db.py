@@ -1,5 +1,5 @@
 """
-PostgreSQL layer for the DealsKoti forwarder bot.
+PostgreSQL layer for the DealKoti forwarder bot.
 
 NON-NEGOTIABLE RULES (do not "optimise" these away in a rewrite):
   1. NEVER add a DROP TABLE to MIGRATIONS_SQL. A redeploy must never wipe
