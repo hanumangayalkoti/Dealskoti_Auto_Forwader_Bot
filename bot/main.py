@@ -66,6 +66,7 @@ from .config import ConfigurationError, Settings
 from .db import Database
 from .faq import FAQS
 from .forwarding import IMAGE_EXTENSIONS, ForwardingEngine
+from .fsm_storage import PostgresStorage
 from .gate import enforce_gate, user_is_member
 from .locales import (
     ADMIN_COMMANDS,
@@ -6564,7 +6565,10 @@ async def _run(settings: Settings) -> None:
         bot=bot,
     )
 
-    dispatcher = Dispatcher()
+    # FSM state lives in Postgres, not memory. Railway restarts the bot on
+    # every deploy, and in-memory state was wiped each time — anyone halfway
+    # through a flow got "Unknown command" and assumed the bot was broken.
+    dispatcher = Dispatcher(storage=PostgresStorage(db))
     # Outer middleware so it runs BEFORE a handler is chosen — otherwise the
     # state-specific handler would win and swallow the command.
     dispatcher.message.outer_middleware(FlowInterruptMiddleware())
@@ -6681,6 +6685,12 @@ async def _run(settings: Settings) -> None:
     async def send_task_creation_reminders():
         await _send_task_creation_reminders(bot, db, settings)
 
+    async def prune_fsm():
+        with suppress(Exception):
+            removed = await db.prune_fsm_state(2)
+            if removed:
+                logger.info("Pruned %s abandoned flow states", removed)
+
     async def prune_broadcast_map():
         with suppress(Exception):
             removed = await db.prune_broadcast_messages(3)
@@ -6705,6 +6715,7 @@ async def _run(settings: Settings) -> None:
     scheduler.add_job(prune_edit_sync_map, CronTrigger(hour=4, minute=30, timezone=scheduler_tz), replace_existing=True)
     scheduler.add_job(nightly_backup, CronTrigger(hour=3, minute=0, timezone=scheduler_tz), replace_existing=True)
     scheduler.add_job(prune_broadcast_map, CronTrigger(hour=4, minute=45, timezone=scheduler_tz), replace_existing=True)
+    scheduler.add_job(prune_fsm, CronTrigger(hour=4, minute=50, timezone=scheduler_tz), replace_existing=True)
     scheduler.start()
 
     forwarding_task = None
