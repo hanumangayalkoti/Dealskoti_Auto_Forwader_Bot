@@ -13,7 +13,7 @@ class FAQItem:
 FAQS: dict[str, list[FAQItem]] = {
     "en": [
         FAQItem(
-            "What is DealsKoti Auto Forwarder Bot?",
+            "What is DealKoti Auto Forwarder Bot?",
             "It copies posts from your chosen source channels to your own channels automatically, in real time. Connect your account, create a task, pick a source and a destination — forwarding starts instantly and runs 24/7.",
         ),
         FAQItem(
@@ -75,7 +75,7 @@ FAQS: dict[str, list[FAQItem]] = {
     ],
     "hinglish": [
         FAQItem(
-            "DealsKoti Auto Forwarder Bot kya hai?",
+            "DealKoti Auto Forwarder Bot kya hai?",
             "Ye aapke chune hue source channels ki posts apne channels me apne aap copy karta hai, real time me. Account connect karo, task banao, source aur destination chuno — forwarding turant shuru ho jaati hai aur 24/7 chalti hai.",
         ),
         FAQItem(
