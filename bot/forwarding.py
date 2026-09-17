@@ -2138,7 +2138,8 @@ class ForwardingEngine:
         return True
 
     async def count_transfer_messages(
-        self, user_id: int, source_ref: dict, since_days: int | None, limit: int | None,
+        self, user_id: int, source_ref: dict, since_days: int | None,
+        limit: int | None, progress_cb=None,
     ) -> int:
         """How many messages the chosen range holds, so the confirmation can
         show a real number and a real time estimate."""
@@ -2159,6 +2160,11 @@ class ForwardingEngine:
             count = 0
             async for _ in client.iter_messages(peer, offset_date=cutoff, reverse=True):
                 count += 1
+                # Reported as it goes so the loader can show a live number
+                # instead of a frozen screen on a long history.
+                if progress_cb is not None and count % 50 == 0:
+                    with suppress(Exception):
+                        progress_cb(count)
                 if count >= 50000:
                     break
             return count
@@ -2169,6 +2175,7 @@ class ForwardingEngine:
     async def run_bulk_transfer(
         self, user_id: int, source_ref: dict, dest_ref: dict,
         since_days: int | None, limit: int | None, progress_cb=None,
+        until=None,
     ) -> dict:
         """Runs the copy. Returns a result summary.
 
@@ -2208,6 +2215,12 @@ class ForwardingEngine:
             async for message in iterator:
                 if state["cancel"]:
                     break
+                if until is not None:
+                    when = getattr(message, "date", None)
+                    if when is not None and when >= until:
+                        # Past the end of the requested range — the iterator
+                        # runs oldest-first here, so nothing further can match.
+                        break
                 if getattr(message, "action", None) is not None:
                     state["skipped"] += 1  # service message, cannot be copied
                     continue
