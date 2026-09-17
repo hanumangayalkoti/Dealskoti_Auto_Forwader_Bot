@@ -202,6 +202,20 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== FSM STATE =====
+-- Where each user is in a multi-step flow, kept in POSTGRES rather than in
+-- memory. Railway restarts the bot on every deploy, and in-memory state was
+-- wiped each time — a user halfway through /connect or a date range would get
+-- "Unknown command" and think the bot was broken.
+CREATE TABLE IF NOT EXISTS fsm_state (
+    key TEXT PRIMARY KEY,
+    state TEXT,
+    data JSONB DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_fsm_state_age ON fsm_state (updated_at);
+
 -- ===== FREE TRIAL =====
 -- One Gold trial per account, ever. The timestamp is what enforces it: a
 -- non-NULL value means the trial has already been claimed, so it can never
@@ -1554,6 +1568,78 @@ class Database:
     # ==========================================
     # FREE TRIAL
     # ==========================================
+
+    # ==========================================
+    # FSM STATE
+    # ==========================================
+
+    async def fsm_get(self, key: str) -> tuple[str | None, dict]:
+        if self.pool is None:
+            return None, {}
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT state, data FROM fsm_state WHERE key = $1", key,
+            )
+        if row is None:
+            return None, {}
+        raw = row["data"]
+        data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        return row["state"], dict(data)
+
+    async def fsm_set_state(self, key: str, state: str | None) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            if state is None:
+                # No state AND no data left means the row is dead weight.
+                await conn.execute(
+                    """UPDATE fsm_state SET state = NULL,
+                              updated_at = CURRENT_TIMESTAMP
+                       WHERE key = $1""",
+                    key,
+                )
+                await conn.execute(
+                    """DELETE FROM fsm_state
+                       WHERE key = $1 AND state IS NULL
+                         AND (data IS NULL OR data = '{}'::jsonb)""",
+                    key,
+                )
+                return
+            await conn.execute(
+                """INSERT INTO fsm_state (key, state)
+                   VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE
+                   SET state = $2, updated_at = CURRENT_TIMESTAMP""",
+                key, state,
+            )
+
+    async def fsm_set_data(self, key: str, data: dict) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO fsm_state (key, data)
+                   VALUES ($1, $2::jsonb)
+                   ON CONFLICT (key) DO UPDATE
+                   SET data = $2::jsonb, updated_at = CURRENT_TIMESTAMP""",
+                key, json.dumps(data, default=str),
+            )
+
+    async def fsm_clear(self, key: str) -> None:
+        if self.pool is None: return
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM fsm_state WHERE key = $1", key)
+
+    async def prune_fsm_state(self, days: int = 2) -> int:
+        """Drops abandoned flows. Nobody resumes a two-day-old prompt, and
+        without this the table only ever grows."""
+        if self.pool is None: return 0
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                f"DELETE FROM fsm_state WHERE updated_at < NOW() - INTERVAL '{int(days)} days'",  # noqa: S608
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
 
     async def trial_claimed_at(self, user_id: int):
         if self.pool is None: return None
