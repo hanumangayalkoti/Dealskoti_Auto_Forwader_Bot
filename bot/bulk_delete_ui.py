@@ -76,6 +76,8 @@ CONFIRM_WORD = "DELETE"
 class BulkDeleteStates(StatesGroup):
     waiting_confirm = State()
     waiting_date = State()
+    waiting_range_start = State()
+    waiting_range_end = State()
     waiting_keyword = State()
     waiting_user = State()
 
@@ -149,6 +151,67 @@ async def _show(message_obj, text: str, markup: InlineKeyboardMarkup | None = No
             if "message is not modified" in str(exc):
                 return
     await message_obj.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+SPINNER_FRAMES = ("▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱",
+                  "▱▰▰▰▰▱▱▱", "▱▱▰▰▰▰▱▱", "▱▱▱▰▰▰▰▱", "▱▱▱▱▰▰▰▰",
+                  "▱▱▱▱▱▰▰▰", "▱▱▱▱▱▱▰▰", "▱▱▱▱▱▱▱▰", "▱▱▱▱▱▱▱▱")
+
+
+class Loader:
+    """Keeps a loading message moving while slow work happens.
+
+    Shows a real percentage when the total is known and a moving bar when it
+    is not — a made-up percentage would sit at 99% and look broken.
+
+    Telegram drops edits sent faster than about one per second, so updates are
+    paced rather than pushed.
+    """
+
+    def __init__(self, message: Message, key: str, language: str,
+                 total: int = 0, interval: float = 1.1, **extra):
+        self.message, self.key, self.language = message, key, language
+        self.total, self.interval, self.extra = total, interval, extra
+        self.done = 0
+        self._frame = 0
+        self._task: asyncio.Task | None = None
+
+    def _render(self) -> str:
+        if self.total > 0:
+            bar = f"{_bar(self.done, self.total)}  {min(100, int(100 * self.done / self.total))}%"
+        else:
+            bar = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
+        return safe_t(
+            self.language, self.key, bar=bar,
+            found=f"{self.done:,}", done=f"{self.done:,}",
+            total=f"{self.total:,}", **self.extra,
+        )
+
+    async def _paint(self) -> None:
+        with suppress(Exception):
+            await self.message.edit_text(self._render(), parse_mode="HTML")
+
+    async def _run(self) -> None:
+        while True:
+            self._frame += 1
+            await self._paint()
+            await asyncio.sleep(self.interval)
+
+    def advance(self, by: int = 1, **extra) -> None:
+        self.done += by
+        if extra:
+            self.extra.update(extra)
+
+    async def __aenter__(self) -> "Loader":
+        await self._paint()
+        self._task = asyncio.create_task(self._run())
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._task
 
 
 def _bar(done: int, total: int, width: int = 12) -> str:
@@ -294,11 +357,20 @@ async def bulk_delete_command(
 # ==========================================
 
 async def _collect_chats(
-    client: TelegramClient, kind: str, limit: int = 400,
+    client: TelegramClient, kind: str, limit: int = 400, progress_cb=None,
 ) -> list[dict]:
-    """The user's channels or groups where they can delete messages."""
+    """The user's channels or groups where they can delete messages.
+
+    Reports progress as it goes: checking permissions on a few hundred chats
+    takes real time, and a frozen screen looks like a hung bot.
+    """
     found: list[dict] = []
+    scanned = 0
     async for dialog in client.iter_dialogs(limit=limit):
+        scanned += 1
+        if progress_cb is not None and scanned % 5 == 0:
+            with suppress(Exception):
+                progress_cb(len(found))
         entity = dialog.entity
         if kind == "ch":
             ok_type = isinstance(entity, Channel) and not getattr(entity, "megagroup", False)
@@ -314,6 +386,9 @@ async def _collect_chats(
             "id": entity.id,
             "title": dialog.title or getattr(entity, "username", None) or str(entity.id),
         })
+        if progress_cb is not None:
+            with suppress(Exception):
+                progress_cb(len(found))
     return found
 
 
@@ -333,7 +408,6 @@ async def bulk_delete_list_cb(
     chats = data.get(f"bd_chats_{kind}")
 
     if not chats:
-        await _show(callback.message, "🔍 <b>Reading your chats…</b>", None)
         client, owned = await _acquire_client(callback.from_user.id, telethon, forwarding)
         if client is None:
             return await _show(
@@ -343,7 +417,10 @@ async def bulk_delete_list_cb(
                 ]),
             )
         try:
-            chats = await _collect_chats(client, kind)
+            async with Loader(callback.message, "load_chats", language) as loader:
+                chats = await _collect_chats(
+                    client, kind, progress_cb=lambda n: setattr(loader, "done", n),
+                )
         except Exception:
             logger.exception("Could not list chats for %s", callback.from_user.id)
             chats = []
@@ -425,6 +502,7 @@ async def bulk_delete_pick_cb(
         [InlineKeyboardButton(text="🕐 Last 24 hours", callback_data="bd:f:24h")],
         [InlineKeyboardButton(text="📅 After a date", callback_data="bd:f:after"),
          InlineKeyboardButton(text="📅 Before a date", callback_data="bd:f:before")],
+        [InlineKeyboardButton(text="📆 Between two dates", callback_data="bd:f:range")],
         [InlineKeyboardButton(text="🖼️ Only media", callback_data="bd:f:media")],
         [InlineKeyboardButton(text="🔤 Containing a word", callback_data="bd:f:keyword")],
         [InlineKeyboardButton(text="👤 By a specific user", callback_data="bd:f:user")],
@@ -470,6 +548,11 @@ async def bulk_delete_filter_cb(
                 explain=safe_t(language, f"bd_date_{choice}"),
             ),
         )
+
+    if choice == "range":
+        await state.set_state(BulkDeleteStates.waiting_range_start)
+        await state.update_data(bd_filter="range")
+        return await _ask(callback, safe_t(language, "bd_range_start"))
 
     if choice == "keyword":
         await state.set_state(BulkDeleteStates.waiting_keyword)
@@ -616,6 +699,66 @@ async def bulk_delete_date_input(
         f"Posts after {pretty}" if which == "after" else f"Posts before {pretty}"
     )
     await _bulk_delete_confirm_screen(message, state, db, language, label)
+
+
+@router.message(BulkDeleteStates.waiting_range_start)
+async def bulk_delete_range_start(
+    message: Message, state: FSMContext, db: Database,
+) -> None:
+    """Step 1 of 2 — the start of the range."""
+    language = await _lang(db, message.from_user.id)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer(safe_t(language, "bd_cancelled"), parse_mode="HTML")
+
+    parsed = parse_short_date(raw)
+    if parsed is None:
+        return await message.answer(safe_t(language, "bd_date_bad"), parse_mode="HTML")
+    if parsed > datetime.now(timezone.utc):
+        return await message.answer(safe_t(language, "bd_date_future"), parse_mode="HTML")
+
+    await state.update_data(bd_range_start=parsed.isoformat())
+    await state.set_state(BulkDeleteStates.waiting_range_end)
+    await message.answer(
+        safe_t(language, "bd_range_end", start=parsed.strftime("%d %b %Y")),
+        parse_mode="HTML",
+    )
+
+
+@router.message(BulkDeleteStates.waiting_range_end)
+async def bulk_delete_range_end(
+    message: Message, state: FSMContext, db: Database,
+) -> None:
+    """Step 2 of 2 — the end of the range, then confirm."""
+    language = await _lang(db, message.from_user.id)
+    raw = (message.text or "").strip()
+    if raw == "/back":
+        await state.clear()
+        return await message.answer(safe_t(language, "bd_cancelled"), parse_mode="HTML")
+
+    parsed = parse_short_date(raw)
+    if parsed is None:
+        return await message.answer(safe_t(language, "bd_date_bad"), parse_mode="HTML")
+
+    data = await state.get_data()
+    start = datetime.fromisoformat(str(data.get("bd_range_start")))
+    # The END date is inclusive, so the whole of that day counts.
+    end = parsed + timedelta(days=1)
+    if end <= start:
+        return await message.answer(
+            safe_t(
+                language, "bd_range_bad_order",
+                start=start.strftime("%d %b %Y"), end=parsed.strftime("%d %b %Y"),
+            ),
+            parse_mode="HTML",
+        )
+
+    await state.update_data(bd_filter_value=f"{start.isoformat()}|{end.isoformat()}")
+    await _bulk_delete_confirm_screen(
+        message, state, db, language,
+        f"Posts between {start.strftime('%d %b %Y')} and {parsed.strftime('%d %b %Y')}",
+    )
 
 
 @router.message(BulkDeleteStates.waiting_keyword)
@@ -790,6 +933,7 @@ async def _run_delete_job(
         # Server-side narrowing wherever Telegram supports it — iterating the
         # whole history and discarding most of it would be far slower.
         iter_kwargs: dict = {}
+        range_start = range_end = None
         if filter_kind == "24h":
             iter_kwargs["offset_date"] = datetime.now(timezone.utc) - timedelta(hours=24)
             iter_kwargs["reverse"] = True
@@ -800,6 +944,12 @@ async def _run_delete_job(
             # offset_date walks BACKWARDS from this point, which is exactly
             # "everything older than this".
             iter_kwargs["offset_date"] = datetime.fromisoformat(str(filter_value))
+        elif filter_kind == "range" and filter_value:
+            start_raw, end_raw = str(filter_value).split("|")
+            range_start = datetime.fromisoformat(start_raw)
+            range_end = datetime.fromisoformat(end_raw)
+            iter_kwargs["offset_date"] = range_start
+            iter_kwargs["reverse"] = True
         elif filter_kind == "keyword" and filter_value:
             iter_kwargs["search"] = str(filter_value)
         elif filter_kind == "user" and filter_value:
@@ -810,6 +960,11 @@ async def _run_delete_job(
 
         def keep(msg) -> bool:
             """The last word on whether a message matches the filter."""
+            if filter_kind == "range":
+                when = getattr(msg, "date", None)
+                if when is None or not (range_start <= when < range_end):
+                    return False
+                return getattr(msg, "action", None) is None
             if filter_kind == "service":
                 return getattr(msg, "action", None) is not None
             if getattr(msg, "action", None) is not None:
