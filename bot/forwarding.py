@@ -1920,7 +1920,7 @@ class ForwardingEngine:
         if not isinstance(message.media, MessageMediaPhoto):
             return media_file
 
-        watermark_text = str(settings.get("watermark_text") or "Forwarded via DealsKoti")
+        watermark_text = str(settings.get("watermark_text") or "Forwarded via DealKoti")
         style = {"position": "bottom_right", "size": "medium", "opacity": 70}
         if plan_has(plan_name, F_WATERMARK_STYLE):
             configured = _as_dict(settings.get("watermark_style"))
