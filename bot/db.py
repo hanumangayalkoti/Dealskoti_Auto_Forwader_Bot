@@ -202,6 +202,22 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== REFERRAL PAYOUT ACCOUNTING =====
+-- How much of a referrer's lifetime commission has actually been paid out.
+--
+-- Before this column the row carried a single total plus an is_paid flag, and
+-- a NEW commission after a payout reset that flag — so the ALREADY-PAID
+-- amount became owed again. An admin paying from that screen would have paid
+-- the same money twice.
+--
+-- Now: commission_amount_paise is lifetime EARNED, paid_amount_paise is
+-- lifetime PAID, and what is owed is simply the difference.
+ALTER TABLE referrals ADD COLUMN IF NOT EXISTS paid_amount_paise INTEGER DEFAULT 0;
+
+-- Existing rows already marked paid are backfilled so nothing looks owed twice.
+UPDATE referrals SET paid_amount_paise = commission_amount_paise
+ WHERE is_paid = TRUE AND COALESCE(paid_amount_paise, 0) = 0;
+
 -- ===== FSM STATE =====
 -- Where each user is in a multi-step flow, kept in POSTGRES rather than in
 -- memory. Railway restarts the bot on every deploy, and in-memory state was
@@ -776,14 +792,19 @@ class Database:
                 )
                 if not row:
                     return None
-                return await conn.fetchrow(
+                # Only the lifetime EARNED total moves. is_paid is left alone
+                # on purpose: resetting it made previously paid money owed
+                # again, and what is owed is now derived from the two totals.
+                updated = await conn.fetchrow(
                     """UPDATE referrals
-                       SET commission_amount_paise = commission_amount_paise + $1,
-                           is_paid = FALSE
+                       SET commission_amount_paise = commission_amount_paise + $1
                        WHERE id = $2
-                       RETURNING id, referrer_id, referred_id, commission_amount_paise""",
+                       RETURNING id, referrer_id, referred_id,
+                                 commission_amount_paise,
+                                 COALESCE(paid_amount_paise, 0) AS paid_amount_paise""",
                     commission, int(row["id"]),
                 )
+                return updated
 
     async def referrer_of(self, referred_id: int) -> int | None:
         """Who referred this user, if anyone."""
@@ -801,8 +822,11 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT COUNT(*) AS joined,
-                          COALESCE(SUM(CASE WHEN is_paid = FALSE THEN commission_amount_paise ELSE 0 END), 0) AS unpaid,
-                          COALESCE(SUM(CASE WHEN is_paid = TRUE  THEN commission_amount_paise ELSE 0 END), 0) AS paid
+                          COALESCE(SUM(
+                            GREATEST(commission_amount_paise
+                                     - COALESCE(paid_amount_paise, 0), 0)
+                          ), 0) AS unpaid,
+                          COALESCE(SUM(COALESCE(paid_amount_paise, 0)), 0) AS paid
                    FROM referrals WHERE referrer_id = $1""",
                 referrer_id,
             )
@@ -823,21 +847,35 @@ class Database:
             return 0
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                total = await conn.fetchval(
-                    """SELECT COALESCE(SUM(commission_amount_paise), 0) FROM referrals
-                       WHERE referrer_id = $1 AND is_paid = FALSE AND commission_amount_paise > 0
-                       FOR UPDATE""",
+                # The UPDATE itself returns what it changed, so the total and
+                # the write are one atomic step.
+                #
+                # This used to be a SELECT SUM(...) FOR UPDATE, which Postgres
+                # rejects outright ("FOR UPDATE is not allowed with aggregate
+                # functions") — every payout attempt raised instead of paying.
+                # The amount owed has to be read BEFORE the update, because
+                # RETURNING gives the NEW row values — and the update sets
+                # paid equal to earned, so the difference there is always 0.
+                # A subquery captures the old numbers and RETURNING reads from
+                # that, keeping it one atomic statement.
+                rows = await conn.fetch(
+                    """UPDATE referrals AS r
+                       SET paid_amount_paise = r.commission_amount_paise,
+                           is_paid = TRUE
+                       FROM (
+                           SELECT id,
+                                  commission_amount_paise
+                                  - COALESCE(paid_amount_paise, 0) AS owed
+                           FROM referrals
+                           WHERE referrer_id = $1
+                             AND commission_amount_paise > COALESCE(paid_amount_paise, 0)
+                           FOR UPDATE
+                       ) AS prev
+                       WHERE r.id = prev.id
+                       RETURNING prev.owed AS owed""",
                     referrer_id,
                 )
-                total = int(total or 0)
-                if total <= 0:
-                    return 0
-                await conn.execute(
-                    """UPDATE referrals SET is_paid = TRUE
-                       WHERE referrer_id = $1 AND is_paid = FALSE""",
-                    referrer_id,
-                )
-                return total
+                return sum(int(r["owed"] or 0) for r in rows)
 
     async def set_payout_method(self, user_id: int, method: str, address: str) -> None:
         if self.pool is None: return
@@ -919,12 +957,13 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """SELECT r.referrer_id,
-                          SUM(r.commission_amount_paise) AS owed,
+                          SUM(r.commission_amount_paise
+                              - COALESCE(r.paid_amount_paise, 0)) AS owed,
                           COUNT(*) AS refs,
                           u.username, u.first_name
                    FROM referrals r
                    LEFT JOIN users u ON u.telegram_user_id = r.referrer_id
-                   WHERE r.is_paid = FALSE AND r.commission_amount_paise > 0
+                   WHERE r.commission_amount_paise > COALESCE(r.paid_amount_paise, 0)
                    GROUP BY r.referrer_id, u.username, u.first_name
                    ORDER BY owed DESC
                    LIMIT $1""",
