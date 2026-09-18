@@ -34,7 +34,7 @@ import html
 import logging
 import re
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
@@ -51,7 +51,7 @@ from .config import Settings
 from .db import Database
 from .forwarding import ForwardingEngine
 from .locales import language_for, t
-from .plans import plan_label, PLANS, F_BULK_DELETE, min_plan_for, plan_has
+from .plans import STYLE_BUY, STYLE_GO, plan_label, PLANS, F_BULK_DELETE, min_plan_for, plan_has
 from .telethon_service import TelethonService
 
 logger = logging.getLogger("dealskoti.bulkdelete")
@@ -167,6 +167,32 @@ async def _show(message_obj, text: str, markup: InlineKeyboardMarkup | None = No
 SPINNER_FRAMES = ("▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱",
                   "▱▰▰▰▰▱▱▱", "▱▱▰▰▰▰▱▱", "▱▱▱▰▰▰▰▱", "▱▱▱▱▰▰▰▰",
                   "▱▱▱▱▱▰▰▰", "▱▱▱▱▱▱▰▰", "▱▱▱▱▱▱▱▰", "▱▱▱▱▱▱▱▱")
+
+
+@asynccontextmanager
+async def _typing(bot, chat_id: int):
+    """Keeps the "typing…" indicator alive for a long job.
+
+    Telegram clears it after ~5 seconds, so it has to be re-sent. Paired with
+    the Loader, this is what every other wait in the bot looks like.
+    """
+    stop = asyncio.Event()
+
+    async def keep():
+        while not stop.is_set():
+            with suppress(Exception):
+                await bot.send_chat_action(chat_id, "typing")
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=4.0)
+
+    task = asyncio.create_task(keep())
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 class Loader:
@@ -322,7 +348,7 @@ async def bulk_delete_command(
         return await message.answer(
             safe_t(language, "bd_locked"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"💎 Upgrade to {required}", callback_data="menu:plans")],
+                [InlineKeyboardButton(text=f"💎 Upgrade to {required}", callback_data="menu:plans", style=STYLE_BUY)],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
             parse_mode="HTML",
@@ -333,7 +359,7 @@ async def bulk_delete_command(
         return await message.answer(
             safe_t(language, "connect_required"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO)],
                 [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
@@ -427,7 +453,8 @@ async def bulk_delete_list_cb(
         # left the screen frozen during exactly the part people notice.
         client = None
         owned = False
-        async with Loader(callback.message, "load_chats", language) as loader:
+        async with _typing(callback.bot, callback.message.chat.id), \
+                Loader(callback.message, "load_chats", language) as loader:
             client, owned = await _acquire_client(
                 callback.from_user.id, telethon, forwarding,
             )
@@ -446,7 +473,7 @@ async def bulk_delete_list_cb(
             return await _show(
                 callback.message, safe_t(language, "connect_required"),
                 InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+                    [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO)],
                 ]),
             )
         await state.update_data({f"bd_chats_{kind}": chats})
