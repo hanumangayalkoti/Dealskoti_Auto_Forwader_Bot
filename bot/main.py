@@ -380,8 +380,12 @@ def progress_bar(done: int, total: int, width: int = PROGRESS_WIDTH) -> str:
 
 
 def progress_line(done: int, total: int) -> str:
-    """A bar WITH a percentage — only for work whose total is actually known."""
-    pct = min(100, int(100 * done / total)) if total else 0
+    """A bar WITH a percentage — only for work whose total is actually known.
+
+    Clamped at both ends: a caller that ever reports a negative count would
+    otherwise print "-5%", which just looks broken.
+    """
+    pct = max(0, min(100, int(100 * done / total))) if total else 0
     return f"{progress_bar(done, total)}  {pct}%"
 
 
@@ -2563,6 +2567,16 @@ BULK_RANGES = {
 }
 
 
+async def _bulk_allowed_user(db: Database, user_id: int) -> bool:
+    """Re-checked on every bulk-transfer callback, not just the command.
+
+    An old button is still tappable after a plan expires, so the gate has to
+    live on each entry point rather than only at the front door.
+    """
+    user = await db.get_user(user_id)
+    return _bulk_allowed(str(user["plan"]) if user else "free")
+
+
 def _bulk_allowed(plan_name: str) -> bool:
     # Gold is the floor: the same tier that unlocks the other heavy features.
     return plan_rank(plan_name) >= plan_rank("gold")
@@ -2647,6 +2661,8 @@ async def bulk_start_cb(
 ) -> None:
     if callback.message is None:
         return
+    if not await _bulk_allowed_user(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     language = await _language_for_callback(db, callback)
     await state.set_state(BulkStates.waiting_source)
     await state.update_data(bulk_source=None, bulk_dest=None, picker_dialogs=None, sources=[])
@@ -2708,6 +2724,8 @@ async def bulk_range_cb(
 ) -> None:
     if callback.message is None:
         return
+    if not await _bulk_allowed_user(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     key = callback.data.rsplit(":", 1)[1]
     # Resolved up front: both the date branches below need it, and reading it
     # only after them left `language` undefined on those paths.
@@ -2939,6 +2957,8 @@ async def bulk_go_cb(
 ) -> None:
     if callback.message is None:
         return
+    if not await _bulk_allowed_user(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     language = await _language_for_callback(db, callback)
     data = await state.get_data()
     source, dest = data.get("bulk_source"), data.get("bulk_dest")
@@ -3022,7 +3042,11 @@ async def bulk_go_cb(
 
 
 @router.callback_query(F.data == "bulk:stop")
-async def bulk_stop_cb(callback: CallbackQuery, forwarding: ForwardingEngine) -> None:
+async def bulk_stop_cb(
+    callback: CallbackQuery, db: Database, forwarding: ForwardingEngine,
+) -> None:
+    if not await _bulk_allowed_user(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     if forwarding.cancel_transfer(callback.from_user.id):
         await callback.answer("Stopping… finishing the current message", show_alert=True)
     else:
