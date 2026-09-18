@@ -1561,15 +1561,30 @@ def _next_qr_attempt(user_id: int) -> int:
     return attempt
 
 
+# user_id -> the QR and timer messages currently on screen, so they can be
+# cleared the moment the user does anything else. A dead QR left sitting in
+# the chat was the single messiest thing about this flow.
+_qr_screens: dict[int, list[tuple[int, int]]] = {}
+
+
+async def _clear_qr_screens(bot: Bot, user_id: int) -> None:
+    for chat_id, message_id in _qr_screens.pop(user_id, []):
+        with suppress(Exception):
+            await bot.delete_message(chat_id, message_id)
+
+
 def _login_choice_keyboard(language: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        # One row, and two DIFFERENT colours: green marks the route that works
+        # on any device, blue the alternative. Two greens side by side gave no
+        # hint which to pick.
         [InlineKeyboardButton(
             text=safe_t(language, "phone_button"), callback_data="login:phone",
             style=STYLE_GO,
-        )],
-        [InlineKeyboardButton(
+        ),
+         InlineKeyboardButton(
             text=safe_t(language, "qr_button"), callback_data="login:qr",
-            style=STYLE_GO,
+            style=STYLE_BUY,
         )],
         [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
@@ -1596,13 +1611,22 @@ def _qr_image(url: str) -> BufferedInputFile:
     return BufferedInputFile(buffer.read(), filename="login_qr.png")
 
 
-def _qr_keyboard(url: str, language: str) -> InlineKeyboardMarkup:
+def _qr_keyboard(language: str) -> InlineKeyboardMarkup:
+    """No "tap to login" button here, on purpose.
+
+    Telethon's docs say opening the tg://login URL signs you in, and it used
+    to. Telegram has since blocked it on mobile — tapping it now shows
+    "This code can be used to allow someone to log in to your account… go to
+    Settings > Devices > Add Device and scan", which is a refusal, not a
+    login. Keeping the button would just send people down a dead end.
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
-        # The tg:// link — this is what lets a single-device user sign in.
-        [InlineKeyboardButton(text="⚡ Tap to Login", url=url)],
         [InlineKeyboardButton(text="🔄 New QR", callback_data="login:qr"),
-         InlineKeyboardButton(text=safe_t(language, "phone_button"), callback_data="login:phone")],
-        [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
+         InlineKeyboardButton(
+             text=safe_t(language, "phone_button"), callback_data="login:phone",
+             style=STYLE_GO,
+         )],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data="login:qr-cancel")],
     ])
 
 
@@ -1636,6 +1660,24 @@ async def login_phone_cb(
     await callback.answer()
 
 
+@router.callback_query(F.data == "login:qr-cancel")
+async def login_qr_cancel_cb(
+    callback: CallbackQuery, db: Database, telethon: TelethonService,
+) -> None:
+    """Cancel clears the code away instead of leaving it sitting there."""
+    language = await _language_for_callback(db, callback)
+    _qr_attempts.pop(callback.from_user.id, None)
+    with suppress(Exception):
+        await telethon.cancel_login(callback.from_user.id)
+    await _clear_qr_screens(callback.bot, callback.from_user.id)
+    await callback.answer()
+    with suppress(Exception):
+        await callback.bot.send_message(
+            callback.from_user.id, safe_t(language, "qr_cancelled"),
+            reply_markup=_login_choice_keyboard(language), parse_mode="HTML",
+        )
+
+
 @router.callback_query(F.data == "login:qr")
 async def login_qr_cb(
     callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
@@ -1659,6 +1701,9 @@ async def login_qr_cb(
         )
 
     attempt = _next_qr_attempt(callback.from_user.id)
+    # Clear whatever QR was on screen before this one — otherwise two codes
+    # and two countdowns sit in the chat at the same time.
+    await _clear_qr_screens(callback.bot, callback.from_user.id)
     await callback.answer()
     with suppress(Exception):
         await callback.message.delete()
@@ -1666,8 +1711,8 @@ async def login_qr_cb(
     qr_msg = await callback.bot.send_photo(
         callback.from_user.id,
         photo=_qr_image(url),
-        caption=safe_t(language, "qr_instructions", seconds=QR_TOTAL_SECONDS),
-        reply_markup=_qr_keyboard(url, language),
+        caption=safe_t(language, "qr_instructions"),
+        reply_markup=_qr_keyboard(language),
         parse_mode="HTML",
     )
     timer_msg = await callback.bot.send_message(
@@ -1675,6 +1720,10 @@ async def login_qr_cb(
         safe_t(language, "qr_timer", seconds=QR_TOTAL_SECONDS),
         parse_mode="HTML",
     )
+    _qr_screens[callback.from_user.id] = [
+        (qr_msg.chat.id, qr_msg.message_id),
+        (timer_msg.chat.id, timer_msg.message_id),
+    ]
 
     # Run the wait in the background so the handler returns immediately and
     # Telegram does not time the callback out.
@@ -1720,10 +1769,7 @@ async def _qr_watch(
                 _qr_attempts.pop(user_id, None)
                 # Scanned, but the account has a cloud password. Hand over to
                 # the SAME 2FA screen the phone flow uses — one code path.
-                with suppress(Exception):
-                    await qr_msg.delete()
-                with suppress(Exception):
-                    await timer_msg.delete()
+                await _clear_qr_screens(bot, user_id)
                 await state.set_state(LoginStates.waiting_2fa)
                 prompt = await bot.send_message(
                     user_id, safe_t(language, "qr_2fa"), parse_mode="HTML",
@@ -1740,14 +1786,18 @@ async def _qr_watch(
             if remaining % 30 == 0:
                 new_url = await telethon.refresh_qr_login(user_id)
                 if new_url:
+                    # Only the picture changes. Rewriting the caption used to
+                    # drop "60s" down to "30s" halfway through, which read as
+                    # the timer jumping — the countdown below already says how
+                    # long is left.
                     with suppress(Exception):
                         await qr_msg.edit_media(
                             InputMediaPhoto(
                                 media=_qr_image(new_url),
-                                caption=safe_t(language, "qr_instructions", seconds=remaining),
+                                caption=safe_t(language, "qr_instructions"),
                                 parse_mode="HTML",
                             ),
-                            reply_markup=_qr_keyboard(new_url, language),
+                            reply_markup=_qr_keyboard(language),
                         )
 
             if remaining % QR_TICK == 0:
@@ -1762,13 +1812,13 @@ async def _qr_watch(
         # A newer QR is on screen. Touch nothing.
         return
 
-    # Timed out — clear the code away so a dead QR is never left on screen.
+    # Timed out. Clear the code AND the countdown, then leave one short line
+    # saying what happened — an empty gap where the QR used to be is worse
+    # than a dead QR.
     with suppress(Exception):
         await telethon.cancel_login(user_id)
-    with suppress(Exception):
-        await qr_msg.delete()
-    with suppress(Exception):
-        await timer_msg.delete()
+    _qr_attempts.pop(user_id, None)
+    await _clear_qr_screens(bot, user_id)
     with suppress(Exception):
         await bot.send_message(
             user_id, safe_t(language, "qr_expired"),
@@ -1787,12 +1837,9 @@ async def _qr_success(
     message, the same admin notification, the same trial offer — so the QR
     path and the phone path can never drift apart.
     """
-    with suppress(Exception):
-        await timer_msg.delete()
-    # The photo message cannot be edited into text, so it is removed and a
-    # plain one takes its place for the shared finisher to work on.
-    with suppress(Exception):
-        await qr_msg.delete()
+    await _clear_qr_screens(bot, user_id)
+    # The photo message cannot be edited into text, so a plain one takes its
+    # place for the shared finisher to work on.
     holder = await bot.send_message(user_id, "✅ Signing you in…")
     await _finish_login_success(holder, state, db, forwarding, settings, info, language)
 
