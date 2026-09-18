@@ -45,6 +45,9 @@ from .forwarding import ForwardingEngine
 from .gate import enforce_gate
 from .locales import language_for, t
 from .plans import (
+    STYLE_BUY,
+    STYLE_GO,
+    plan_label,
     PLANS,
     cycles_for,
     duration_days,
@@ -129,20 +132,18 @@ def _display_name(record) -> str:
 
 # Two per row: full-width buttons wasted vertical space and pushed the
 # navigation off the first screen on a phone.
-PLAN_BUTTONS = [
-    ("🥉 Basic", "plan:basic"),
-    ("🥈 Silver", "plan:silver"),
-    ("🥇 Gold", "plan:gold"),
-    ("💎 Platinum", "plan:platinum"),
-    ("🆓 Free", "plan:free"),
-]
+# Built from plan_label() rather than written out, so the tier emoji only ever
+# has to change in ONE place (plans.TIER_ICON) and every screen follows.
+PLAN_BUTTON_ORDER = ("basic", "silver", "gold", "platinum", "free")
 
 
 def plans_keyboard() -> InlineKeyboardMarkup:
     rows = []
     row = []
-    for label, data in PLAN_BUTTONS:
-        row.append(InlineKeyboardButton(text=label, callback_data=data))
+    for key in PLAN_BUTTON_ORDER:
+        row.append(InlineKeyboardButton(
+            text=plan_label(key), callback_data=f"plan:{key}",
+        ))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -265,6 +266,7 @@ async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) ->
     rows = [[InlineKeyboardButton(
         text="💷 Pay with UPI / Card",
         callback_data=f"pay:inr:{plan_name}:{cycle}",
+        style=STYLE_BUY,
     )]]
     # Each alternative method only appears when it is actually configured, so a
     # user can never start a payment that has nowhere to go.
@@ -272,11 +274,13 @@ async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) ->
         rows.append([InlineKeyboardButton(
             text=f"🪙 Pay with USDT — ${usdt_amount_usd(plan_name, cycle):g}",
             callback_data=f"pay:usdt:{plan_name}:{cycle}",
+            style=STYLE_BUY,
         )])
     if settings.stars_enabled and stars_amount(plan_name, cycle) > 0:
         rows.append([InlineKeyboardButton(
             text=f"⭐ Pay with Stars — {stars_amount(plan_name, cycle)}",
             callback_data=f"pay:stars:{plan_name}:{cycle}",
+            style=STYLE_BUY,
         )])
     rows.append([InlineKeyboardButton(text="◀️ Back", callback_data=f"plan:{plan_name}")])
     rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
@@ -285,7 +289,7 @@ async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) ->
         callback.message,
         safe_t(
             language, "billing_details",
-            plan=PLANS[plan_name].name, cycle=cycle.title(),
+            plan=plan_label(plan_name), cycle=cycle.title(),
             original=format_paise(original), discount=format_paise(discount),
             payable=format_paise(payable),
         ),
@@ -307,7 +311,7 @@ async def _prepay_guard(callback: CallbackQuery, db: Database, settings: Setting
             callback.message,
             safe_t(language, "connect_required"),
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO)],
                 [InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans"),
                  InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
@@ -365,7 +369,7 @@ async def pay_inr_cb(
         callback.message,
         safe_t(
             language, "payment_link",
-            plan=PLANS[plan_name].name, cycle=cycle.title(), amount=format_paise(payable),
+            plan=plan_label(plan_name), cycle=cycle.title(), amount=format_paise(payable),
         ),
         InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Pay Now", url=link.short_url)],
@@ -402,7 +406,7 @@ async def pay_usdt_cb(callback: CallbackQuery, db: Database, settings: Settings)
         callback.message,
         safe_t(
             language, "usdt_instructions",
-            plan=PLANS[plan_name].name, cycle=cycle.title(), amount=f"{amount:g}",
+            plan=plan_label(plan_name), cycle=cycle.title(), amount=f"{amount:g}",
             network=safe_html(settings.usdt_network),
             wallet=safe_html(settings.usdt_wallet_address),
         ),
@@ -446,7 +450,7 @@ async def pay_stars_cb(callback: CallbackQuery, db: Database, settings: Settings
     await _show(
         callback.message,
         safe_t(
-            language, "stars_intro", plan=PLANS[plan_name].name,
+            language, "stars_intro", plan=plan_label(plan_name),
             cycle=cycle.title(), amount=amount, days=days,
         ),
         InlineKeyboardMarkup(inline_keyboard=[
@@ -459,9 +463,9 @@ async def pay_stars_cb(callback: CallbackQuery, db: Database, settings: Settings
     await callback.bot.send_invoice(
         chat_id=callback.from_user.id,
         title=safe_t(language, "stars_invoice_title",
-                     plan=PLANS[plan_name].name, cycle=cycle.title())[:32],
+                     plan=plan_label(plan_name), cycle=cycle.title())[:32],
         description=safe_t(language, "stars_invoice_desc",
-                           plan=PLANS[plan_name].name, days=days)[:255],
+                           plan=plan_label(plan_name), days=days)[:255],
         payload=f"stars:{plan_name}:{cycle}:{callback.from_user.id}",
         # Stars invoices use the XTR currency and NO provider token.
         currency="XTR",
@@ -557,7 +561,7 @@ async def stars_payment_done(
     await message.answer(
         safe_t(
             language, "stars_paid", amount=amount,
-            plan=PLANS[plan_name].name, days=days, expiry=expiry,
+            plan=plan_label(plan_name), days=days, expiry=expiry,
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks")],
@@ -573,7 +577,7 @@ async def stars_payment_done(
                 f"⭐ <b>Stars Payment Received</b>\n\n"
                 f"👤 {_display_name(user)}\n"
                 f"🆔 <code>{user_id}</code>\n\n"
-                f"💎 Plan: <b>{PLANS[plan_name].name}</b> ({cycle.title()})\n"
+                f"Plan: <b>{plan_label(plan_name)}</b> ({cycle.title()})\n"
                 f"⭐ Amount: <b>{amount} Stars</b>\n"
                 f"📅 Duration: {days} days\n"
                 f"⏳ Expiry: {expiry}\n"
@@ -713,7 +717,7 @@ async def _review_text(db: Database, request) -> str:
         method=str(request["method"]).upper(),
         name=_display_name(user),
         user_id=request["user_id"],
-        plan=str(request["plan"]).title(),
+        plan=plan_label(str(request["plan"])),
         cycle=str(request["cycle"]).title(),
         amount=safe_html(request["amount"]),
         ref=safe_html(request["reference"] or "— (screenshot attached)"),
@@ -860,7 +864,7 @@ async def manual_payment_review_cb(
             safe_t(
                 language,
                 "usdt_approved_user" if method == "usdt" else "stars_approved_user",
-                plan=PLANS[plan_name].name, days=days, expiry=expiry,
+                plan=plan_label(plan_name), days=days, expiry=expiry,
             ),
             parse_mode="HTML",
         )
@@ -869,7 +873,7 @@ async def manual_payment_review_cb(
 
     await _mark_reviewed(
         callback,
-        safe_t("en", "admin_payment_approved", plan=PLANS[plan_name].name, user_id=user_id),
+        safe_t("en", "admin_payment_approved", plan=plan_label(plan_name), user_id=user_id),
     )
     await callback.answer("Approved")
 
