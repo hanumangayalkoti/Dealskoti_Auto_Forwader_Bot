@@ -329,11 +329,17 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
 # Tier emoji. The KEYS ("basic", "silver"…) are never renamed — every existing
 # user row stores one of them, so changing a key would break their plan. Only
 # the emoji and display names are cosmetic and safe to change.
+# Tier emoji — the ONLY place these are written.
+#
+# Chosen so the ladder reads itself: Silver is the white disc and Gold the
+# yellow one, because those are literally the colours of the metals. Nobody
+# has to learn or guess the order. An earlier set used ⚡ and 🚀, which both
+# just meant "fast" and told the user nothing about which tier was higher.
 TIER_ICON = {
     "free": "🆓",
     "basic": "🌱",
-    "silver": "⚡",
-    "gold": "🚀",
+    "silver": "⚪",
+    "gold": "🟡",
     "platinum": "💎",
 }
 TIER_LABEL = {
@@ -551,6 +557,26 @@ def all_features_text(features: list[dict], page: int = 0) -> str:
     lines.append("")
     lines.append(f"Page {page + 1} of {pages} · {len(features)} features")
     return "\n".join(lines)
+
+
+# ==========================================
+# BUTTON STYLES
+# ==========================================
+# Telegram supports coloured inline buttons: "success" (green), "primary"
+# (blue), "danger" (red) and "link" (plain).
+#
+# Used sparingly and only where the colour carries MEANING:
+#   green  — the one action we want the user to take on that screen
+#   blue   — where to spend money
+#   red    — something irreversible
+#
+# Colouring everything would make the colour mean nothing.
+#
+# Older Telegram clients ignore the style and draw a normal button, so
+# nothing breaks for anyone — they just miss the colour.
+STYLE_GO = "success"      # green: connect, start, confirm
+STYLE_BUY = "primary"     # blue: plans, upgrade, pay
+STYLE_DANGER = "danger"   # red: delete, disconnect, anything final
 
 
 def plan_icon(plan_name: str) -> str:
