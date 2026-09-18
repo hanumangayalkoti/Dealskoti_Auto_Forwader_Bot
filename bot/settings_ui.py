@@ -49,6 +49,9 @@ from .forwarding import (
 )
 from .locales import language_for, t
 from .plans import (
+    STYLE_BUY,
+    STYLE_DANGER,
+    STYLE_GO,
     PLANS,
     F_ANTIBAN,
     F_ATTACH_FILE,
@@ -382,7 +385,7 @@ async def settings_command(message: Message, db: Database) -> None:
         await message.answer(
             safe_t(language, "settings_no_tasks"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ New Task", callback_data="task:create")],
+                [InlineKeyboardButton(text="➕ New Task", callback_data="task:create", style=STYLE_GO)],
                 [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
                  InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
@@ -403,7 +406,7 @@ async def settings_menu_cb(callback: CallbackQuery, db: Database) -> None:
         await _show(
             callback.message, safe_t(language, "settings_no_tasks"),
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ New Task", callback_data="task:create")],
+                [InlineKeyboardButton(text="➕ New Task", callback_data="task:create", style=STYLE_GO)],
                 [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
                  InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
@@ -458,7 +461,7 @@ async def settings_task_menu(callback: CallbackQuery, db: Database) -> None:
             text="▶️ Resume" if task["is_paused"] else "⏸️ Pause",
             callback_data=f"task:{'resume' if task['is_paused'] else 'pause'}:{task_id}",
         ),
-        InlineKeyboardButton(text="🗑️ Delete Task", callback_data=f"task:delete:{task_id}"),
+        InlineKeyboardButton(text="🗑️ Delete Task", callback_data=f"task:delete:{task_id}", style=STYLE_DANGER),
     ])
     rows.append([
         InlineKeyboardButton(text="◀️ Back", callback_data="menu:settings"),
@@ -570,7 +573,7 @@ async def settings_locked_cb(callback: CallbackQuery, db: Database) -> None:
         feature=spec.display if spec else key, required_plan=required,
     )
     await _show(callback.message, text, InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
+        [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans", style=STYLE_BUY)],
         [InlineKeyboardButton(text="◀️ Back", callback_data=f"st:task:{task_id}")],
         [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ]))
@@ -1160,7 +1163,7 @@ async def settings_save_value(
         await message.answer(
             safe_t(language, "feature_locked", feature=spec.display, required_plan=required),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans", style=STYLE_BUY)],
                 [InlineKeyboardButton(text="◀️ Back", callback_data=f"st:task:{task_id}"),
                  InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
