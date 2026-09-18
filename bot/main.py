@@ -77,6 +77,7 @@ from .locales import (
     t,
 )
 from .plans import (
+    plan_label,
     MIN_WITHDRAWAL_PAISE,
     PLANS,
     REFERRAL_RATE,
@@ -1241,7 +1242,7 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
         name=_format_name(user),
         username=f"@{safe_html(user['username'])}" if user and user["username"] else "—",
         user_id=user_id,
-        plan=str(user["plan"]).title() if user else "Free",
+        plan=plan_label(str(user["plan"])) if user else "🆓 Free",
         plan_started=started,
         expiry=expiry,
         txn_id=safe_html(txn_id),
@@ -1398,7 +1399,7 @@ async def _finish_login_success(
         f"🆔 User ID: <code>{message.from_user.id}</code>\n"
         f"📱 Connected as: "
         f"{'@' + safe_html(tg_username_raw) if tg_username_raw else 'no username'}\n"
-        f"💎 Plan: {safe_html(str(user['plan']).title() if user else 'Free')}\n"
+        f"Plan: {safe_html(plan_label(str(user['plan'])) if user else '🆓 Free')}\n"
         f"🕐 Connected: {_now_ist()}",
     )
     phone = str(account_info.get("phone") or "").strip()
@@ -2324,7 +2325,7 @@ async def _finish_destinations(
         f"👤 User: {_format_name(user)}\n"
         f"🔗 Username: {_handle(user)}\n"
         f"🆔 User ID: <code>{user_id}</code>\n"
-        f"💎 Plan: {safe_html(str(user['plan']).title() if user else 'Free')}\n\n"
+        f"Plan: {safe_html(plan_label(str(user['plan'])) if user else '🆓 Free')}\n\n"
         f"📥 <b>Sources ({len(source_list)}):</b>\n{source_text}\n\n"
         f"📤 <b>Destinations ({len(destinations)}):</b>\n{destination_text}\n\n"
         f"▶️ Status: Active\n"
@@ -3388,7 +3389,7 @@ async def trial_start_cb(
         f"📅 Joined: "
         f"{user['created_at'].astimezone(IST).strftime('%d %b %Y, %I:%M %p IST') if user and user['created_at'] else '—'}"
         f"{referred_by}\n\n"
-        f"💎 Plan: <b>Gold</b> (7-day trial)\n"
+        f"Plan: <b>{plan_label(TRIAL_PLAN)}</b> (7-day trial)\n"
         f"⏳ Ends: <b>{expiry}</b>\n"
         f"🔌 Account connected: ✅\n"
         f"📋 Tasks: {len(await db.list_tasks(callback.from_user.id))}\n\n"
@@ -4588,7 +4589,7 @@ async def _render_feature_list(message_obj, db: Database, language: str, page: i
     for idx, feat in enumerate(chunk):
         number = idx + 1
         mark = "✅" if feat["link"] else "⭕"
-        icon = TIER_ICON.get(str(feat["tier"]), "🥈")
+        icon = TIER_ICON.get(str(feat["tier"]), "⚡")
         lines.append(f"{number:2d}. {mark} {icon} {safe_html(feat['name'])}")
         number_row.append(InlineKeyboardButton(
             text=str(number), callback_data=f"feat:open:{page}:{feat['id']}",
@@ -5687,7 +5688,7 @@ async def admin_picker_done_cb(
         return await callback.answer("Select at least one user first", show_alert=True)
 
     if action == "grant":
-        rows = [[InlineKeyboardButton(text=f"💎 {plan.name}", callback_data=f"agrant:{key}")]
+        rows = [[InlineKeyboardButton(text=plan_label(key), callback_data=f"agrant:{key}")]
                 for key, plan in PLANS.items() if key != "free"]
         rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="apage:grant:0")])
         await _safe_edit(
@@ -5738,7 +5739,7 @@ async def _selection_summary(db: Database, user_ids: list[int], cut_days: int = 
             left, expiry = 0, "—"
 
         lines.append(f"{i}. <b>{name}</b> ({handle})")
-        lines.append(f"     💎 {plan} · {left} day{'s' if left != 1 else ''} left")
+        lines.append(f"     {plan_label(plan)} · {left} day{'s' if left != 1 else ''} left")
         lines.append(f"     📅 Expires: {expiry}")
 
         purchase = await db.last_purchase_info(uid)
@@ -6136,7 +6137,7 @@ async def admin_task_info_cb(callback: CallbackQuery, db: Database, settings: Se
         f"👤 User: {_format_name(owner)}\n"
         f"🔗 Username: {_handle(owner)}\n"
         f"🆔 User ID: <code>{task['user_id']}</code>\n"
-        f"💎 Plan: {safe_html(str(owner['plan']).title() if owner else 'Free')}\n\n"
+        f"Plan: {safe_html(plan_label(str(owner['plan'])) if owner else '🆓 Free')}\n\n"
         f"📥 <b>Sources ({len(sources)}):</b>\n{src_text}\n\n"
         f"📤 <b>Destinations ({len(dests)}):</b>\n{dst_text}\n\n"
         f"{status}\n"
@@ -6465,7 +6466,7 @@ def build_app(
                         user_id,
                         safe_t(
                             language, "payment_success",
-                            plan=PLANS[stored_plan].name if stored_plan in PLANS else stored_plan.title(),
+                            plan=plan_label(stored_plan),
                             days=duration_days(stored_cycle),
                             amount=format_paise(captured.amount_paise),
                             txn_id=captured.payment_id, expiry=expiry_str,
@@ -6477,7 +6478,7 @@ def build_app(
                     f"👤 User: {_format_name(user)}\n"
                     f"🔗 Username: {_handle(user)}\n"
                     f"🆔 User ID: <code>{user_id}</code>\n\n"
-                    f"💎 Plan: <b>{stored_plan.title()}</b> ({stored_cycle.title()})\n"
+                    f"Plan: <b>{plan_label(stored_plan)}</b> ({stored_cycle.title()})\n"
                     f"💵 Amount: <b>{format_paise(captured.amount_paise)}</b>\n"
                     f"🧾 Txn: <code>{safe_html(captured.payment_id)}</code>\n"
                     f"📅 New expiry: {expiry_str}\n"
@@ -6699,7 +6700,7 @@ async def _run(settings: Settings) -> None:
                     int(row["telegram_user_id"]),
                     safe_t(
                         language_for(row["preferred_language"]), "expiry_done",
-                        plan=str(row["scheduled_plan"] or "Premium").title(),
+                        plan=plan_label(str(row["scheduled_plan"] or "free")),
                     ),
                     parse_mode="HTML",
                 )
