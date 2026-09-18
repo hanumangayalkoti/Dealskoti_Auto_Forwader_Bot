@@ -137,6 +137,17 @@ def safe_t(lang: str, key: str, **kwargs) -> str:
         return f"[{key}]"
 
 
+async def _allowed(db: Database, user_id: int) -> bool:
+    """Is bulk delete still available to this user?
+
+    Re-checked on EVERY callback, not just on the command. A button from a
+    week ago is still tappable, so a plan that has since expired would
+    otherwise keep working through stale keyboards.
+    """
+    user = await db.get_user(user_id)
+    return plan_has(str(user["plan"]) if user else "free", F_BULK_DELETE)
+
+
 async def _lang(db: Database, user_id: int) -> str:
     user = await db.get_user(user_id)
     return language_for(user["preferred_language"]) if user else "en"
@@ -178,7 +189,8 @@ class Loader:
 
     def _render(self) -> str:
         if self.total > 0:
-            bar = f"{_bar(self.done, self.total)}  {min(100, int(100 * self.done / self.total))}%"
+            pct = max(0, min(100, int(100 * self.done / self.total)))
+            bar = f"{_bar(self.done, self.total)}  {pct}%"
         else:
             bar = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
         return safe_t(
@@ -399,6 +411,8 @@ async def bulk_delete_list_cb(
 ) -> None:
     if callback.message is None:
         return
+    if not await _allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     _, _, kind, page_str = callback.data.split(":")
     page = int(page_str)
     language = await _lang(db, callback.from_user.id)
@@ -478,6 +492,8 @@ async def bulk_delete_list_cb(
 async def bulk_delete_intro_cb(callback: CallbackQuery, db: Database) -> None:
     if callback.message is None:
         return
+    if not await _allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     language = await _lang(db, callback.from_user.id)
     await _show(callback.message, safe_t(language, "bd_intro"), _intro_markup())
     await callback.answer()
@@ -494,6 +510,8 @@ async def bulk_delete_pick_cb(
     """Chat chosen — now pick what to delete."""
     if callback.message is None:
         return
+    if not await _allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     _, _, kind, index_str = callback.data.split(":")
     language = await _lang(db, callback.from_user.id)
     data = await state.get_data()
@@ -542,6 +560,8 @@ async def bulk_delete_filter_cb(
     """A filter was chosen. Some need a follow-up value first."""
     if callback.message is None:
         return
+    if not await _allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     choice = callback.data.rsplit(":", 1)[1]
     language = await _lang(db, callback.from_user.id)
     data = await state.get_data()
@@ -667,6 +687,8 @@ async def bulk_delete_admin_pick_cb(
 ) -> None:
     if callback.message is None:
         return
+    if not await _allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     index = int(callback.data.rsplit(":", 1)[1])
     data = await state.get_data()
     admins = data.get("bd_admins") or []
@@ -840,7 +862,9 @@ async def bulk_delete_cancel_cb(callback: CallbackQuery, state: FSMContext, db: 
 
 
 @router.callback_query(F.data == "bd:stop")
-async def bulk_delete_stop_cb(callback: CallbackQuery) -> None:
+async def bulk_delete_stop_cb(callback: CallbackQuery, db: Database) -> None:
+    if not await _allowed(db, callback.from_user.id):
+        return await callback.answer("Gold and above only", show_alert=True)
     job = _JOBS.get(callback.from_user.id)
     if not job:
         return await callback.answer("Nothing is running", show_alert=True)
