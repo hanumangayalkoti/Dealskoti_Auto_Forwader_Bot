@@ -462,6 +462,48 @@ class LiveLoader:
                 await self._task
 
 
+@asynccontextmanager
+async def _keep_typing(bot, chat_id: int, seconds: float = 120.0) -> None:
+    """Re-sends the typing indicator for up to `seconds`.
+
+    Telegram clears it after about five seconds, so a long job has to keep
+    refreshing it. Cancelling the task stops it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while loop.time() < deadline:
+        with suppress(Exception):
+            await bot.send_chat_action(chat_id, "typing")
+        await asyncio.sleep(4)
+
+
+@asynccontextmanager
+async def busy_with_loader(message_obj, key: str, language: str, total: int = 0, **extra):
+    """Typing indicator AND an animated loader, for one wait.
+
+    Every place the user waits should show both: the typing dots tell them the
+    bot is alive, the bar tells them how far along it is. Using one helper
+    means a new wait cannot accidentally ship with only half of that.
+
+    The loader message is removed afterwards, so the caller is free to send
+    whatever the result is.
+    """
+    holder = await message_obj.answer(
+        safe_t(language, key, bar=SPINNER_FRAMES[0], found="0",
+               done="0", total=str(total), **extra),
+        parse_mode="HTML",
+    )
+    loader = LiveLoader(holder, key, language, total=total, **extra)
+    await loader.__aenter__()
+    try:
+        async with _busy(message_obj.bot, message_obj.chat.id):
+            yield loader
+    finally:
+        await loader.__aexit__()
+        with suppress(Exception):
+            await holder.delete()
+
+
 class Spinner:
     """An indeterminate loader, for work whose size cannot be known.
 
@@ -2773,7 +2815,7 @@ async def task_destination(
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
     try:
-        async with _busy(message.bot, message.chat.id):
+        async with busy_with_loader(message, "load_validating", language):
             destination = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         return await message.answer(f"⚠️ {safe_html(exc)}")
@@ -3362,7 +3404,7 @@ async def bulk_dest_input(
     if not CHANNEL_INPUT_RE.match(text):
         return await message.answer(safe_t(language, "invalid_channel_format"), parse_mode="HTML")
     try:
-        async with _busy(message.bot, message.chat.id):
+        async with busy_with_loader(message, "load_validating", language):
             entity = await telethon.validate_for_user(message.from_user.id, text)
     except ValueError as exc:
         return await message.answer(f"⚠️ {safe_html(exc)}")
@@ -4673,7 +4715,10 @@ async def backup_command(message: Message, db: Database, settings: Settings) -> 
         safe_t(language, "load_backup", bar=progress_line(0, 1), step="starting"),
         parse_mode="HTML",
     )
-    name = await _make_backup(message.bot, db, settings, reason="manual", loader_message=notice)
+    async with _busy(message.bot, message.chat.id):
+        name = await _make_backup(
+            message.bot, db, settings, reason="manual", loader_message=notice,
+        )
     with suppress(Exception):
         await notice.delete()
     await message.answer(
@@ -4775,10 +4820,20 @@ async def restore_apply(
                        step="writing the tables"),
                 reply_markup=None, parse_mode="HTML",
             )
-        tg_file = await callback.bot.get_file(file_id)
-        buf = await callback.bot.download_file(tg_file.file_path)
-        payload = json.loads(buf.read().decode("utf-8"), object_hook=_json_revive)
-        restored = await db.import_backup(payload.get("data") or {})
+        # Restoring touches every table; keep the typing indicator alive so
+        # the chat does not look frozen while it runs.
+        restore_typing = asyncio.create_task(
+            _keep_typing(callback.bot, callback.message.chat.id),
+        )
+        try:
+            tg_file = await callback.bot.get_file(file_id)
+            buf = await callback.bot.download_file(tg_file.file_path)
+            payload = json.loads(buf.read().decode("utf-8"), object_hook=_json_revive)
+            restored = await db.import_backup(payload.get("data") or {})
+        finally:
+            restore_typing.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await restore_typing
     except Exception as exc:
         logger.exception("Restore failed")
         return await _safe_edit(
@@ -5373,9 +5428,10 @@ async def admin_backup_cb(callback: CallbackQuery, db: Database, settings: Setti
         callback.message,
         safe_t(language, "load_backup", bar=progress_line(0, 1), step="starting"), None,
     )
-    name = await _make_backup(
-        callback.bot, db, settings, reason="manual", loader_message=callback.message,
-    )
+    async with _busy(callback.bot, callback.message.chat.id):
+        name = await _make_backup(
+            callback.bot, db, settings, reason="manual", loader_message=callback.message,
+        )
     await _safe_edit(
         callback.message,
         f"✅ Backup sent.\n\n<code>{safe_html(name)}</code>" if name
