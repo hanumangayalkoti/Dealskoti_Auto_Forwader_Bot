@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import io
 import logging
 import os
 import re
@@ -44,6 +45,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
+    InputMediaPhoto,
     BotCommandScopeChat,
     CallbackQuery,
     ErrorEvent,
@@ -77,6 +80,9 @@ from .locales import (
     t,
 )
 from .plans import (
+    STYLE_BUY,
+    STYLE_DANGER,
+    STYLE_GO,
     plan_label,
     MIN_WITHDRAWAL_PAISE,
     PLANS,
@@ -251,7 +257,7 @@ async def _require_connected(db: Database, user_id: int, language: str) -> str |
 
 def _connect_required_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+        [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO)],
         # Most people stop right here: handing a phone number and 2FA password
         # to a bot is a big ask. This answers that worry before they leave.
         [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
@@ -269,7 +275,7 @@ async def why_connect_cb(callback: CallbackQuery, db: Database) -> None:
         callback.message,
         safe_t(language, "why_connect"),
         InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔌 Connect Now", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="🔌 Connect Now", callback_data="menu:connect", style=STYLE_GO)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
@@ -338,11 +344,11 @@ async def _menu_text(db: Database, user_id: int, language: str) -> str:
 
 def main_menu_keyboard(settings: Settings) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect"),
+        [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO),
          InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks")],
-        [InlineKeyboardButton(text="➕ New Task", callback_data="task:create"),
+        [InlineKeyboardButton(text="➕ New Task", callback_data="task:create", style=STYLE_GO),
          InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings")],
-        [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
+        [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans", style=STYLE_BUY),
          InlineKeyboardButton(text="👤 My Account", callback_data="menu:account")],
         [InlineKeyboardButton(text="❓ FAQ", callback_data="faq:page:0"),
          InlineKeyboardButton(text="🎁 Refer & Earn", callback_data="menu:refer")],
@@ -828,10 +834,10 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
         if await _trial_available(db, user_id):
             rows.append(_trial_button())
         rows += [
-            [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+            [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO)],
             [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
             [InlineKeyboardButton(text="🔐 Why connect?", callback_data="why:connect")],
-            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
+            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans", style=STYLE_BUY),
              InlineKeyboardButton(text="❓ How it works", callback_data="faq:page:0")],
         ]
         if settings.support_bot_link:
@@ -850,9 +856,9 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
         if await _trial_available(db, user_id):
             rows.append(_trial_button())
         rows += [
-            [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create")],
+            [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create", style=STYLE_GO)],
             [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
-            [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
+            [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans", style=STYLE_BUY),
              InlineKeyboardButton(text="👤 Account", callback_data="menu:account")],
             [InlineKeyboardButton(text="❓ Help", callback_data="faq:page:0")],
         ]
@@ -879,7 +885,7 @@ async def _home_screen(db: Database, user_id: int, language: str, settings: Sett
          InlineKeyboardButton(text="📊 Stats", callback_data="menu:stats")],
         [InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings"),
          InlineKeyboardButton(text="🛠️ Config", callback_data="cfg:list")],
-        [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans"),
+        [InlineKeyboardButton(text="💎 Plans", callback_data="menu:plans", style=STYLE_BUY),
          InlineKeyboardButton(text="🎁 Refer & Earn", callback_data="menu:refer")],
         [InlineKeyboardButton(text="👤 Account", callback_data="menu:account"),
          InlineKeyboardButton(text="❓ Help", callback_data="faq:page:0")],
@@ -1257,9 +1263,9 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
 
 def _account_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
+        [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans", style=STYLE_BUY)],
         [InlineKeyboardButton(text="📎 My File", callback_data="menu:myfile")],
-        [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect-ask")],
+        [InlineKeyboardButton(text="🔌 Disconnect", callback_data="auth:disconnect-ask", style=STYLE_DANGER)],
         [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
          InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
     ])
@@ -1415,8 +1421,8 @@ async def _finish_login_success(
             username=f"@{safe_html(tg_username)}" if tg_username else "—",
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
-            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+            [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create", style=STYLE_GO)],
+            [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans", style=STYLE_BUY)],
             [InlineKeyboardButton(text="👤 My Account", callback_data="menu:account"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
@@ -1472,6 +1478,99 @@ async def menu_connect(
         )
         return await callback.answer()
     await telethon.cancel_login(callback.from_user.id)
+    await state.set_state(None)
+    await _safe_edit(
+        callback.message, safe_t(language, "login_choose"), _login_choice_keyboard(language),
+    )
+    await callback.answer()
+
+
+# ==========================================
+# QR LOGIN
+# ==========================================
+# Two ways to sign in, offered side by side:
+#   📱 phone number + OTP  — the old flow, untouched
+#   📷 QR code             — faster, and no phone number to type
+#
+# The QR is shown as an image AND as a tappable tg:// link. That link is the
+# part that makes QR usable at all for most people: a user with Telegram on
+# one phone cannot scan their own screen, so without it the whole feature
+# would only work for people who own a second device.
+#
+# The token expires roughly every minute, so it is regenerated in place while
+# the user is still deciding — they never see it change.
+
+QR_TOTAL_SECONDS = 60
+QR_TICK = 5          # how often the countdown is redrawn
+QR_WAIT_SLICE = 5.0  # how long each wait() call blocks before ticking
+
+
+def _login_choice_keyboard(language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=safe_t(language, "phone_button"), callback_data="login:phone",
+            style=STYLE_GO,
+        )],
+        [InlineKeyboardButton(
+            text=safe_t(language, "qr_button"), callback_data="login:qr",
+            style=STYLE_GO,
+        )],
+        [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
+        [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
+         InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
+    ])
+
+
+def _qr_image(url: str) -> BufferedInputFile:
+    """Renders the login URL as a QR PNG."""
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=3,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return BufferedInputFile(buffer.read(), filename="login_qr.png")
+
+
+def _qr_keyboard(url: str, language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        # The tg:// link — this is what lets a single-device user sign in.
+        [InlineKeyboardButton(text="⚡ Tap to Login", url=url)],
+        [InlineKeyboardButton(text="🔄 New QR", callback_data="login:qr"),
+         InlineKeyboardButton(text=safe_t(language, "phone_button"), callback_data="login:phone")],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
+    ])
+
+
+def _qr_expired_keyboard(language: str, settings: Settings) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🔄 Generate New QR", callback_data="login:qr",
+                              style=STYLE_GO)],
+        [InlineKeyboardButton(text=safe_t(language, "phone_button"), callback_data="login:phone")],
+    ]
+    if settings.support_url:
+        rows.append([InlineKeyboardButton(text="📞 Support", url=settings.support_url)])
+    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "login:phone")
+async def login_phone_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService,
+) -> None:
+    """The original phone + OTP flow, now reached from the choice screen."""
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await telethon.cancel_login(callback.from_user.id)
     await state.set_state(LoginStates.waiting_phone)
     await state.update_data(login_msg_ids=[callback.message.message_id])
     await _safe_edit(
@@ -1479,6 +1578,146 @@ async def menu_connect(
         _nav_keyboard(include_cancel=True, why_connect=True),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "login:qr")
+async def login_qr_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
+    telethon: TelethonService, forwarding: ForwardingEngine,
+) -> None:
+    if callback.message is None:
+        return
+    language = await _language_for_callback(db, callback)
+    await state.set_state(None)
+
+    try:
+        url = await telethon.start_qr_login(callback.from_user.id)
+    except ValueError as exc:
+        return await _safe_edit(
+            callback.message, f"⚠️ {safe_html(exc)}", _login_choice_keyboard(language),
+        )
+    except Exception:
+        logger.exception("QR login failed to start for %s", callback.from_user.id)
+        return await _safe_edit(
+            callback.message, safe_t(language, "qr_failed"), _login_choice_keyboard(language),
+        )
+
+    await callback.answer()
+    with suppress(Exception):
+        await callback.message.delete()
+
+    qr_msg = await callback.bot.send_photo(
+        callback.from_user.id,
+        photo=_qr_image(url),
+        caption=safe_t(language, "qr_instructions", seconds=QR_TOTAL_SECONDS),
+        reply_markup=_qr_keyboard(url, language),
+        parse_mode="HTML",
+    )
+    timer_msg = await callback.bot.send_message(
+        callback.from_user.id,
+        safe_t(language, "qr_timer", seconds=QR_TOTAL_SECONDS),
+        parse_mode="HTML",
+    )
+
+    # Run the wait in the background so the handler returns immediately and
+    # Telegram does not time the callback out.
+    asyncio.create_task(_qr_watch(
+        callback.bot, db, settings, telethon, forwarding, state,
+        callback.from_user.id, qr_msg, timer_msg, language,
+    ))
+
+
+async def _qr_watch(
+    bot: Bot, db: Database, settings: Settings, telethon: TelethonService,
+    forwarding: ForwardingEngine, state: FSMContext, user_id: int,
+    qr_msg: Message, timer_msg: Message, language: str,
+) -> None:
+    """Counts down, refreshes the token, and finishes the login."""
+    remaining = QR_TOTAL_SECONDS
+    try:
+        while remaining > 0:
+            result = await telethon.wait_qr_login(user_id, timeout=QR_WAIT_SLICE)
+
+            if isinstance(result, dict):
+                return await _qr_success(
+                    bot, db, settings, forwarding, state, user_id,
+                    qr_msg, timer_msg, language, result,
+                )
+
+            if result == "2fa":
+                # Scanned, but the account has a cloud password. Hand over to
+                # the SAME 2FA screen the phone flow uses — one code path.
+                with suppress(Exception):
+                    await qr_msg.delete()
+                with suppress(Exception):
+                    await timer_msg.delete()
+                await state.set_state(LoginStates.waiting_2fa)
+                prompt = await bot.send_message(
+                    user_id, safe_t(language, "qr_2fa"), parse_mode="HTML",
+                )
+                await state.update_data(login_msg_ids=[prompt.message_id])
+                return
+
+            remaining -= int(QR_WAIT_SLICE)
+            if remaining <= 0:
+                break
+
+            # The token dies before the countdown does, so it is quietly
+            # replaced. The user sees the same picture the whole time.
+            if remaining % 30 == 0:
+                new_url = await telethon.refresh_qr_login(user_id)
+                if new_url:
+                    with suppress(Exception):
+                        await qr_msg.edit_media(
+                            InputMediaPhoto(
+                                media=_qr_image(new_url),
+                                caption=safe_t(language, "qr_instructions", seconds=remaining),
+                                parse_mode="HTML",
+                            ),
+                            reply_markup=_qr_keyboard(new_url, language),
+                        )
+
+            if remaining % QR_TICK == 0:
+                with suppress(Exception):
+                    await timer_msg.edit_text(
+                        safe_t(language, "qr_timer", seconds=remaining), parse_mode="HTML",
+                    )
+    except Exception:
+        logger.exception("QR watch failed for %s", user_id)
+
+    # Timed out — clear the code away so a dead QR is never left on screen.
+    with suppress(Exception):
+        await telethon.cancel_login(user_id)
+    with suppress(Exception):
+        await qr_msg.delete()
+    with suppress(Exception):
+        await timer_msg.delete()
+    with suppress(Exception):
+        await bot.send_message(
+            user_id, safe_t(language, "qr_expired"),
+            reply_markup=_qr_expired_keyboard(language, settings), parse_mode="HTML",
+        )
+
+
+async def _qr_success(
+    bot: Bot, db: Database, settings: Settings, forwarding: ForwardingEngine,
+    state: FSMContext, user_id: int, qr_msg: Message, timer_msg: Message,
+    language: str, info: dict,
+) -> None:
+    """Signed in.
+
+    Deliberately reuses _finish_login_success — the same congratulations
+    message, the same admin notification, the same trial offer — so the QR
+    path and the phone path can never drift apart.
+    """
+    with suppress(Exception):
+        await timer_msg.delete()
+    # The photo message cannot be edited into text, so it is removed and a
+    # plain one takes its place for the shared finisher to work on.
+    with suppress(Exception):
+        await qr_msg.delete()
+    holder = await bot.send_message(user_id, "✅ Signing you in…")
+    await _finish_login_success(holder, state, db, forwarding, settings, info, language)
 
 
 @router.callback_query(F.data == "connect:force")
@@ -1489,10 +1728,9 @@ async def connect_force(
         return
     language = await _language_for_callback(db, callback)
     await telethon.cancel_login(callback.from_user.id)
-    await state.set_state(LoginStates.waiting_phone)
-    await state.update_data(login_msg_ids=[callback.message.message_id])
+    await state.set_state(None)
     await _safe_edit(
-        callback.message, safe_t(language, "login_phone"), _nav_keyboard(include_cancel=True),
+        callback.message, safe_t(language, "login_choose"), _login_choice_keyboard(language),
     )
     await callback.answer()
 
@@ -1668,7 +1906,7 @@ async def _start_upload(message_obj, db: Database, settings: Settings, user_id: 
     if not _can_upload_file(plan_name):
         text = safe_t(language, "upload_not_platinum")
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans")],
+            [InlineKeyboardButton(text="💎 Upgrade Plan", callback_data="menu:plans", style=STYLE_BUY)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
@@ -1916,7 +2154,7 @@ async def _render_tasks(message_obj, db: Database, user_id: int) -> None:
 
     if not tasks:
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create")],
+            [InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create", style=STYLE_GO)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ])
@@ -1940,7 +2178,7 @@ async def _render_tasks(message_obj, db: Database, user_id: int) -> None:
             f"📊 {len(tasks)}/{plan.tasks} tasks used on the <b>{plan.name}</b> plan"
         )
         if len(tasks) < plan.tasks:
-            rows.append([InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create")])
+            rows.append([InlineKeyboardButton(text="➕ Create New Task", callback_data="task:create", style=STYLE_GO)])
         rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
         text = "\n".join(lines)
         markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1993,7 +2231,7 @@ async def new_task_cmd(
     allowed, warning = await _can_create_task(db, message.from_user.id)
     if not allowed:
         return await message.answer(warning, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Upgrade", callback_data="menu:plans")],
+            [InlineKeyboardButton(text="💎 Upgrade", callback_data="menu:plans", style=STYLE_BUY)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:tasks"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]), parse_mode="HTML")
@@ -2017,7 +2255,7 @@ async def task_create_cb(
     allowed, warning = await _can_create_task(db, callback.from_user.id)
     if not allowed:
         await _safe_edit(callback.message, warning, InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Upgrade", callback_data="menu:plans")],
+            [InlineKeyboardButton(text="💎 Upgrade", callback_data="menu:plans", style=STYLE_BUY)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:tasks"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]))
@@ -2616,7 +2854,7 @@ async def bulk_transfer_command(
         return await message.answer(
             safe_t(language, "bulk_locked"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans", style=STYLE_BUY)],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
@@ -2777,7 +3015,7 @@ async def bulk_range_cb(
             range=label, count=f"{count:,}", eta=_eta_text(count, language),
         ),
         InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go")],
+            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go", style=STYLE_GO)],
             [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
         ]),
     )
@@ -2844,7 +3082,7 @@ async def bulk_date_input(
             eta=_eta_text(count, language),
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go")],
+            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go", style=STYLE_GO)],
             [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
         ]),
     )
@@ -2946,7 +3184,7 @@ async def bulk_range_end(
             range=label, count=f"{count:,}", eta=_eta_text(count, language),
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go")],
+            [InlineKeyboardButton(text="✅ Start Transfer", callback_data="bulk:go", style=STYLE_GO)],
             [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")],
         ]),
     )
@@ -3242,7 +3480,7 @@ async def _trial_available(db: Database, user_id: int) -> bool:
 
 
 def _trial_button() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="🎁 Try Gold FREE for 7 Days", callback_data="trial:offer")]
+    return [InlineKeyboardButton(text="🎁 Try Gold FREE for 7 Days", callback_data="trial:offer", style=STYLE_GO)]
 
 
 @router.message(Command("trial"))
@@ -3269,7 +3507,7 @@ async def _trial_offer(message_obj, db: Database, user_id: int, language: str) -
             safe_t(language, "trial_used",
                    when=claimed.astimezone(IST).strftime("%d %b %Y")),
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans", style=STYLE_BUY)],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
@@ -3292,7 +3530,7 @@ async def _trial_offer(message_obj, db: Database, user_id: int, language: str) -
         message_obj,
         safe_t(language, "trial_offer", features=features),
         InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Continue", callback_data="trial:ask")],
+            [InlineKeyboardButton(text="🎁 Continue", callback_data="trial:ask", style=STYLE_GO)],
             [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
              InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
@@ -3313,7 +3551,7 @@ async def trial_ask_cb(callback: CallbackQuery, db: Database) -> None:
             callback.message,
             safe_t(language, "trial_needs_connect"),
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
+                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect", style=STYLE_GO)],
                 [InlineKeyboardButton(text="🔐 Why is this needed?", callback_data="why:connect")],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
@@ -3361,7 +3599,7 @@ async def trial_start_cb(
         callback.message,
         safe_t(language, "trial_started", expiry=expiry),
         InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create")],
+            [InlineKeyboardButton(text="➕ Create First Task", callback_data="task:create", style=STYLE_GO)],
             [InlineKeyboardButton(text="✨ All Features", callback_data="menu:features")],
             [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
         ]),
@@ -3408,7 +3646,7 @@ async def _offer_trial_after_connect(bot: Bot, db: Database, user_id: int, langu
             safe_t(language, "trial_offer",
                    features=plan_feature_tree(TRIAL_PLAN, await db.features_map())),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎁 Continue", callback_data="trial:ask")],
+                [InlineKeyboardButton(text="🎁 Continue", callback_data="trial:ask", style=STYLE_GO)],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
             parse_mode="HTML",
@@ -3539,7 +3777,7 @@ async def inline_button_command(message: Message, db: Database) -> None:
         return await message.answer(
             safe_t(language, "ib_locked"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans")],
+                [InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans", style=STYLE_BUY)],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
         )
@@ -3550,7 +3788,7 @@ async def inline_button_command(message: Message, db: Database) -> None:
             "📭 <b>No tasks yet</b>\n\nCreate a task first — buttons are set per task, "
             "so each of your channels can have its own.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
+                [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create", style=STYLE_GO)],
                 [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
             parse_mode="HTML",
@@ -3997,7 +4235,7 @@ async def config_command(message: Message, db: Database) -> None:
         return await message.answer(
             safe_t(language, "config_no_tasks"),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create")],
+                [InlineKeyboardButton(text="➕ Create Task", callback_data="task:create", style=STYLE_GO)],
                 [InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
                  InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
             ]),
@@ -4839,8 +5077,8 @@ def _all_features_markup(page: int, pages: int) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append([
-        InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans"),
-        InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect"),
+        InlineKeyboardButton(text="💎 View Plans", callback_data="menu:plans", style=STYLE_BUY),
+        InlineKeyboardButton(text="🔌 Connect", callback_data="menu:connect", style=STYLE_GO),
     ])
     rows.append([
         InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
