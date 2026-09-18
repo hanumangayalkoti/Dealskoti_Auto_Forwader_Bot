@@ -329,7 +329,13 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
 # Tier emoji. The KEYS ("basic", "silver"…) are never renamed — every existing
 # user row stores one of them, so changing a key would break their plan. Only
 # the emoji and display names are cosmetic and safe to change.
-TIER_ICON = {"basic": "🌱", "silver": "⚡", "gold": "🚀", "platinum": "💎"}
+TIER_ICON = {
+    "free": "🆓",
+    "basic": "🌱",
+    "silver": "⚡",
+    "gold": "🚀",
+    "platinum": "💎",
+}
 TIER_LABEL = {
     "basic": "Basic & Above", "silver": "Silver & Above",
     "gold": "Gold & Above", "platinum": "Platinum Only",
@@ -518,7 +524,12 @@ def all_features_text(features: list[dict], page: int = 0) -> str:
     lines = [
         "✨ <b>All Features</b>",
         "",
-        "🥉 Basic  ·  🥈 Silver  ·  🥇 Gold  ·  💎 Platinum",
+        # Built from TIER_ICON so the legend can never disagree with the
+        # icons on the lines below it.
+        "  ·  ".join(
+            f"{TIER_ICON[k]} {PLANS[k].name}"
+            for k in ("basic", "silver", "gold", "platinum")
+        ),
         "👆 Tap any feature to know about it",
         "",
     ]
@@ -531,7 +542,7 @@ def all_features_text(features: list[dict], page: int = 0) -> str:
 
     for index, row in enumerate(chunk):
         branch = "└─" if index == len(chunk) - 1 else "├─"
-        icon = TIER_ICON.get(str(row["tier"]), "🥈")
+        icon = TIER_ICON.get(str(row["tier"]), "⚡")
         name = str(row["name"])
         link = row["link"]
         label = f'<a href="{link}"><b>{name}</b></a>' if link else name
@@ -540,6 +551,24 @@ def all_features_text(features: list[dict], page: int = 0) -> str:
     lines.append("")
     lines.append(f"Page {page + 1} of {pages} · {len(features)} features")
     return "\n".join(lines)
+
+
+def plan_icon(plan_name: str) -> str:
+    """The emoji for a plan, used EVERYWHERE a plan is named.
+
+    Single source of truth: changing TIER_ICON has to change the plans screen,
+    the home header, payment receipts, admin tools and the feature list all at
+    once — otherwise the tiers look inconsistent depending on which screen you
+    happen to be on.
+    """
+    return TIER_ICON.get((plan_name or "free").lower(), "🆓")
+
+
+def plan_label(plan_name: str) -> str:
+    """Emoji + display name, e.g. "🚀 Gold"."""
+    plan = PLANS.get((plan_name or "free").lower())
+    name = plan.name if plan else str(plan_name).title()
+    return f"{plan_icon(plan_name)} {name}"
 
 
 def plan_details_text(plan_name: str, links: dict[str, dict] | None = None) -> str:
@@ -563,7 +592,7 @@ def plan_details_text(plan_name: str, links: dict[str, dict] | None = None) -> s
         )
 
     return (
-        f"💎 <b>{plan.name} Plan</b>\n"
+        f"{plan_icon(plan_name)} <b>{plan.name} Plan</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"{plan_price_block(plan_name)}\n"
         f"{plan_feature_tree(plan_name, links)}"
