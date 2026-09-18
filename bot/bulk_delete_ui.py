@@ -51,7 +51,7 @@ from .config import Settings
 from .db import Database
 from .forwarding import ForwardingEngine
 from .locales import language_for, t
-from .plans import PLANS, F_BULK_DELETE, min_plan_for, plan_has
+from .plans import plan_label, PLANS, F_BULK_DELETE, min_plan_for, plan_has
 from .telethon_service import TelethonService
 
 logger = logging.getLogger("dealskoti.bulkdelete")
@@ -1131,7 +1131,7 @@ async def _log_to_admins(
     user = await db.get_user(user_id)
     name = safe_html(user["first_name"] or user["username"] or user_id) if user else str(user_id)
     handle = f"@{safe_html(user['username'])}" if user and user["username"] else "no username"
-    plan = str(user["plan"]).title() if user else "?"
+    plan_raw = str(user["plan"]) if user else "free"
     status_line = (
         "⏹️ Stopped by user" if job["cancel"]
         else ("⚠️ Partial" if (reason or job["failed"]) else "✅ Completed")
@@ -1140,7 +1140,7 @@ async def _log_to_admins(
         f"🗑️ <b>Bulk Delete Job</b>\n\n"
         f"👤 {name} ({handle})\n"
         f"🆔 <code>{user_id}</code>\n"
-        f"💎 Plan: {plan}\n\n"
+        f"{plan_label(plan_raw)}\n\n"
         f"📛 Chat: <b>{safe_html(chat_title)}</b>\n"
         f"🆔 Chat ID: <code>{chat_id}</code>\n"
         f"🗑️ Filter: <b>{safe_html(job.get('scope') or 'All messages')}</b>\n\n"
