@@ -18,6 +18,7 @@ NON-NEGOTIABLE RULES (do not "optimise" these away in a rewrite):
   3. OTP codes and 2FA passwords are never persisted anywhere.
 """
 
+import asyncio
 import logging
 from contextlib import suppress
 
@@ -171,6 +172,88 @@ class TelethonService:
             await client.disconnect()
             logger.error(f"Error starting phone login for {user_id}: {e}")
             raise ValueError("Failed to request OTP. Please try again.")
+
+    # ==========================================
+    # QR LOGIN
+    # ==========================================
+    # Telegram can log a user in from a QR code instead of a phone number and
+    # OTP. Two ways to use it:
+    #   * scan the QR from ANOTHER logged-in device
+    #   * tap the tg:// link, which works on the SAME device
+    #
+    # The second one matters more than it looks: most people have Telegram on
+    # one phone only and cannot scan their own screen, so a QR-only flow would
+    # be unusable for them.
+    #
+    # The token expires every ~60 seconds, so it is regenerated in place while
+    # the user is still deciding — they never see it change.
+
+    async def start_qr_login(self, user_id: int) -> str:
+        """Begins a QR login. Returns the tg:// URL to show and to link."""
+        await self.cancel_login(user_id)
+
+        client = TelegramClient(StringSession(), self.api_id, self.api_hash)
+        await client.connect()
+        try:
+            qr = await client.qr_login()
+        except errors.FloodWaitError as e:
+            await client.disconnect()
+            raise ValueError(f"Telegram blocked requests for {e.seconds} seconds. Try again later.")
+        except Exception as e:
+            await client.disconnect()
+            logger.error(f"Error starting QR login for {user_id}: {e}")
+            raise ValueError("Could not create a QR code. Please try again.")
+
+        self.login_clients[user_id] = {"client": client, "qr": qr, "phone": None}
+        return qr.url
+
+    async def refresh_qr_login(self, user_id: int) -> str | None:
+        """Regenerates an expired token in place. Returns the new URL."""
+        login_data = self.login_clients.get(user_id)
+        if not login_data or "qr" not in login_data:
+            return None
+        try:
+            await login_data["qr"].recreate()
+            return login_data["qr"].url
+        except Exception as e:
+            logger.info(f"Could not refresh QR for {user_id}: {e}")
+            return None
+
+    async def wait_qr_login(self, user_id: int, timeout: float = 30.0) -> dict | str | None:
+        """Waits for the QR to be scanned or the link to be opened.
+
+        Returns:
+            dict  — signed in, account info
+            "2fa" — scanned, but a cloud password is still needed
+            None  — nobody scanned it in time (caller should refresh and retry)
+        """
+        login_data = self.login_clients.get(user_id)
+        if not login_data or "qr" not in login_data:
+            raise ValueError("Login session expired. Please start over.")
+
+        client: TelegramClient = login_data["client"]
+        qr = login_data["qr"]
+        try:
+            await qr.wait(timeout=timeout)
+        except asyncio.TimeoutError:
+            return None  # not scanned yet — perfectly normal
+        except errors.SessionPasswordNeededError:
+            # Scanned, but the account has a cloud password. The client is kept
+            # alive so the existing 2FA screen can finish the job.
+            return "2fa"
+        except Exception as e:
+            logger.info(f"QR wait ended for {user_id}: {e}")
+            return None
+
+        session_string = client.session.save()
+        await self._save_session(user_id, session_string)
+        account_info = await self._account_info(client)
+        await self.cancel_login(user_id)
+        return account_info
+
+    def qr_login_active(self, user_id: int) -> bool:
+        data = self.login_clients.get(user_id)
+        return bool(data and "qr" in data)
 
     async def submit_pin(self, user_id: int, pin: str) -> dict | str:
         """Submits the OTP.
