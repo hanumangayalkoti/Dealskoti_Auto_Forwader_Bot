@@ -1,893 +1,161 @@
-"""
-Plans, pricing and every payment method.
-
-Three ways to pay, all ending at the same place:
-  * Razorpay (INR)   — automatic, activated by the webhook in main.py
-  * USDT             — admin verifies a TXID
-  * Telegram Stars   — admin verifies a screenshot or transaction id
-
-USDT and Stars share ONE table (manual_payments) and ONE admin review screen,
-so there is never a second code path to drift out of sync. Approval calls
-db.apply_manual_plan(), which runs the exact same upgrade/downgrade maths as a
-card payment.
-
-Register in main.py BEFORE the main router:
-    from .billing_ui import router as billing_router
-    dispatcher.include_router(billing_router)
-"""
-
-from __future__ import annotations
-
-import html
+import base64
+import hashlib
+import hmac
+import json
 import logging
-from contextlib import suppress
-from uuid import uuid4
-from zoneinfo import ZoneInfo
+from dataclasses import dataclass
 
-from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    Message,
-    PreCheckoutQuery,
-)
+import aiohttp
 
-from .billing import BillingError, RazorpayBilling
 from .config import Settings
-from .db import Database
-from .forwarding import ForwardingEngine
-from .gate import enforce_gate
-from .locales import language_for, t
-from .plans import (
-    plan_label,
-    PLANS,
-    cycles_for,
-    duration_days,
-    format_paise,
-    payable_amount_paise as _payable,
-    payable_amount_paise,
-    plan_details_text,
-    stars_amount,
-    usdt_amount_usd,
-)
 
-logger = logging.getLogger("dealskoti.billing_ui")
+logger = logging.getLogger("dealskoti.billing")
 
-router = Router(name="dealskoti-billing")
+class BillingError(Exception):
+    """Raised when payment gateway operations fail."""
+    pass
 
-CYCLES = ("weekly", "monthly", "yearly")
-IST = ZoneInfo("Asia/Kolkata")
+@dataclass
+class PaymentLinkResult:
+    link_id: str
+    short_url: str
 
+@dataclass
+class CapturedPayment:
+    order_id: str
+    payment_id: str
+    amount_paise: int
+    # Razorpay copies payment-link notes onto the payment entity. Used as a
+    # fallback when order_id does not match a stored payment row.
+    notes: dict | None = None
 
-# ==========================================
-# FSM STATES
-# ==========================================
+class RazorpayBilling:
+    def __init__(self, settings: Settings):
+        self.key_id = settings.razorpay_key_id
+        self.key_secret = settings.razorpay_key_secret
+        self.webhook_secret = settings.razorpay_webhook_secret
 
-class ManualPayStates(StatesGroup):
-    waiting_proof = State()
-
-
-# ==========================================
-# LOCAL HELPERS
-# ==========================================
-
-def safe_html(text) -> str:
-    return html.escape(str(text))
-
-
-def safe_t(lang: str, key: str, **kwargs) -> str:
-    try:
-        return t(lang, key, **kwargs)
-    except Exception:
-        logger.warning("Missing translation key %r for language %r", key, lang)
-        return f"[{key}]"
-
-
-async def _lang(db: Database, user_id: int) -> str:
-    user = await db.get_user(user_id)
-    return language_for(user["preferred_language"]) if user else "en"
-
-
-async def _show(message_obj, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
-    if hasattr(message_obj, "edit_text") and getattr(message_obj, "message_id", None):
+    async def create_payment_link(self, amount_paise: int, receipt: str, plan: str, cycle: str, user_id: int) -> PaymentLinkResult:
+        url = "https://api.razorpay.com/v1/payment_links"
+        
+        auth_string = f"{self.key_id}:{self.key_secret}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        headers = {
+            "Authorization": f"Basic {encoded_auth}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "amount": amount_paise,
+            "currency": "INR",
+            "accept_partial": False,
+            "reference_id": receipt,
+            "description": f"DealsKoti {plan.title()} Plan - {cycle.title()}",
+            "customer": {
+                "name": f"User {user_id}"
+                # FIX: Removed the empty "contact" field to prevent Razorpay API errors
+            },
+            "notify": {
+                "sms": False,
+                "email": False
+            },
+            "reminder_enable": False,
+            "notes": {
+                "user_id": str(user_id),
+                "plan": plan,
+                "cycle": cycle
+            }
+        }
+        
         try:
-            await message_obj.edit_text(text, reply_markup=markup, parse_mode="HTML")
-            return
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc):
-                return
-    await message_obj.answer(text, reply_markup=markup, parse_mode="HTML")
-
-
-def _nav(back: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Back", callback_data=back)],
-        [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-    ])
-
-
-def _is_admin(settings: Settings, user_id: int) -> bool:
-    return user_id in settings.admin_telegram_ids
-
-
-def _display_name(record) -> str:
-    if record is None:
-        return "User"
-    first = record["first_name"] if "first_name" in record.keys() else None
-    username = record["username"] if "username" in record.keys() else None
-    return safe_html(first or username or "User")
-
-
-# ==========================================
-# PLAN SCREENS
-# ==========================================
-
-# Two per row: full-width buttons wasted vertical space and pushed the
-# navigation off the first screen on a phone.
-# Built from plan_label() rather than written out, so the tier emoji only ever
-# has to change in ONE place (plans.TIER_ICON) and every screen follows.
-PLAN_BUTTON_ORDER = ("basic", "silver", "gold", "platinum", "free")
-
-
-def plans_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    row = []
-    for key in PLAN_BUTTON_ORDER:
-        row.append(InlineKeyboardButton(
-            text=plan_label(key), callback_data=f"plan:{key}",
-        ))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([
-        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
-        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def cycles_keyboard(plan_name: str) -> InlineKeyboardMarkup:
-    rows = []
-    for cycle in cycles_for(plan_name):
-        _o, _d, payable = payable_amount_paise(plan_name, cycle)
-        label = {"weekly": "🗓️ Weekly", "monthly": "📅 Monthly", "yearly": "⭐ Yearly (20% OFF)"}[cycle]
-        rows.append([InlineKeyboardButton(
-            text=f"{label} — {format_paise(payable)}",
-            callback_data=f"cycle:{plan_name}:{cycle}",
-        )])
-    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans")])
-    rows.append([
-        InlineKeyboardButton(text="◀️ Back", callback_data="menu:home"),
-        InlineKeyboardButton(text="🏠 Home", callback_data="menu:home"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _plans_prefix(user, language: str) -> str:
-    if user and user["plan"] != "free":
-        current_plan = str(user["plan"]).title()
-        expiry = (
-            user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-            if user["plan_expiry"] else "Lifetime"
-        )
-        if language == "hinglish":
-            return f"👤 <b>Aapka Plan:</b> {current_plan}\n⏳ <b>Expiry:</b> {expiry}\n\n"
-        return f"👤 <b>Current Plan:</b> {current_plan}\n⏳ <b>Expiry:</b> {expiry}\n\n"
-    label = "Aapka Plan" if language == "hinglish" else "Current Plan"
-    return f"👤 <b>{label}:</b> Free\n\n"
-
-
-@router.message(Command("plans", "subscribe"))
-async def plans_command(message: Message, db: Database) -> None:
-    language = await _lang(db, message.from_user.id)
-    user = await db.get_user(message.from_user.id)
-    await message.answer(
-        _plans_prefix(user, language) + safe_t(language, "choose_plan"),
-        reply_markup=plans_keyboard(), parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data == "menu:plans")
-async def plans_menu_cb(callback: CallbackQuery, db: Database) -> None:
-    if callback.message is None:
-        return
-    language = await _lang(db, callback.from_user.id)
-    user = await db.get_user(callback.from_user.id)
-    await _show(
-        callback.message,
-        _plans_prefix(user, language) + safe_t(language, "choose_plan"),
-        plans_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("plan:"))
-async def plan_details_cb(callback: CallbackQuery, db: Database) -> None:
-    """Shows the full feature tree for one plan.
-
-    The body comes from plans.plan_details_text() so the pricing and the
-    feature list can never disagree with what the tiers actually unlock.
-    """
-    if callback.message is None:
-        return
-    plan_name = callback.data.split(":", 1)[1]
-    if plan_name not in PLANS:
-        return await callback.answer("Invalid plan", show_alert=True)
-
-    language = await _lang(db, callback.from_user.id)
-    # Feature names come from the database so an admin's renames and channel
-    # links show up here without a redeploy.
-    links = await db.features_map()
-    details = plan_details_text(plan_name, links)
-
-    if plan_name == "free":
-        await _show(
-            callback.message,
-            safe_t(language, "plan_details_free", details=details),
-            _nav("menu:plans"),
-        )
-        return await callback.answer()
-
-    await _show(
-        callback.message,
-        safe_t(language, "plan_details", details=details)
-        + (safe_t(language, "features_hint") if any(v.get("link") for v in links.values()) else ""),
-        cycles_keyboard(plan_name),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("cycle:"))
-async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
-    """Checkout summary with every enabled payment method."""
-    if callback.message is None:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        return await callback.answer("Invalid option", show_alert=True)
-    plan_name, cycle = parts[1], parts[2]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in cycles_for(plan_name):
-        return await callback.answer("Invalid option", show_alert=True)
-
-    language = await _lang(db, callback.from_user.id)
-    first_order = not await db.has_paid_order(callback.from_user.id)
-    original, discount, payable = payable_amount_paise(plan_name, cycle, first_paid_order=first_order)
-
-    rows = [[InlineKeyboardButton(
-        text="💷 Pay with UPI / Card",
-        callback_data=f"pay:inr:{plan_name}:{cycle}",
-    )]]
-    # Each alternative method only appears when it is actually configured, so a
-    # user can never start a payment that has nowhere to go.
-    if settings.usdt_enabled and usdt_amount_usd(plan_name, cycle) > 0:
-        rows.append([InlineKeyboardButton(
-            text=f"🪙 Pay with USDT — ${usdt_amount_usd(plan_name, cycle):g}",
-            callback_data=f"pay:usdt:{plan_name}:{cycle}",
-        )])
-    if settings.stars_enabled and stars_amount(plan_name, cycle) > 0:
-        rows.append([InlineKeyboardButton(
-            text=f"⭐ Pay with Stars — {stars_amount(plan_name, cycle)}",
-            callback_data=f"pay:stars:{plan_name}:{cycle}",
-        )])
-    rows.append([InlineKeyboardButton(text="◀️ Back", callback_data=f"plan:{plan_name}")])
-    rows.append([InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")])
-
-    await _show(
-        callback.message,
-        safe_t(
-            language, "billing_details",
-            plan=plan_label(plan_name), cycle=cycle.title(),
-            original=format_paise(original), discount=format_paise(discount),
-            payable=format_paise(payable),
-        ),
-        InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
-
-
-# ==========================================
-# SHARED PRE-PAYMENT CHECKS
-# ==========================================
-
-async def _prepay_guard(callback: CallbackQuery, db: Database, settings: Settings, language: str) -> bool:
-    """Channel gate + connected account. Returns True when it is safe to go on."""
-    if not await enforce_gate(callback.bot, db, settings, callback.from_user.id, language):
-        return False
-    if not await db.has_active_session(callback.from_user.id):
-        await _show(
-            callback.message,
-            safe_t(language, "connect_required"),
-            InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔌 Connect Account", callback_data="menu:connect")],
-                [InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans"),
-                 InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-            ]),
-        )
-        await callback.answer()
-        return False
-    return True
-
-
-# ==========================================
-# RAZORPAY (INR)
-# ==========================================
-
-@router.callback_query(F.data.startswith("pay:inr:"))
-async def pay_inr_cb(
-    callback: CallbackQuery, db: Database, billing: RazorpayBilling, settings: Settings,
-) -> None:
-    if callback.message is None:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        return await callback.answer("Invalid option", show_alert=True)
-    plan_name, cycle = parts[2], parts[3]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in cycles_for(plan_name):
-        return await callback.answer("Invalid option", show_alert=True)
-
-    language = await _lang(db, callback.from_user.id)
-    if not await _prepay_guard(callback, db, settings, language):
-        return
-
-    first_order = not await db.has_paid_order(callback.from_user.id)
-    original, discount, payable = payable_amount_paise(plan_name, cycle, first_paid_order=first_order)
-    if payable <= 0:
-        return await callback.answer("Invalid option", show_alert=True)
-
-    # Razorpay's reference_id has a hard 40-character limit. Single-letter plan
-    # and cycle codes plus a short suffix keep this comfortably under it —
-    # spelling them out once pushed it to 41 and Razorpay rejected the link.
-    receipt = f"dk_{callback.from_user.id}_{plan_name[0]}{cycle[0]}_{uuid4().hex[:12]}"
-    try:
-        link = await billing.create_payment_link(
-            amount_paise=payable, receipt=receipt, plan=plan_name,
-            cycle=cycle, user_id=callback.from_user.id,
-        )
-        await db.save_payment(
-            callback.from_user.id, link.link_id, plan_name, cycle, original, discount, payable,
-        )
-    except BillingError as exc:
-        logger.warning("Payment link creation failed for %s: %s", callback.from_user.id, exc)
-        return await callback.answer(
-            f"{safe_t(language, 'payment_failed')}\n\n{exc}"[:200], show_alert=True,
-        )
-
-    await _show(
-        callback.message,
-        safe_t(
-            language, "payment_link",
-            plan=plan_label(plan_name), cycle=cycle.title(), amount=format_paise(payable),
-        ),
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Pay Now", url=link.short_url)],
-            [InlineKeyboardButton(text="◀️ Back", callback_data=f"cycle:{plan_name}:{cycle}")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
-    )
-    await callback.answer()
-
-
-# ==========================================
-# USDT + STARS (ADMIN-VERIFIED)
-# ==========================================
-
-@router.callback_query(F.data.startswith("pay:usdt:"))
-async def pay_usdt_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
-    if callback.message is None:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        return await callback.answer("Invalid option", show_alert=True)
-    plan_name, cycle = parts[2], parts[3]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in CYCLES:
-        return await callback.answer("Invalid option", show_alert=True)
-
-    language = await _lang(db, callback.from_user.id)
-    if not settings.usdt_enabled:
-        return await callback.answer(safe_t(language, "usdt_unavailable"), show_alert=True)
-    if not await _prepay_guard(callback, db, settings, language):
-        return
-
-    amount = usdt_amount_usd(plan_name, cycle)
-    await _show(
-        callback.message,
-        safe_t(
-            language, "usdt_instructions",
-            plan=plan_label(plan_name), cycle=cycle.title(), amount=f"{amount:g}",
-            network=safe_html(settings.usdt_network),
-            wallet=safe_html(settings.usdt_wallet_address),
-        ),
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=safe_t(language, "usdt_paid_btn"),
-                callback_data=f"proof:usdt:{plan_name}:{cycle}",
-            )],
-            [InlineKeyboardButton(text="◀️ Back", callback_data=f"cycle:{plan_name}:{cycle}")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("pay:stars:"))
-async def pay_stars_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
-    """Native Telegram Stars checkout — instant, no admin approval.
-
-    Telegram collects the payment itself and calls back, so there is no
-    screenshot to verify and nothing to fake. The old flow made the user wait
-    for a manual approval; this activates the plan the moment payment lands.
-    """
-    if callback.message is None:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        return await callback.answer("Invalid option", show_alert=True)
-    plan_name, cycle = parts[2], parts[3]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in cycles_for(plan_name):
-        return await callback.answer("Invalid option", show_alert=True)
-
-    language = await _lang(db, callback.from_user.id)
-    amount = stars_amount(plan_name, cycle)
-    if amount <= 0:
-        return await callback.answer(safe_t(language, "stars_unavailable"), show_alert=True)
-    if not await _prepay_guard(callback, db, settings, language):
-        return
-
-    days = duration_days(cycle)
-    await _show(
-        callback.message,
-        safe_t(
-            language, "stars_intro", plan=plan_label(plan_name),
-            cycle=cycle.title(), amount=amount, days=days,
-        ),
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Back", callback_data=f"cycle:{plan_name}:{cycle}")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
-    )
-
-    # The payload carries what we need to apply the plan on the callback.
-    await callback.bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=safe_t(language, "stars_invoice_title",
-                     plan=plan_label(plan_name), cycle=cycle.title())[:32],
-        description=safe_t(language, "stars_invoice_desc",
-                           plan=plan_label(plan_name), days=days)[:255],
-        payload=f"stars:{plan_name}:{cycle}:{callback.from_user.id}",
-        # Stars invoices use the XTR currency and NO provider token.
-        currency="XTR",
-        provider_token="",
-        prices=[LabeledPrice(label=f"{PLANS[plan_name].name} {cycle.title()}", amount=amount)],
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=safe_t(language, "stars_pay_button", amount=amount), pay=True,
-            ),
-        ]]),
-    )
-    await callback.answer()
-
-
-@router.pre_checkout_query()
-async def stars_pre_checkout(query: PreCheckoutQuery) -> None:
-    """Telegram's last check before charging.
-
-    Answered ok=True for any payload we recognise. Rejecting here is the only
-    chance to stop a charge, so the shape is validated first.
-    """
-    parts = (query.invoice_payload or "").split(":")
-    valid = (
-        len(parts) == 4 and parts[0] == "stars"
-        and parts[1] in PLANS and parts[1] != "free"
-        and parts[2] in CYCLES
-    )
-    if not valid:
-        return await query.answer(
-            ok=False, error_message="This payment link is no longer valid. Please try again.",
-        )
-    await query.answer(ok=True)
-
-
-@router.message(F.successful_payment)
-async def stars_payment_done(
-    message: Message, db: Database, settings: Settings, forwarding: ForwardingEngine,
-) -> None:
-    """Payment landed — apply the plan immediately.
-
-    Recorded in manual_payments with status 'approved' so Stars purchases show
-    up in the same history as every other method, but with NO admin step.
-    """
-    payment = message.successful_payment
-    parts = (payment.invoice_payload or "").split(":")
-    if len(parts) != 4 or parts[0] != "stars":
-        return
-    plan_name, cycle = parts[1], parts[2]
-    if plan_name not in PLANS or plan_name == "free" or cycle not in CYCLES:
-        return
-
-    user_id = message.from_user.id
-    language = await _lang(db, user_id)
-    days = duration_days(cycle)
-    amount = int(payment.total_amount or 0)
-
-    request_id = None
-    with suppress(Exception):
-        request_id = await db.create_manual_payment(
-            user_id, "stars", plan_name, cycle, f"{amount} Stars",
-            reference=payment.telegram_payment_charge_id,
-        )
-        if request_id:
-            await db.set_manual_payment_status(request_id, "approved", 0)
-
-    applied = None
-    try:
-        if request_id:
-            applied = await db.apply_manual_plan(request_id, plan_name, days)
-        if applied is None:
-            # Never leave a paid user without their plan just because the
-            # bookkeeping row failed.
-            await db.set_plan(user_id, plan_name, days)
-    except Exception:
-        logger.exception("Could not apply Stars plan for %s", user_id)
-        await db.set_plan(user_id, plan_name, days)
-
-    with suppress(Exception):
-        await forwarding.refresh_user(user_id)
-
-    # Referral commission, same as every other payment method.
-    with suppress(Exception):
-        _o, _d, payable = _payable(plan_name, cycle)
-        credited = await db.credit_referral_commission(user_id, payable)
-        if credited is not None:
-            await _notify_referrer(message.bot, db, credited)
-
-    user = await db.get_user(user_id)
-    expiry = (
-        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-        if user and user["plan_expiry"] else "—"
-    )
-    await message.answer(
-        safe_t(
-            language, "stars_paid", amount=amount,
-            plan=plan_label(plan_name), days=days, expiry=expiry,
-        ),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 My Tasks", callback_data="menu:tasks")],
-            [InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
-        parse_mode="HTML",
-    )
-
-    for admin_id in settings.admin_telegram_ids:
-        with suppress(Exception):
-            await message.bot.send_message(
-                admin_id,
-                f"⭐ <b>Stars Payment Received</b>\n\n"
-                f"👤 {_display_name(user)}\n"
-                f"🆔 <code>{user_id}</code>\n\n"
-                f"Plan: <b>{plan_label(plan_name)}</b> ({cycle.title()})\n"
-                f"⭐ Amount: <b>{amount} Stars</b>\n"
-                f"📅 Duration: {days} days\n"
-                f"⏳ Expiry: {expiry}\n"
-                f"🧾 <code>{safe_html(payment.telegram_payment_charge_id)}</code>",
-                parse_mode="HTML",
-            )
-
-
-@router.callback_query(F.data.startswith("proof:"))
-async def proof_prompt_cb(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    """Asks for the TXID (USDT) or screenshot/transaction id (Stars)."""
-    if callback.message is None:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        return await callback.answer("Invalid option", show_alert=True)
-    method, plan_name, cycle = parts[1], parts[2], parts[3]
-    # Stars no longer needs a proof step — Telegram confirms it directly.
-    if method != "usdt" or plan_name not in PLANS or cycle not in CYCLES:
-        return await callback.answer("Invalid option", show_alert=True)
-
-    language = await _lang(db, callback.from_user.id)
-    await state.set_state(ManualPayStates.waiting_proof)
-    await state.update_data(method=method, plan=plan_name, cycle=cycle)
-    prompt_key = "usdt_txid_prompt" if method == "usdt" else "stars_proof_prompt"
-    await _show(
-        callback.message,
-        safe_t(language, prompt_key),
-        _nav(f"pay:{method}:{plan_name}:{cycle}"),
-    )
-    await callback.answer()
-
-
-@router.message(ManualPayStates.waiting_proof)
-async def proof_submit(
-    message: Message, state: FSMContext, db: Database, settings: Settings,
-) -> None:
-    """Stores the pending payment and pushes it to every admin for review.
-
-    Stars proof may be a photo; USDT proof is always text. Either way the row
-    lands in manual_payments with status='pending'.
-    """
-    data = await state.get_data()
-    method = data.get("method")
-    plan_name = data.get("plan")
-    cycle = data.get("cycle")
-    if method != "usdt" or plan_name not in PLANS or cycle not in CYCLES:
-        await state.clear()
-        return
-
-    language = await _lang(db, message.from_user.id)
-    text = (message.text or message.caption or "").strip()
-
-    if text.lower() == "/back":
-        await state.clear()
-        await message.answer(
-            safe_t(language, "payment_failed"),
-            reply_markup=_nav(f"cycle:{plan_name}:{cycle}"), parse_mode="HTML",
-        )
-        return
-
-    proof_file_id = None
-    if message.photo:
-        proof_file_id = message.photo[-1].file_id
-    elif message.document:
-        proof_file_id = message.document.file_id
-
-    if not text and not proof_file_id:
-        # Nothing usable was sent — stay in the state and ask again rather than
-        # filing a blank request the admin cannot verify.
-        prompt_key = "usdt_txid_prompt" if method == "usdt" else "stars_proof_prompt"
-        await message.answer(safe_t(language, prompt_key), parse_mode="HTML")
-        return
-    if method == "usdt" and not text:
-        await message.answer(safe_t(language, "usdt_txid_prompt"), parse_mode="HTML")
-        return
-
-    amount = (
-        f"{usdt_amount_usd(plan_name, cycle):g} USDT"
-        if method == "usdt" else f"{stars_amount(plan_name, cycle)} Stars"
-    )
-
-    try:
-        request_id = await db.create_manual_payment(
-            message.from_user.id, method, plan_name, cycle,
-            amount, reference=text or None, proof_file_id=proof_file_id,
-        )
-    except Exception:
-        logger.exception("Could not store manual payment for %s", message.from_user.id)
-        await state.clear()
-        await message.answer(safe_t(language, "generic_error"), parse_mode="HTML")
-        return
-
-    await state.clear()
-    await message.answer(
-        safe_t(language, "usdt_submitted" if method == "usdt" else "stars_submitted"),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Back", callback_data="menu:plans"),
-             InlineKeyboardButton(text="🏠 Home", callback_data="menu:home")],
-        ]),
-        parse_mode="HTML",
-    )
-
-    await _notify_admins_of_payment(message.bot, db, settings, request_id)
-
-
-# ==========================================
-# ADMIN REVIEW
-# ==========================================
-
-async def _notify_referrer(bot: Bot, db: Database, credited) -> None:
-    """Tells a referrer they just earned. Best-effort — a blocked referrer must
-    never stop a payment from being applied."""
-    referrer_id = int(credited["referrer_id"])
-    language = await _lang(db, referrer_id)
-    with suppress(Exception):
-        await bot.send_message(
-            referrer_id,
-            f"🎁 <b>You earned a referral commission!</b>\n\n"
-            f"Your total unpaid earnings: <b>{format_paise(int(credited['commission_amount_paise']))}</b>\n\n"
-            f"Contact support to request a payout.",
-            parse_mode="HTML",
-        )
-
-
-def _review_markup(request_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Approve", callback_data=f"mp:ok:{request_id}"),
-        InlineKeyboardButton(text="❌ Reject", callback_data=f"mp:no:{request_id}"),
-    ]])
-
-
-async def _review_text(db: Database, request) -> str:
-    user = await db.get_user(int(request["user_id"]))
-    return safe_t(
-        "en", "admin_payment_review",
-        method=str(request["method"]).upper(),
-        name=_display_name(user),
-        user_id=request["user_id"],
-        plan=plan_label(str(request["plan"])),
-        cycle=str(request["cycle"]).title(),
-        amount=safe_html(request["amount"]),
-        ref=safe_html(request["reference"] or "— (screenshot attached)"),
-    )
-
-
-async def _notify_admins_of_payment(
-    bot: Bot, db: Database, settings: Settings, request_id: int,
-) -> None:
-    request = await db.get_manual_payment(request_id)
-    if request is None:
-        return
-    text = await _review_text(db, request)
-    markup = _review_markup(request_id)
-    for admin_id in settings.admin_telegram_ids:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = {}
+
+                    if resp.status >= 400:
+                        error_msg = (data.get("error") or {}).get("description") or f"HTTP {resp.status}"
+                        logger.error(f"Razorpay API Error: {error_msg}")
+                        raise BillingError(f"Payment gateway rejected the request: {error_msg}")
+
+                    if not data.get("id") or not data.get("short_url"):
+                        logger.error(f"Razorpay returned an unexpected payload: {data}")
+                        raise BillingError("Payment gateway returned an incomplete response.")
+
+                    return PaymentLinkResult(
+                        link_id=data["id"],
+                        short_url=data["short_url"],
+                    )
+        except BillingError:
+            # Already a user-facing message — do not mask the real reason.
+            raise
+        except aiohttp.ClientError as e:
+            logger.error(f"Razorpay request failed: {e}")
+            raise BillingError("Could not connect to the payment gateway. Please try again later.")
+        except TimeoutError:
+            logger.error("Razorpay request timed out")
+            raise BillingError("The payment gateway timed out. Please try again in a minute.")
+        except Exception as e:
+            logger.exception(f"Unexpected Razorpay failure: {e}")
+            raise BillingError("Could not create the payment link. Please try again later.")
+
+    def verify_webhook_signature(self, raw_body: bytes, signature: str) -> bool:
+        if not signature or not raw_body:
+            return False
+            
+        expected_signature = hmac.new(
+            self.webhook_secret.encode('utf-8'),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac.compare_digest(expected_signature, signature)
+
+    def parse_json(self, raw_body: bytes) -> dict:
         try:
-            if request["proof_file_id"]:
-                # Send the screenshot with the details as its caption so the
-                # admin can verify without opening anything else.
-                await bot.send_photo(
-                    admin_id, request["proof_file_id"],
-                    caption=text, reply_markup=markup, parse_mode="HTML",
+            return json.loads(raw_body.decode('utf-8'))
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON body in webhook")
+
+    def parse_captured_payment(self, payload: dict) -> CapturedPayment | None:
+        event = payload.get("event")
+        body = payload.get("payload") or {}
+        payment_entity = ((body.get("payment") or {}).get("entity")) or {}
+
+        if event == "payment_link.paid":
+            link_entity = ((body.get("payment_link") or {}).get("entity")) or {}
+            plink_id = link_entity.get("id")
+            # Prefer the amount actually paid; fall back to the link amount.
+            amount = payment_entity.get("amount") or link_entity.get("amount")
+            payment_id = payment_entity.get("id") or "unknown_txn"
+            notes = payment_entity.get("notes") or link_entity.get("notes") or {}
+
+            if plink_id and amount:
+                return CapturedPayment(
+                    order_id=plink_id,
+                    payment_id=payment_id,
+                    amount_paise=int(amount),
+                    notes=notes,
                 )
-            else:
-                await bot.send_message(admin_id, text, reply_markup=markup, parse_mode="HTML")
-        except Exception as exc:
-            logger.warning("Could not notify admin %s of payment %s: %s", admin_id, request_id, exc)
 
+        elif event == "payment.captured":
+            payment_id = payment_entity.get("id")
+            amount = payment_entity.get("amount")
+            notes = payment_entity.get("notes") or {}
+            # A payment made through a payment link has no plink id on the payment
+            # entity, so fall back to the notes we attached when creating the link.
+            order_id = payment_entity.get("order_id") or notes.get("link_id") or ""
 
-@router.message(Command("pending"))
-async def pending_command(message: Message, db: Database, settings: Settings) -> None:
-    if not _is_admin(settings, message.from_user.id):
-        return
-    rows = await db.list_pending_manual_payments()
-    if not rows:
-        await message.answer(safe_t("en", "admin_no_pending"), parse_mode="HTML")
-        return
-    for request in rows:
-        text = await _review_text(db, request)
-        markup = _review_markup(int(request["id"]))
-        try:
-            if request["proof_file_id"]:
-                await message.answer_photo(
-                    request["proof_file_id"], caption=text,
-                    reply_markup=markup, parse_mode="HTML",
+            if payment_id and amount:
+                return CapturedPayment(
+                    order_id=order_id,
+                    payment_id=payment_id,
+                    amount_paise=int(amount),
+                    notes=notes,
                 )
-            else:
-                await message.answer(text, reply_markup=markup, parse_mode="HTML")
-        except Exception as exc:
-            logger.warning("Could not render pending payment %s: %s", request["id"], exc)
 
-
-@router.callback_query(F.data.startswith("mp:"))
-async def manual_payment_review_cb(
-    callback: CallbackQuery, db: Database, settings: Settings, forwarding: ForwardingEngine,
-) -> None:
-    """Approve or reject a USDT / Stars payment.
-
-    set_manual_payment_status() only succeeds while the row is still pending,
-    so two admins tapping Approve at the same moment cannot grant the plan
-    twice — the second one is told it was already handled.
-    """
-    if not _is_admin(settings, callback.from_user.id):
-        return await callback.answer("Admin only", show_alert=True)
-
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        return await callback.answer("Invalid option", show_alert=True)
-    action, request_id = parts[1], int(parts[2])
-
-    request = await db.get_manual_payment(request_id)
-    if request is None:
-        return await callback.answer("Not found", show_alert=True)
-    if str(request["status"]) != "pending":
-        return await callback.answer(safe_t("en", "admin_payment_gone"), show_alert=True)
-
-    user_id = int(request["user_id"])
-    plan_name = str(request["plan"])
-    cycle = str(request["cycle"])
-    language = await _lang(db, user_id)
-    method = str(request["method"])
-
-    if action == "no":
-        if not await db.set_manual_payment_status(request_id, "rejected", callback.from_user.id):
-            return await callback.answer(safe_t("en", "admin_payment_gone"), show_alert=True)
-        try:
-            await callback.bot.send_message(
-                user_id,
-                safe_t(
-                    language,
-                    "usdt_rejected_user" if method == "usdt" else "stars_rejected_user",
-                    txid=safe_html(request["reference"] or "—"),
-                    ref=safe_html(request["reference"] or "—"),
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            logger.warning("Could not notify user %s of rejection: %s", user_id, exc)
-        await _mark_reviewed(callback, safe_t("en", "admin_payment_rejected"))
-        return await callback.answer("Rejected")
-
-    if action != "ok":
-        return await callback.answer("Invalid option", show_alert=True)
-
-    # Claim the row FIRST. If this fails somebody else already handled it and
-    # we must not touch the plan.
-    if not await db.set_manual_payment_status(request_id, "approved", callback.from_user.id):
-        return await callback.answer(safe_t("en", "admin_payment_gone"), show_alert=True)
-
-    days = duration_days(cycle)
-    try:
-        applied = await db.apply_manual_plan(request_id, plan_name, days)
-    except Exception:
-        logger.exception("Failed to apply manual plan for request %s", request_id)
-        applied = None
-
-    if applied is None:
-        await callback.answer("Could not apply the plan — check the logs", show_alert=True)
-        return
-
-    with_suppress_refresh = getattr(forwarding, "refresh_user", None)
-    if with_suppress_refresh is not None:
-        try:
-            await forwarding.refresh_user(user_id)
-        except Exception as exc:
-            logger.warning("Could not hot-reload forwarding for %s: %s", user_id, exc)
-
-    # Referral commission — the referrer earns on EVERY payment, not just the
-    # first, so this runs for manual approvals exactly as it does for cards.
-    with suppress(Exception):
-        _o, _d, payable = _payable(plan_name, cycle)
-        credited = await db.credit_referral_commission(user_id, payable)
-        if credited is not None:
-            await _notify_referrer(callback.bot, db, credited)
-
-    user = await db.get_user(user_id)
-    expiry = (
-        user["plan_expiry"].astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-        if user and user["plan_expiry"] else "—"
-    )
-    try:
-        await callback.bot.send_message(
-            user_id,
-            safe_t(
-                language,
-                "usdt_approved_user" if method == "usdt" else "stars_approved_user",
-                plan=plan_label(plan_name), days=days, expiry=expiry,
-            ),
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        logger.warning("Could not notify user %s of approval: %s", user_id, exc)
-
-    await _mark_reviewed(
-        callback,
-        safe_t("en", "admin_payment_approved", plan=plan_label(plan_name), user_id=user_id),
-    )
-    await callback.answer("Approved")
-
-
-async def _mark_reviewed(callback: CallbackQuery, note: str) -> None:
-    """Replaces the review buttons with the outcome, so the same request can
-    never be actioned twice from a stale message."""
-    if callback.message is None:
-        return
-    try:
-        if callback.message.photo:
-            await callback.message.edit_caption(
-                caption=(callback.message.caption or "") + f"\n\n{note}", parse_mode="HTML",
-            )
-        else:
-            await callback.message.edit_text(
-                (callback.message.html_text or callback.message.text or "") + f"\n\n{note}",
-                parse_mode="HTML",
-            )
-    except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc):
-            logger.debug("Could not annotate reviewed payment: %s", exc)
+        return None
