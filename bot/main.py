@@ -1546,6 +1546,20 @@ QR_TOTAL_SECONDS = 60
 QR_TICK = 5          # how often the countdown is redrawn
 QR_WAIT_SLICE = 5.0  # how long each wait() call blocks before ticking
 
+# user_id -> id of the QR attempt that is currently valid.
+#
+# Tapping "New QR" starts a fresh attempt while the previous watcher is still
+# looping in the background. Without this, that stale watcher would find its
+# own session gone, assume it had expired, and then delete the NEW QR and tell
+# the user it had expired — killing the code they were about to scan.
+_qr_attempts: dict[int, int] = {}
+
+
+def _next_qr_attempt(user_id: int) -> int:
+    attempt = _qr_attempts.get(user_id, 0) + 1
+    _qr_attempts[user_id] = attempt
+    return attempt
+
 
 def _login_choice_keyboard(language: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1644,6 +1658,7 @@ async def login_qr_cb(
             callback.message, safe_t(language, "qr_failed"), _login_choice_keyboard(language),
         )
 
+    attempt = _next_qr_attempt(callback.from_user.id)
     await callback.answer()
     with suppress(Exception):
         await callback.message.delete()
@@ -1665,28 +1680,44 @@ async def login_qr_cb(
     # Telegram does not time the callback out.
     asyncio.create_task(_qr_watch(
         callback.bot, db, settings, telethon, forwarding, state,
-        callback.from_user.id, qr_msg, timer_msg, language,
+        callback.from_user.id, qr_msg, timer_msg, language, attempt,
     ))
 
 
 async def _qr_watch(
     bot: Bot, db: Database, settings: Settings, telethon: TelethonService,
     forwarding: ForwardingEngine, state: FSMContext, user_id: int,
-    qr_msg: Message, timer_msg: Message, language: str,
+    qr_msg: Message, timer_msg: Message, language: str, attempt: int,
 ) -> None:
-    """Counts down, refreshes the token, and finishes the login."""
+    """Counts down, refreshes the token, and finishes the login.
+
+    `attempt` is checked every loop. A watcher left over from an earlier QR
+    stops quietly instead of interfering with the current one.
+    """
     remaining = QR_TOTAL_SECONDS
+    superseded = False
     try:
         while remaining > 0:
-            result = await telethon.wait_qr_login(user_id, timeout=QR_WAIT_SLICE)
+            if _qr_attempts.get(user_id) != attempt:
+                superseded = True
+                break
+            try:
+                result = await telethon.wait_qr_login(user_id, timeout=QR_WAIT_SLICE)
+            except ValueError:
+                # The session is gone. Either this attempt was replaced, or
+                # the login was cancelled elsewhere — nothing to clean up here.
+                superseded = True
+                break
 
             if isinstance(result, dict):
+                _qr_attempts.pop(user_id, None)
                 return await _qr_success(
                     bot, db, settings, forwarding, state, user_id,
                     qr_msg, timer_msg, language, result,
                 )
 
             if result == "2fa":
+                _qr_attempts.pop(user_id, None)
                 # Scanned, but the account has a cloud password. Hand over to
                 # the SAME 2FA screen the phone flow uses — one code path.
                 with suppress(Exception):
@@ -1726,6 +1757,10 @@ async def _qr_watch(
                     )
     except Exception:
         logger.exception("QR watch failed for %s", user_id)
+
+    if superseded:
+        # A newer QR is on screen. Touch nothing.
+        return
 
     # Timed out — clear the code away so a dead QR is never left on screen.
     with suppress(Exception):
@@ -6510,28 +6545,36 @@ async def _run_broadcast(
     delivered: list[tuple[int, int]] = []
 
     language = await _language_for_callback(db, callback)
+    # The loader edits a message on a timer, so it MUST be closed even if the
+    # loop dies part-way. Without the finally, a crashed broadcast would leave
+    # a task editing that message for as long as the bot stayed up.
     loader = LiveLoader(callback.message, "load_broadcast", language, total=len(users))
     await loader.__aenter__()
-
-    for i, u in enumerate(users, 1):
-        try:
-            posted = await callback.bot.send_message(int(u["telegram_user_id"]), text)
-            sent += 1
-            loader.advance()
-            if posted is not None:
-                delivered.append((int(u["telegram_user_id"]), int(posted.message_id)))
-        except TelegramForbiddenError:
-            blocked += 1
-            await db.mark_user_inactive(int(u["telegram_user_id"]))
-        except TelegramBadRequest:
-            failed += 1
-        except Exception:
-            failed += 1
-        # Telegram rate-limits bulk sends; pausing keeps the whole run alive.
-        if i % 20 == 0:
-            await asyncio.sleep(1)
-
-    await loader.__aexit__()
+    try:
+        async with _busy(callback.bot, callback.message.chat.id):
+            for i, u in enumerate(users, 1):
+                try:
+                    posted = await callback.bot.send_message(
+                        int(u["telegram_user_id"]), text,
+                    )
+                    sent += 1
+                    loader.advance()
+                    if posted is not None:
+                        delivered.append(
+                            (int(u["telegram_user_id"]), int(posted.message_id)),
+                        )
+                except TelegramForbiddenError:
+                    blocked += 1
+                    await db.mark_user_inactive(int(u["telegram_user_id"]))
+                except TelegramBadRequest:
+                    failed += 1
+                except Exception:
+                    failed += 1
+                # Telegram rate-limits bulk sends; pausing keeps the run alive.
+                if i % 20 == 0:
+                    await asyncio.sleep(1)
+    finally:
+        await loader.__aexit__()
     await db.finish_broadcast(broadcast_id, sent, failed, blocked)
     with suppress(Exception):
         await db.record_broadcast_messages(broadcast_id, delivered)
