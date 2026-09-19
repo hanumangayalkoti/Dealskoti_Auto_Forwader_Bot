@@ -736,6 +736,66 @@ class CallbackCleanupMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+async def _sweep_unfinished_login(event: Message, data: dict) -> None:
+    """Clears an abandoned login when another command arrives.
+
+    Two halves, both dead once the user moves on:
+      * the QR code and its countdown
+      * the phone prompts ("send your number", "send the PIN") and the user's
+        own replies to them
+
+    Reports are deliberately untouched — "account connected", "task created"
+    and the rest are records someone may want to scroll back to. Only the
+    half-finished steps go.
+    """
+    if event.from_user is None:
+        return
+    user_id = event.from_user.id
+    telethon_service = data.get("telethon")
+    database = data.get("db")
+    state = data.get("state")
+    cleared = False
+
+    # --- QR half ---
+    if _qr_attempts.pop(user_id, None) is not None:
+        cleared = True
+        if telethon_service is not None:
+            with suppress(Exception):
+                await telethon_service.cancel_login(user_id)
+    if _qr_screens.get(user_id):
+        cleared = True
+    with suppress(Exception):
+        await _clear_qr_screens(event.bot, user_id)
+
+    # --- phone half ---
+    if state is not None:
+        current = await state.get_state()
+        if current in {
+            LoginStates.waiting_phone.state,
+            LoginStates.waiting_pin.state,
+            LoginStates.waiting_2fa.state,
+        }:
+            cleared = True
+            if telethon_service is not None:
+                with suppress(Exception):
+                    await telethon_service.cancel_login(user_id)
+            stored = await state.get_data()
+            for msg_id in list(stored.get("login_msg_ids") or []):
+                with suppress(Exception):
+                    await event.bot.delete_message(event.chat.id, msg_id)
+            await state.update_data(login_msg_ids=[])
+
+    if not cleared:
+        return
+
+    language = "en"
+    if database is not None:
+        with suppress(Exception):
+            language = await _language_for_message(database, event)
+    with suppress(Exception):
+        await event.answer(safe_t(language, "login_abandoned"), parse_mode="HTML")
+
+
 class FlowInterruptMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         # The user's own commands are part of the clutter, so they are tracked
@@ -755,6 +815,11 @@ class FlowInterruptMiddleware(BaseMiddleware):
         command = text.split()[0].lstrip("/").split("@")[0].lower()
         if command in FLOW_INTERNAL_COMMANDS:
             return await handler(event, data)
+
+        # An unfinished login is dead the moment another command arrives.
+        # Both halves go: the QR code with its countdown, and the phone
+        # prompts with the user's replies to them. Reports are never touched.
+        await _sweep_unfinished_login(event, data)
 
         current = await state.get_state()
         if not current:
