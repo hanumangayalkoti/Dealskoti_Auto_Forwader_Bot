@@ -414,6 +414,18 @@ FEATURE_PRIORITY = [
 TIER_WEIGHT = {"platinum": 0, "gold": 1, "silver": 2, "basic": 3}
 
 
+# Features that have been RENAMED, old slug -> new slug.
+#
+# A rename changes the slug, so the seed inserts a brand new row and the old
+# one is left behind — showing up in /update_feature as an entry that looks
+# real but is wired to nothing. Declaring the rename here lets the link the
+# admin had already attached move across to the new row before the old one is
+# removed.
+FEATURE_RENAMES = {
+    "attach_custom_file": "replace_file",
+}
+
+
 def seed_feature_rows() -> list[dict]:
     """Every feature from the plan trees, with the LOWEST plan that has it.
 
