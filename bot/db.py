@@ -1770,6 +1770,49 @@ class Database:
         except (ValueError, IndexError):
             return 0
 
+    async def migrate_features(self, renames: dict[str, str], valid_slugs: set[str]) -> int:
+        """Moves renamed features across and drops rows that no longer exist.
+
+        Two jobs, in this order:
+          1. For each old -> new rename, carry the admin's channel link over
+             to the new row (only if the new row has none), then delete the
+             old row.
+          2. Delete any remaining row whose slug is not in the current code.
+             Such a row can never be shown on a plan screen, so it is pure
+             dead weight — but it DOES appear in /update_feature, where it
+             looks real and silently swallows any link set on it.
+
+        Returns how many stale rows were removed.
+        """
+        if self.pool is None or not valid_slugs:
+            return 0
+        removed = 0
+        async with self.pool.acquire() as conn:
+            for old_slug, new_slug in renames.items():
+                old = await conn.fetchrow(
+                    "SELECT link FROM features WHERE slug = $1", old_slug,
+                )
+                if old is None:
+                    continue
+                if old["link"]:
+                    await conn.execute(
+                        """UPDATE features SET link = $1
+                           WHERE slug = $2 AND (link IS NULL OR link = '')""",
+                        old["link"], new_slug,
+                    )
+                await conn.execute("DELETE FROM features WHERE slug = $1", old_slug)
+                removed += 1
+
+            result = await conn.execute(
+                "DELETE FROM features WHERE slug <> ALL($1::text[])",
+                list(valid_slugs),
+            )
+        try:
+            removed += int(result.split()[-1])
+        except (ValueError, IndexError):
+            pass
+        return removed
+
     async def list_features(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
         async with self.pool.acquire() as conn:
