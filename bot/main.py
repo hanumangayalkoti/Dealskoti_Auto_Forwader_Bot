@@ -88,6 +88,7 @@ from .plans import (
     PLANS,
     REFERRAL_RATE,
     FEATURES_PAGE_SIZE,
+    FEATURE_RENAMES,
     TIER_ICON,
     TIER_LABEL,
     all_features_text,
@@ -7059,9 +7060,16 @@ async def _run(settings: Settings) -> None:
     # Load any feature that is not in the database yet. Existing rows — and so
     # every name and link the admin has set — are never touched.
     with suppress(Exception):
-        added = await db.seed_features(seed_feature_rows())
+        feature_rows = seed_feature_rows()
+        added = await db.seed_features(feature_rows)
         if added:
             logger.info("Seeded %s new features into the catalogue", added)
+        # Clear out rows left behind by a rename, carrying their links across.
+        dropped = await db.migrate_features(
+            FEATURE_RENAMES, {row["slug"] for row in feature_rows},
+        )
+        if dropped:
+            logger.info("Removed %s stale feature rows", dropped)
 
     bot = Bot(
         settings.telegram_bot_token,
