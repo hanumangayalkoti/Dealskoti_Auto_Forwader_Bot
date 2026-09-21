@@ -48,6 +48,7 @@ from .plans import (
     STYLE_BUY,
     STYLE_GO,
     plan_label,
+    plan_label_priced,
     PLANS,
     cycles_for,
     duration_days,
@@ -142,7 +143,7 @@ def plans_keyboard() -> InlineKeyboardMarkup:
     row = []
     for key in PLAN_BUTTON_ORDER:
         row.append(InlineKeyboardButton(
-            text=plan_label(key), callback_data=f"plan:{key}",
+            text=plan_label_priced(key), callback_data=f"plan:{key}",
         ))
         if len(row) == 2:
             rows.append(row)
@@ -266,7 +267,9 @@ async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) ->
     rows = [[InlineKeyboardButton(
         text="💷 Pay with UPI / Card",
         callback_data=f"pay:inr:{plan_name}:{cycle}",
-        style=STYLE_BUY,
+        # Green: the only method that activates instantly. The colour is
+        # doing real work here — it points at the route with no waiting.
+        style=STYLE_GO,
     )]]
     # Each alternative method only appears when it is actually configured, so a
     # user can never start a payment that has nowhere to go.
@@ -274,7 +277,6 @@ async def cycle_cb(callback: CallbackQuery, db: Database, settings: Settings) ->
         rows.append([InlineKeyboardButton(
             text=f"🪙 Pay with USDT — ${usdt_amount_usd(plan_name, cycle):g}",
             callback_data=f"pay:usdt:{plan_name}:{cycle}",
-            style=STYLE_BUY,
         )])
     if settings.stars_enabled and stars_amount(plan_name, cycle) > 0:
         rows.append([InlineKeyboardButton(
