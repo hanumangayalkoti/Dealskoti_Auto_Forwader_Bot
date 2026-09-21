@@ -603,10 +603,33 @@ def plan_icon(plan_name: str) -> str:
 
 
 def plan_label(plan_name: str) -> str:
-    """Emoji + display name, e.g. "🚀 Gold"."""
+    """Emoji + display name, e.g. "🟡 Gold"."""
     plan = PLANS.get((plan_name or "free").lower())
     name = plan.name if plan else str(plan_name).title()
     return f"{plan_icon(plan_name)} {name}"
+
+
+def plan_label_priced(plan_name: str) -> str:
+    """Emoji + name + the cheapest entry price, e.g. "⚪ Silver (₹25)".
+
+    Shows the CHEAPEST cycle the plan offers, so the number is the smallest
+    amount that actually unlocks it. Basic has no weekly cycle, so it shows
+    its monthly price rather than a weekly figure that cannot be bought.
+    """
+    key = (plan_name or "free").lower()
+    plan = PLANS.get(key)
+    if plan is None:
+        return plan_label(plan_name)
+    if key == "free":
+        return plan_label(plan_name)
+
+    cycles = cycles_for(key)
+    cycle = "weekly" if "weekly" in cycles else ("monthly" if "monthly" in cycles else cycles[0])
+    _original, _discount, payable = payable_amount_paise(key, cycle)
+    # Rounded to whole rupees: "₹249.75" on a button reads like a mistake,
+    # and the exact figure is shown on the checkout screen anyway.
+    rupees = round(payable / 100)
+    return f"{plan_icon(key)} {plan.name} (₹{rupees})"
 
 
 def plan_details_text(plan_name: str, links: dict[str, dict] | None = None) -> str:
