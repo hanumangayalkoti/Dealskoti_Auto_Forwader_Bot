@@ -151,6 +151,7 @@ _BASIC_ADDS: set[str] = {
 }
 
 _SILVER_ADDS: set[str] = {
+    F_INLINE_BUTTONS,
     F_HEADER,
     F_FOOTER,
     F_LINK_PREVIEW,
@@ -168,7 +169,6 @@ _SILVER_ADDS: set[str] = {
 
 _GOLD_ADDS: set[str] = {
     F_BULK_DELETE,
-    F_INLINE_BUTTONS,
     F_AUTO_DELETE,
     F_POST_EDIT_SYNC,
     F_TRIM_WORDS,
@@ -246,6 +246,7 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Remove Links ON/OFF",
         "Mono Text ON/OFF",
         "Disable Hidden Links ON/OFF",
+        "Set Inline Buttons",
         "Blacklist Keywords",
         "Whitelist Keywords",
         "Add Header Text",
@@ -279,7 +280,6 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Delay Timer Per Target",
         "Topics Forwarding",
         "Bulk Delete Messages",
-        "Set Inline Buttons",
         "{daily}",
         "No BOT Watermark",
         "Anti-Ban Speed Forwarding",
@@ -308,7 +308,6 @@ PLAN_FEATURE_TREE: dict[str, list[str]] = {
         "Delay Timer Per Target",
         "Topics Forwarding",
         "Bulk Delete Messages",
-        "Set Inline Buttons",
         "{daily}",
         "Custom Image Watermark",
         "Watermark Position/Size/Opacity",
