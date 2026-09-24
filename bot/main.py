@@ -644,7 +644,11 @@ async def _track_sent_messages(handler, bot: Bot, method):
     result = await handler(bot, method)
     with suppress(Exception):
         if isinstance(result, Message) and result.chat is not None:
-            _remember_bot_message(result.chat.id, result.message_id, _classify_sent(result))
+            cleanable = _classify_sent(result)
+            _remember_bot_message(result.chat.id, result.message_id, cleanable)
+            # Only screens are worth replacing on a repeat; a record is not.
+            if cleanable:
+                _remember_command_reply(result.chat.id, result.message_id)
     return result
 
 
@@ -816,6 +820,10 @@ class FlowInterruptMiddleware(BaseMiddleware):
         command = text.split()[0].lstrip("/").split("@")[0].lower()
         if command in FLOW_INTERNAL_COMMANDS:
             return await handler(event, data)
+
+        # Same command twice in a row — clear the previous copy first.
+        with suppress(Exception):
+            await _drop_repeat_command(event, command)
 
         # An unfinished login is dead the moment another command arrives.
         # Both halves go: the QR code with its countdown, and the phone
@@ -1625,6 +1633,36 @@ def _next_qr_attempt(user_id: int) -> int:
     attempt = _qr_attempts.get(user_id, 0) + 1
     _qr_attempts[user_id] = attempt
     return attempt
+
+
+# chat_id -> (command, [message ids it produced]) for the LAST command only.
+#
+# Sending the same command twice in a row leaves two identical screens in the
+# chat. When the repeat arrives, the previous one is removed so exactly one
+# copy of that screen is ever on display.
+#
+# Deliberately narrow: only the IMMEDIATELY preceding command counts, and only
+# when it is the SAME command. /start then /plans leaves both alone, because
+# those are two different screens the user may well want to compare.
+_last_command: dict[int, tuple[str, list[int]]] = {}
+
+
+async def _drop_repeat_command(event: Message, command: str) -> None:
+    """Removes the previous run of this exact command, if it was the last one."""
+    chat_id = event.chat.id
+    previous = _last_command.get(chat_id)
+    if previous is not None and previous[0] == command:
+        for message_id in previous[1]:
+            with suppress(Exception):
+                await event.bot.delete_message(chat_id, message_id)
+    # The user's own command message is part of the pair, so it goes too.
+    _last_command[chat_id] = (command, [event.message_id])
+
+
+def _remember_command_reply(chat_id: int, message_id: int) -> None:
+    entry = _last_command.get(chat_id)
+    if entry is not None:
+        entry[1].append(message_id)
 
 
 # user_id -> EVERY QR/timer message still on screen for that user.
@@ -3902,6 +3940,23 @@ async def _offer_trial_after_connect(bot: Bot, db: Database, user_id: int, langu
 
 URL_INPUT_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
+# The only colours Telegram offers for an inline button. There is no custom
+# palette and no hex — these four plus plain is the whole set.
+#
+# Colour is OPTIONAL throughout: a button with none set is drawn plain, which
+# is what a Telegram button normally looks like, so leaving it alone is a
+# perfectly good answer rather than an unfinished one.
+IB_COLOURS = {
+    "": ("⚪ Plain", None),
+    "success": ("🟢 Green", STYLE_GO),
+    "primary": ("🔵 Blue", STYLE_BUY),
+    "danger": ("🔴 Red", STYLE_DANGER),
+}
+
+
+def _ib_colour_name(value: str | None) -> str:
+    return IB_COLOURS.get(str(value or ""), IB_COLOURS[""])[0]
+
 
 def _ib_status(buttons: dict, language: str) -> str:
     b1, b2 = buttons.get("btn1", {}), buttons.get("btn2", {})
@@ -3932,6 +3987,10 @@ def _ib_detail_kb(key: str, button: dict, task_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📝 Rename", callback_data=f"ib:rename:{task_id}:{key}"),
          InlineKeyboardButton(text="🔗 Set Link", callback_data=f"ib:link:{task_id}:{key}")],
+        [InlineKeyboardButton(
+            text=f"🎨 Colour — {_ib_colour_name(button.get('colour'))}",
+            callback_data=f"ib:colour:{task_id}:{key}",
+        )],
     ]
     if ready:
         rows.append([InlineKeyboardButton(
@@ -3998,6 +4057,7 @@ async def _ib_detail(
         safe_t(
             language, "ib_detail", num=key[-1], label=safe_html(label),
             url=safe_html(button.get("url") or "—"),
+            colour=_ib_colour_name(button.get("colour")),
             status="✅ ON" if button.get("enabled") else "❌ OFF",
             preview=preview,
         ),
@@ -4149,6 +4209,61 @@ async def ib_url_input(message: Message, state: FSMContext, db: Database) -> Non
     buttons.setdefault(key, {})["url"] = raw
     await _ib_save(db, message.from_user.id, task_id, buttons)
     await _ib_detail(message, db, message.from_user.id, language, key, task_id)
+
+
+@router.callback_query(F.data.startswith("ib:colour:"))
+async def ib_colour_menu_cb(callback: CallbackQuery, db: Database) -> None:
+    """Offers the four Telegram colours, plus plain."""
+    if callback.message is None:
+        return
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Silver and above only", show_alert=True)
+    _, _, task_id, key = callback.data.split(":")
+    if key not in ("btn1", "btn2"):
+        return await callback.answer("Invalid", show_alert=True)
+
+    language = await _language_for_callback(db, callback)
+    buttons = await _ib_load(db, callback.from_user.id, int(task_id))
+    current = str((buttons.get(key) or {}).get("colour") or "")
+
+    rows = []
+    for value, (name, _style) in IB_COLOURS.items():
+        mark = " ✅" if value == current else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{name}{mark}",
+            callback_data=f"ib:setcol:{task_id}:{key}:{value or 'none'}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="◀️ Back", callback_data=f"ib:open:{task_id}:{key}",
+    )])
+    await _safe_edit(
+        callback.message,
+        safe_t(language, "ib_color_prompt", num=key[-1],
+               current=_ib_colour_name(current)),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ib:setcol:"))
+async def ib_set_colour_cb(callback: CallbackQuery, db: Database) -> None:
+    if callback.message is None:
+        return
+    if not await _ib_allowed(db, callback.from_user.id):
+        return await callback.answer("Silver and above only", show_alert=True)
+    _, _, task_id, key, value = callback.data.split(":")
+    if key not in ("btn1", "btn2"):
+        return await callback.answer("Invalid", show_alert=True)
+    colour = "" if value == "none" else value
+    if colour not in IB_COLOURS:
+        return await callback.answer("Invalid colour", show_alert=True)
+
+    language = await _language_for_callback(db, callback)
+    buttons = await _ib_load(db, callback.from_user.id, int(task_id))
+    buttons.setdefault(key, {})["colour"] = colour
+    await _ib_save(db, callback.from_user.id, int(task_id), buttons)
+    await _ib_detail(callback.message, db, callback.from_user.id, language, key, int(task_id))
+    await callback.answer(_ib_colour_name(colour))
 
 
 @router.callback_query(F.data.startswith("ib:toggle:"))
