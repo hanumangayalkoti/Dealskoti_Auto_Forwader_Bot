@@ -1631,7 +1631,14 @@ class ForwardingEngine:
         for key in ("btn1", "btn2"):
             button = buttons.get(key) or {}
             if button.get("enabled") and button.get("label") and button.get("url"):
-                row.append({"text": str(button["label"]), "url": str(button["url"])})
+                entry = {"text": str(button["label"]), "url": str(button["url"])}
+                # Colour is optional: only sent when the user actually chose
+                # one, so a button left alone renders exactly as a plain
+                # Telegram button does.
+                colour = str(button.get("colour") or "")
+                if colour in ("success", "primary", "danger"):
+                    entry["style"] = colour
+                row.append(entry)
         return {"inline_keyboard": [row]} if row else None
 
     async def _bot_can_post(self, chat_id: int) -> bool:
