@@ -226,102 +226,88 @@ def min_plan_for(feature: str) -> str:
 # behaviour, this is marketing copy and its wording/order is fixed.
 # "{limits}" and "{daily}" are filled in from PLANS at render time.
 
-PLAN_FEATURE_TREE: dict[str, list[str]] = {
-    "basic": [
-        "{tasks}",
-        "{limits}",
-        "Auto Forwarding",
-        "Media Forwarding",
-        "No BOT Watermark",
-        "{daily}",
-    ],
-    "silver": [
-        "{tasks}",
-        "{limits}",
-        "Auto Forwarding",
-        "Header Control",
-        "Media Forwarding",
-        "Link Preview ON/OFF",
-        "Remove Usernames ON/OFF",
-        "Remove Links ON/OFF",
-        "Mono Text ON/OFF",
-        "Disable Hidden Links ON/OFF",
-        "Set Inline Buttons",
-        "Blacklist Keywords",
-        "Whitelist Keywords",
-        "Add Header Text",
-        "Add Footer Text",
-        "Replace Usernames",
-        "Replace Words (Text)",
-        "{daily}",
-        "No BOT Watermark",
-        "Anti-Ban Speed Forwarding",
-        "Super Fast Message Delivery",
-    ],
-    "gold": [
-        "{tasks}",
-        "{limits}",
-        "Auto Forwarding",
-        "Header & Footer Control",
-        "Media Forwarding",
-        "Link Preview ON/OFF",
-        "Auto Delete Messages ON/OFF",
-        "Remove Usernames ON/OFF",
-        "Remove Links ON/OFF",
-        "Mono Text ON/OFF",
-        "Post Edit Sync ON/OFF",
-        "Disable Hidden Links ON/OFF",
-        "Blacklist Keywords",
-        "Whitelist Keywords",
-        "Replace Usernames",
-        "Replace Words (Text)",
-        "Trim Single Words/Lines",
-        "Replace Links",
-        "Delay Timer Per Target",
-        "Topics Forwarding",
-        "Bulk Delete Messages",
-        "{daily}",
-        "No BOT Watermark",
-        "Anti-Ban Speed Forwarding",
-        "Instant VIP Support",
-        "Super Fast Message Delivery",
-    ],
-    "platinum": [
-        "{tasks}",
-        "{limits}",
-        "Auto Forwarding",
-        "Header & Footer Control",
-        "Media Forwarding",
-        "Link Preview ON/OFF",
-        "Auto Delete Messages ON/OFF",
-        "Remove Usernames ON/OFF",
-        "Remove Links ON/OFF",
-        "Mono Text ON/OFF",
-        "Automatic Post Edit Sync",
-        "Disable Hidden Links ON/OFF",
-        "Blacklist Keywords",
-        "Whitelist Keywords",
-        "Replace Usernames",
-        "Replace Words (Text)",
-        "Trim Single Words/Lines",
-        "Replace Links",
-        "Delay Timer Per Target",
-        "Topics Forwarding",
-        "Bulk Delete Messages",
-        "{daily}",
-        "Custom Image Watermark",
-        "Watermark Position/Size/Opacity",
-        "Replace File",
-        "Auto Reaction System",
-        "Sender Filter",
-        "Advanced Text Replacement",
-        "Advanced Link Replacement",
-        "Custom Header/Footer Per Target",
-        "Anti-Ban Speed Forwarding",
-        "Instant VIP Support",
-        "Super Fast Message Delivery",
-    ],
-}
+# ==========================================
+# FEATURE LISTS SHOWN ON EACH PLAN SCREEN
+# ==========================================
+# Each marketing label is paired with the capability that ACTUALLY unlocks it,
+# and the per-plan lists are then built from that pairing.
+#
+# They used to be four hand-written lists sitting next to the capability
+# tables with nothing tying the two together. They drifted, as hand-kept
+# copies do: four labels advertised the wrong tier (Silver features listed
+# under Platinum), and eight features were missing from the higher plans that
+# do include them — so a Gold subscriber's own page did not mention header
+# text, which Gold has.
+#
+# Building the lists from the capabilities means that can no longer happen: a
+# feature appears on exactly the plans that can use it, and adding a new one
+# means touching this table only.
+#
+# A label mapped to None is not gated by a per-task setting — support
+# promises, and behaviour that is simply always on for that tier.
+FEATURE_LABELS: list[tuple[str, str | None]] = [
+    # (label, capability that gates it — None means always on for its tier)
+    ("Auto Forwarding",                 F_AUTO_FORWARD),
+    ("Media Forwarding",                F_MEDIA),
+    ("No BOT Watermark",                F_NO_WATERMARK),
+
+    ("Set Inline Buttons",              F_INLINE_BUTTONS),
+    ("Mono Text ON/OFF",                F_MONO_TEXT),
+    ("Blacklist Keywords",              F_BLACKLIST),
+    ("Whitelist Keywords",              F_WHITELIST),
+    ("Replace Usernames",               F_REPLACE_USERNAMES),
+    ("Replace Words (Text)",            F_REPLACE_WORDS),
+    ("Remove Links ON/OFF",             F_REMOVE_LINKS),
+    ("Remove Usernames ON/OFF",         F_REMOVE_USERNAMES),
+    ("Disable Hidden Links ON/OFF",     F_HIDDEN_LINKS),
+    ("Add Header Text",                 F_HEADER),
+    ("Add Footer Text",                 F_FOOTER),
+    ("Link Preview ON/OFF",             F_LINK_PREVIEW),
+    ("Anti-Ban Speed Forwarding",       F_ANTIBAN),
+    ("Super Fast Message Delivery",     F_FAST_DELIVERY),
+
+    ("Bulk Delete Messages",            F_BULK_DELETE),
+    ("Topics Forwarding",               F_TOPICS),
+    ("Delay Timer Per Target",          F_DELAY_TIMER),
+    ("Post Edit Sync ON/OFF",           F_POST_EDIT_SYNC),
+    ("Auto Delete Messages ON/OFF",     F_AUTO_DELETE),
+    ("Trim Single Words/Lines",         F_TRIM_WORDS),
+    ("Replace Links",                   F_REPLACE_LINKS),
+    ("Advanced Link Replacement",       F_ADV_LINK_REPLACE),
+    ("Advanced Text Replacement",       F_ADV_TEXT_REPLACE),
+    ("Instant VIP Support",             F_VIP_SUPPORT),
+
+    ("Custom Image Watermark",          F_WATERMARK_IMAGE),
+    ("Watermark Position/Size/Opacity", F_WATERMARK_STYLE),
+    ("Auto Reaction System",            F_AUTO_REACTION),
+    ("Replace File",                    F_ATTACH_FILE),
+    ("Sender Filter",                   F_SENDER_FILTER),
+    ("Custom Header/Footer Per Target", F_PER_TARGET_HF),
+]
+
+_TIER_ORDER = ("basic", "silver", "gold", "platinum")
+
+
+def _build_feature_tree() -> dict[str, list[str]]:
+    """One list per plan: its own features PLUS everything below it.
+
+    The {tasks}, {limits} and {daily} placeholders are filled in at render
+    time with that plan's actual numbers.
+    """
+    tree: dict[str, list[str]] = {}
+    for tier in _TIER_ORDER:
+        rows = ["{tasks}", "{limits}"]
+        for label, capability in FEATURE_LABELS:
+            # The capability table is the single source of truth: if the plan
+            # can use it, the plan's page lists it.
+            if capability is None or plan_has(tier, capability):
+                rows.append(label)
+        rows.append("{daily}")
+        tree[tier] = rows
+    return tree
+
+
+PLAN_FEATURE_TREE: dict[str, list[str]] = _build_feature_tree()
 
 
 # Tier shown next to each feature on the public All Features list.
