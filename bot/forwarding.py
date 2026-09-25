@@ -27,6 +27,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from contextlib import suppress
 
+from aiogram.types import BufferedInputFile
 from telethon import TelegramClient, errors, events, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -1322,6 +1323,25 @@ class ForwardingEngine:
                     button_markup = self._button_markup(
                         self._json_field(settings.get("inline_buttons"), {})
                     )
+
+            # Buttons on a photo need the actual bytes, because the Bot API
+            # rejects a file_id that came from a user account. The watermark
+            # step already produces bytes; without a watermark the media is
+            # still a raw Telethon object, so it is downloaded ONCE here and
+            # reused for every destination.
+            if (
+                button_markup is not None
+                and isinstance(getattr(message, "media", None), MessageMediaPhoto)
+                and not isinstance(media_file, io.BytesIO)
+                and media_file is not None
+            ):
+                with suppress(Exception):
+                    buffer = io.BytesIO()
+                    await client.download_media(message, file=buffer)
+                    if 0 < buffer.getbuffer().nbytes <= self.BOT_MEDIA_LIMIT:
+                        buffer.name = "post.jpg"
+                        buffer.seek(0)
+                        media_file = buffer
             if replacement_file is not None and not clean_copy:
                 # A native forward carries the ORIGINAL file and cannot swap it.
                 replacement_file = None
@@ -1404,7 +1424,7 @@ class ForwardingEngine:
                             if bot_chat_id and await self._bot_can_post(bot_chat_id):
                                 sent_msg = await self._send_with_buttons(
                                     bot_chat_id, new_text, button_markup, message,
-                                    entities=entities,
+                                    entities=entities, media_payload=payload,
                                 )
                             else:
                                 # The user set buttons up and they are not
@@ -1669,27 +1689,51 @@ class ForwardingEngine:
         self._bot_admin_cache[chat_id] = (allowed, now)
         return allowed
 
-    async def _send_with_buttons(self, chat_id: int, text: str, markup, media_message, entities=None):
+    # Bot API refuses a file_id that came from a user account, so the only way
+    # for the bot to post someone else's media is to hand it the actual bytes.
+    # Those are already in hand for photos (the pipeline downloads them for the
+    # watermark), which is why photos can carry buttons and larger media
+    # cannot: downloading a 2 GB video per destination just to attach two
+    # buttons would be slower and costlier than the buttons are worth.
+    BOT_MEDIA_LIMIT = 10 * 1024 * 1024  # Bot API photo ceiling
+
+    async def _send_with_buttons(
+        self, chat_id: int, text: str, markup, media_message,
+        entities=None, media_payload=None,
+    ):
         """Sends the post from the BOT so buttons can be attached.
 
-        The entities are carried across too. Sending only the text stripped
-        every bit of formatting — bold, italic and premium emoji — so turning
-        buttons on silently made posts worse everywhere else.
+        Handles text posts and photos. Anything heavier falls back to the
+        user's own account, which sends the post correctly but without
+        buttons — a post that arrives beats a post that does not.
 
-        Returns the sent message, or None if the bot could not do it, in which
-        case the caller falls back to the user's own account so a
-        misconfigured channel never costs a post.
+        Returns the sent message, or None if the bot could not do it.
         """
         if self.bot is None:
             return None
         try:
-            if media_message is not None and getattr(media_message, "media", None):
-                # Re-uploading media through the Bot API would mean downloading
-                # it first, so media posts keep the user-account path and lose
-                # only the buttons.
-                return None
-
             bot_entities = self._to_bot_entities(entities)
+            has_media = media_message is not None and getattr(media_message, "media", None)
+
+            if has_media:
+                photo_bytes = self._bot_photo_bytes(media_message, media_payload)
+                if photo_bytes is None:
+                    return None
+                caption = text or ""
+                if len(caption) > 1024:
+                    # A photo caption is capped at 1024 characters; a longer
+                    # post would be silently cut, so the user account keeps it
+                    # whole instead.
+                    return None
+                return await self.bot.send_photo(
+                    chat_id,
+                    photo=BufferedInputFile(photo_bytes, filename="post.jpg"),
+                    caption=caption or None,
+                    caption_entities=bot_entities if caption else None,
+                    parse_mode=None if (bot_entities and caption) else "HTML",
+                    reply_markup=markup,
+                )
+
             return await self.bot.send_message(
                 chat_id, text,
                 entities=bot_entities,
@@ -1699,6 +1743,25 @@ class ForwardingEngine:
         except Exception as exc:
             logger.debug("Bot send with buttons failed for %s: %s", chat_id, exc)
             return None
+
+    def _bot_photo_bytes(self, media_message, media_payload) -> bytes | None:
+        """The photo's bytes, if this post is one the bot can re-send.
+
+        Only photos, and only when the bytes are already in memory from the
+        watermark step — re-downloading per destination would undo the whole
+        point of processing the message once.
+        """
+        if not isinstance(getattr(media_message, "media", None), MessageMediaPhoto):
+            return None
+        if isinstance(media_payload, io.BytesIO):
+            data = media_payload.getvalue()
+        elif isinstance(media_payload, (bytes, bytearray)):
+            data = bytes(media_payload)
+        else:
+            return None
+        if not data or len(data) > self.BOT_MEDIA_LIMIT:
+            return None
+        return data
 
     @staticmethod
     def _to_bot_entities(entities):
