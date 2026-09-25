@@ -1447,6 +1447,19 @@ class ForwardingEngine:
                                     bot_chat_id, new_text, button_markup, message,
                                     entities=entities, media_payload=payload,
                                 )
+                                if sent_msg is None:
+                                    # The bot IS an admin here, so permissions
+                                    # are not the problem — the caption was
+                                    # over Telegram's limit or the file was too
+                                    # big to re-upload. Staying silent here is
+                                    # what made this look like "buttons just
+                                    # don't work on my channel".
+                                    await self._warn_once(
+                                        user_id, f"nobtnsend:{dest_raw}",
+                                        "notify_buttons_media_skipped", hours=24,
+                                        task=str(task["task_name"]),
+                                        dest=str(dest.get("title") or dest_raw),
+                                    )
                             else:
                                 # The user set buttons up and they are not
                                 # appearing — they need to know why.
@@ -1719,10 +1732,10 @@ class ForwardingEngine:
     # Photos are cheap to re-send: the pipeline already has their bytes.
     BOT_PHOTO_LIMIT = 10 * 1024 * 1024
     # Everything else has to be downloaded and uploaded again just to carry two
-    # buttons. 20 MB keeps that worth doing — above it the post would crawl and
-    # the bandwidth bill would climb, so those go through the user's account
-    # instead, correctly but without buttons.
-    BOT_MEDIA_LIMIT = 20 * 1024 * 1024
+    # buttons. 45 MB is the practical ceiling: the Bot API refuses an upload
+    # over 50 MB outright, so anything above this goes through the user's
+    # account instead, correctly but without buttons.
+    BOT_MEDIA_LIMIT = 45 * 1024 * 1024
 
     async def _send_with_buttons(
         self, chat_id: int, text: str, markup, media_message,
