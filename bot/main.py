@@ -2590,7 +2590,45 @@ CHANNEL_INPUT_RE = re.compile(
     r"^(?:@[\w]{2,64}|https?://t\.me/\S+|t\.me/\S+|-?\d{5,})$", re.IGNORECASE,
 )
 
-PICKER_DIALOG_LIMIT = 15
+# How many chats to read from Telegram for the picker.
+#
+# This used to be 15 with no way to see any more, so a source sitting 16th in
+# someone's chat list simply never appeared — and a Platinum plan that allows
+# 50 sources could only ever offer 15 of them. 50 chats across 4 pages covers
+# nearly everyone; beyond that, typing an @username or forwarding a message
+# still works as it always has.
+PICKER_DIALOG_LIMIT = 50
+PICKER_PAGE_SIZE = 15
+
+
+def _dialog_icon(dialog: dict) -> str:
+    """A glance-level hint of what a row is.
+
+    With 50 rows to scan, "📢 vs 👥 vs 👤" separates a channel from a group
+    from a person far faster than reading the names does.
+    """
+    kind = str(dialog.get("type") or "")
+    if dialog.get("is_forum"):
+        return "🧵"
+    if kind == "Channel":
+        return "📢" if not dialog.get("username") else "📣"
+    if kind == "Chat":
+        return "👥"
+    if kind == "User":
+        return "👤"
+    return "💬"
+
+
+def _picker_page_count(dialogs: list) -> int:
+    return max(1, (len(dialogs) + PICKER_PAGE_SIZE - 1) // PICKER_PAGE_SIZE)
+
+
+def _picker_slice(dialogs: list, page: int) -> tuple[list, int, int]:
+    """(rows for this page, clamped page, total pages)."""
+    pages = _picker_page_count(dialogs)
+    page = max(0, min(page, pages - 1))
+    start = page * PICKER_PAGE_SIZE
+    return dialogs[start:start + PICKER_PAGE_SIZE], page, pages
 PICKER_BUTTONS_PER_ROW = 5
 
 
@@ -2600,24 +2638,52 @@ def _picker_field_state(data: dict, field: str) -> tuple[list, list]:
     return selected, dialogs
 
 
-def _picker_keyboard(dialogs: list, selected_ids: set[int], field: str, language: str) -> InlineKeyboardMarkup:
+def _picker_keyboard(
+    dialogs: list, selected_ids: set[int], field: str, language: str, page: int = 0,
+) -> InlineKeyboardMarkup:
     """A numeric keypad — one button per listed chat — so nothing has to be
-    typed. Selected entries show a tick; tapping again deselects."""
+    typed. Selected entries show a tick; tapping again deselects.
+
+    Numbers restart at 1 on every page rather than running 16-30, because a
+    short number is quicker to find and tap than a long one, and the list
+    beside it is numbered to match.
+    """
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
-    for idx, d in enumerate(dialogs):
+    visible, page, pages = _picker_slice(dialogs, page)
+
+    for idx, d in enumerate(visible):
         try:
             did = int(d.get("id", 0))
         except (TypeError, ValueError):
             continue
         number = idx + 1
+        # The absolute position is what the handler resolves, so a pick on
+        # page 3 lands on the right chat.
+        absolute = page * PICKER_PAGE_SIZE + number
         label = f"✅ {number}" if did in selected_ids else str(number)
-        row.append(InlineKeyboardButton(text=label, callback_data=f"pick:{field}:{number}"))
+        row.append(InlineKeyboardButton(text=label, callback_data=f"pick:{field}:{absolute}"))
         if len(row) == PICKER_BUTTONS_PER_ROW:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="⬅️ Prev", callback_data=f"pick:page:{field}:{page - 1}",
+            ))
+        nav.append(InlineKeyboardButton(
+            text=f"{page + 1}/{pages}", callback_data="noop",
+        ))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(
+                text="Next ➡️", callback_data=f"pick:page:{field}:{page + 1}",
+            ))
+        rows.append(nav)
+
     rows.append([
         InlineKeyboardButton(text=safe_t(language, "picker_done"), callback_data=f"pick:done:{field}"),
         InlineKeyboardButton(text=safe_t(language, "picker_refresh"), callback_data=f"pick:refresh:{field}"),
@@ -2668,16 +2734,22 @@ async def _render_chat_picker(
     title_key = "picker_title_src" if field == "src" else "picker_title_dst"
 
     selected_ids = {int(e.get("id", 0)) for e in selected}
+    data_now = await state.get_data()
+    page = int(data_now.get(f"picker_page_{field}", 0) or 0)
+    visible, page, pages = _picker_slice(dialogs, page)
+
     lines: list[str] = [safe_t(language, title_key, limit=limit), ""]
-    for idx, d in enumerate(dialogs):
+    for idx, d in enumerate(visible):
         try:
             did = int(d.get("id", 0))
         except (TypeError, ValueError):
             continue
-        label = safe_html(str(d.get("title") or d.get("username") or did))[:40]
-        forum = " 🧵" if d.get("is_forum") else ""
+        label = safe_html(str(d.get("title") or d.get("username") or did))[:38]
         mark = " ✅" if did in selected_ids else ""
-        lines.append(f"{idx + 1}. {label}{forum}{mark}")
+        lines.append(f"{idx + 1}. {_dialog_icon(d)} {label}{mark}")
+    if pages > 1:
+        lines.append("")
+        lines.append(f"📄 Page {page + 1} of {pages} · {len(dialogs)} chats")
 
     sel_titles = [safe_html(str(e.get("title") or e.get("username") or e.get("id")))[:30] for e in selected]
     lines.append("")
@@ -2686,7 +2758,7 @@ async def _render_chat_picker(
     lines.append(safe_t(language, "picker_instructions"))
 
     text = "\n".join(lines)
-    keyboard = _picker_keyboard(dialogs, selected_ids, field, language)
+    keyboard = _picker_keyboard(dialogs, selected_ids, field, language, page)
     if not dialogs:
         text = safe_t(language, "picker_empty")
         keyboard = _nav_keyboard(include_cancel=True)
@@ -2859,6 +2931,34 @@ async def _finish_destinations(
         edit,
     )
     return None
+
+
+@router.callback_query(F.data.startswith("pick:page:"))
+async def picker_page_cb(
+    callback: CallbackQuery, state: FSMContext, db: Database, telethon: TelethonService,
+) -> None:
+    """Turns a page without losing what is already selected.
+
+    The chats are already in state, so this only re-renders — no second trip
+    to Telegram, which is what makes paging feel instant.
+    """
+    if callback.message is None:
+        return
+    _, _, field, page = callback.data.split(":")
+    if field not in ("src", "dst"):
+        return await callback.answer("Invalid", show_alert=True)
+    language = await _language_for_callback(db, callback)
+    await state.update_data({f"picker_page_{field}": int(page)})
+    await _render_chat_picker(
+        callback.message, db, telethon, state, callback.from_user.id, field, language,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def picker_noop_cb(callback: CallbackQuery) -> None:
+    """The page indicator is a label, not a control."""
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("pick:"))
