@@ -2949,8 +2949,12 @@ async def picker_page_cb(
         return await callback.answer("Invalid", show_alert=True)
     language = await _language_for_callback(db, callback)
     await state.update_data({f"picker_page_{field}": int(page)})
+    # edit=True, not a fresh send: turning a page should replace the list in
+    # place the way every other screen in this bot does. Without it each Next
+    # left another copy of the picker behind.
     await _render_chat_picker(
-        callback.message, db, telethon, state, callback.from_user.id, field, language,
+        callback.message, db, telethon, state, callback.from_user.id, field,
+        language, edit=True,
     )
     await callback.answer()
 
