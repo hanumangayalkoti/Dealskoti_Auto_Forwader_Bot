@@ -90,6 +90,31 @@ from .telethon_service import TelethonService
 
 logger = logging.getLogger("dealskoti.forwarding")
 
+# ---- Session health ----
+# Only these mean Telegram itself has ended the session for good. Anything
+# else at connect time (a network blip, a timeout, a short rate limit, a
+# Telegram server hiccup) is TEMPORARY: the session is kept, the user is not
+# told to reconnect, and the bot quietly tries again a little later.
+#
+# Before this, ANY failure at startup was treated as a dead session: the
+# user's forwarding stayed off until the next deploy and they got an
+# "account disconnected, send /connect" message for nothing.
+DEAD_SESSION_ERRORS = (
+    errors.AuthKeyDuplicatedError,
+    errors.AuthKeyUnregisteredError,
+    errors.AuthKeyInvalidError,
+    errors.AuthKeyPermEmptyError,
+    errors.SessionRevokedError,
+    errors.SessionExpiredError,
+    errors.UserDeactivatedError,
+    errors.UserDeactivatedBanError,
+)
+# Waits between automatic reconnect attempts after a temporary failure:
+# 30s, 1m, 2m, 5m, 10m, then every 15m — about four hours in total before the
+# user is asked to look at it.
+RECONNECT_DELAYS = (30, 60, 120, 300, 600, 900)
+RECONNECT_MAX_ATTEMPTS = 20
+
 # ---- Reply Sync tuning ----
 # How long a reply may wait for its parent's copy to land in a destination.
 # Generous on purpose: with a Delay Timer the parent's later destinations go
@@ -628,6 +653,10 @@ class ForwardingEngine:
         # delay never consumes shared capacity.
         self._cooldowns: dict[int, float] = {}
 
+        # ---- automatic reconnect after a TEMPORARY connect failure ----
+        self._reconnect_attempts: dict[int, int] = {}
+        self._reconnect_pending: set[int] = set()
+
         # ---- Reply Sync state ----
         # (task_id, source_raw, source_msg_id, dest_raw) -> destination msg id.
         # Every key carries the task AND the destination, so channel A's copy
@@ -669,24 +698,24 @@ class ForwardingEngine:
         self._running = True
         users = await self.db.list_users(limit=10000)
         bad_sessions = 0
+        retrying = 0
         for user in users:
             user_id = int(user["telegram_user_id"])
             if not user["is_blocked"]:
-                before = len(self.clients)
-                await self.refresh_user(user_id)
-                if len(self.clients) == before and await self.db.has_active_session(user_id):
-                    # refresh_user refused to register the client, so the stored
-                    # session must be invalid.
+                status = await self.refresh_user(user_id)
+                if status == "dead":
+                    # Telegram really ended this session. refresh_user has
+                    # already told the user to /connect.
                     bad_sessions += 1
-                    # This is the single most important thing to tell a user:
-                    # their forwarding has stopped completely and nothing in
-                    # the bot will show them why.
-                    await self._warn_once(
-                        user_id, "session_dead", "notify_session_dead", hours=24,
-                    )
+                elif status == "retry":
+                    # A temporary failure. The session is kept and a reconnect
+                    # is already scheduled — the user is NOT bothered.
+                    retrying += 1
+        if retrying:
+            logger.warning("%s client(s) hit a temporary error and will reconnect automatically", retrying)
         logger.info(
             f"Forwarding Engine started. Active clients: {len(self.clients)}. "
-            f"Invalid sessions cleared: {bad_sessions}"
+            f"Sessions ended by Telegram: {bad_sessions}. Reconnecting automatically: {retrying}"
         )
 
     async def stop(self) -> None:
@@ -704,21 +733,28 @@ class ForwardingEngine:
     # CLIENT MANAGEMENT
     # ==========================================
 
-    async def refresh_user(self, user_id: int) -> None:
-        """Starts or restarts the TelegramClient for a user to apply new settings/tasks."""
+    async def refresh_user(self, user_id: int) -> str:
+        """Starts or restarts the TelegramClient for a user to apply new settings/tasks.
+
+        Returns what happened, so callers can tell a dead session from a blip:
+          "ok"    — connected and forwarding
+          "dead"  — Telegram ended the session; the user has been told to /connect
+          "retry" — temporary failure; session kept, reconnect scheduled
+          "skip"  — nothing to do (engine stopped, blocked user, no session)
+        """
         if not self._running:
-            return
+            return "skip"
 
         # Ensure we don't have stale clients (prevents duplicate event handlers)
         await self.remove_user(user_id)
 
         user = await self.db.get_user(user_id)
         if not user or user["is_blocked"]:
-            return
+            return "skip"
 
         session_string = await self.telethon._get_session_string(user_id)
         if not session_string:
-            return
+            return "skip"
 
         try:
             client = TelegramClient(StringSession(session_string), self.telethon.api_id, self.telethon.api_hash)
@@ -727,7 +763,8 @@ class ForwardingEngine:
             logger.warning(f"Dropping invalid session for user {user_id}: {exc}")
             with suppress(Exception):
                 await self.telethon.disconnect(user_id)
-            return
+            await self._session_dead(user_id)
+            return "dead"
 
         try:
             await client.connect()
@@ -735,7 +772,8 @@ class ForwardingEngine:
                 await self.telethon.disconnect(user_id)
                 if client.is_connected():
                     await client.disconnect()
-                return
+                await self._session_dead(user_id)
+                return "dead"
 
             # Telethon handles SHORT rate limits itself by sleeping. Setting
             # this to 0 (as an earlier build did) made every 1-2 second limit
@@ -755,11 +793,62 @@ class ForwardingEngine:
             )
 
             self.clients[user_id] = client
+            self._reconnect_attempts.pop(user_id, None)
+            return "ok"
 
+        except DEAD_SESSION_ERRORS as e:
+            # Telegram has revoked this session for good. Removing it makes the
+            # bot show "not connected" with a Connect button, instead of
+            # looking connected while nothing forwards.
+            logger.error(f"Session ended by Telegram for user {user_id}: {e}")
+            with suppress(Exception):
+                if client.is_connected():
+                    await client.disconnect()
+            with suppress(Exception):
+                await self.telethon.disconnect(user_id)
+            await self._session_dead(user_id)
+            return "dead"
         except Exception as e:
-            logger.error(f"Failed to start forwarding client for user {user_id}: {e}")
-            if client.is_connected():
-                await client.disconnect()
+            # Network blip, timeout, rate limit, Telegram hiccup: the session
+            # itself is fine. Keep it, say nothing to the user, try again soon.
+            logger.warning(f"Temporary error starting client for user {user_id}, will retry: {e}")
+            with suppress(Exception):
+                if client.is_connected():
+                    await client.disconnect()
+            self._schedule_reconnect(user_id)
+            return "retry"
+
+    async def _session_dead(self, user_id: int) -> None:
+        """The one message worth sending: forwarding has fully stopped."""
+        self._reconnect_attempts.pop(user_id, None)
+        with suppress(Exception):
+            await self._warn_once(user_id, "session_dead", "notify_session_dead", hours=24)
+
+    def _schedule_reconnect(self, user_id: int) -> None:
+        """Quietly tries again later. Never stacks up duplicate attempts."""
+        if user_id in self._reconnect_pending or not self._running:
+            return
+        attempt = self._reconnect_attempts.get(user_id, 0)
+        if attempt >= RECONNECT_MAX_ATTEMPTS:
+            # Hours of failures: no longer a blip. Now it is worth telling them.
+            logger.error("Giving up automatic reconnect for user %s after %s attempts", user_id, attempt)
+            asyncio.create_task(self._session_dead(user_id))
+            return
+        self._reconnect_attempts[user_id] = attempt + 1
+        delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
+        self._reconnect_pending.add(user_id)
+        asyncio.create_task(self._reconnect_later(user_id, delay))
+
+    async def _reconnect_later(self, user_id: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            self._reconnect_pending.discard(user_id)
+        if not self._running or user_id in self.clients:
+            return
+        with suppress(Exception):
+            # On another temporary failure refresh_user schedules the next try.
+            await self.refresh_user(user_id)
 
     async def remove_user(self, user_id: int) -> None:
         """Stops and removes the user's forwarding client."""
