@@ -80,6 +80,7 @@ from .locales import (
     t,
 )
 from .plans import (
+    F_BULK_TRANSFER,
     STYLE_BUY,
     STYLE_DANGER,
     STYLE_GO,
@@ -97,7 +98,6 @@ from .plans import (
     F_INLINE_BUTTONS,
     plan_feature_tree,
     plan_has,
-    plan_rank,
     seed_feature_rows,
 )
 from .settings_ui import router as settings_router
@@ -3194,8 +3194,10 @@ async def _bulk_allowed_user(db: Database, user_id: int) -> bool:
 
 
 def _bulk_allowed(plan_name: str) -> bool:
-    # Gold is the floor: the same tier that unlocks the other heavy features.
-    return plan_rank(plan_name) >= plan_rank("gold")
+    # Read from the capability table like every other feature, so the plan
+    # screens (which list Bulk Transfer under Gold) and this gate can never
+    # disagree. Same plans as before: Gold and Platinum.
+    return plan_has(plan_name, F_BULK_TRANSFER)
 
 
 def _eta_text(count: int, language: str = "en") -> str:
@@ -7454,6 +7456,12 @@ async def _run(settings: Settings) -> None:
             removed = await db.prune_sent_map(older_than_days=3)
             if removed:
                 logger.info("Pruned %s stale edit-sync rows", removed)
+        # Reply Sync keeps its own map for two weeks: long enough for real
+        # conversations, short enough that the table stays small.
+        with suppress(Exception):
+            removed = await db.prune_reply_map(older_than_days=14)
+            if removed:
+                logger.info("Pruned %s stale reply-sync rows", removed)
 
     scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=scheduler_tz), replace_existing=True)
     scheduler.add_job(send_expiry_reminders, CronTrigger(hour=10, minute=0, timezone=scheduler_tz), replace_existing=True)
