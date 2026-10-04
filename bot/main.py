@@ -28,6 +28,7 @@ import html
 import json
 import io
 import logging
+import math
 import os
 import re
 from contextlib import asynccontextmanager, suppress
@@ -3191,6 +3192,28 @@ async def _bulk_allowed_user(db: Database, user_id: int) -> bool:
     """
     user = await db.get_user(user_id)
     return _bulk_allowed(str(user["plan"]) if user else "free")
+
+
+def _expiry_stage(seconds_left: float, last_stage: int) -> tuple[int | None, str]:
+    """(stage to send now, human label) — or (None, "") if nothing is due.
+
+    Stages are 5, 3, 2, 1 days before expiry. The most urgent stage the user
+    is inside wins; it is skipped if that stage, or a more urgent one, was
+    already sent (last_stage 0 = never warned; legacy -1 = final warning sent).
+    """
+    days_left = seconds_left / 86400
+    if days_left <= 0:
+        return None, ""
+    stage = next((s for s in (1, 2, 3, 5) if days_left <= s), None)
+    if stage is None:
+        return None, ""
+    if last_stage == -1 or (last_stage > 0 and last_stage <= stage):
+        return None, ""
+    if days_left < 1:
+        hours = max(1, math.ceil(seconds_left / 3600))
+        return stage, f"{hours} hour" + ("s" if hours != 1 else "")
+    days = math.ceil(days_left)
+    return stage, f"{days} day" + ("s" if days != 1 else "")
 
 
 def _bulk_allowed(plan_name: str) -> bool:
@@ -7401,48 +7424,37 @@ async def _run(settings: Settings) -> None:
         await _notify_admins(bot, settings, await _weekly_report(db))
 
     async def send_expiry_reminders():
-        """Warns at 5, 3, 2, 1 and 0 days before expiry.
+        """ONE warning per user per run, saying how long is really left.
 
-        Stages run from the largest number down, so a user who is already
-        inside a shorter window gets the most urgent message rather than a
-        stale one. mark_expiry_reminder_sent() records the stage, which is what
-        stops a second copy going out.
+        It used to walk the stages 5 -> 3 -> 2 -> 1 and send every stage the
+        user fitted: a plan ending in under a day fits all four, so the user got
+        "5 days", "3 days", "2 days" and "1 day" at the same moment. Now the
+        single most urgent stage is chosen, and the text shows the real time
+        left (in hours when it is under a day).
         """
-        for stage in (5, 3, 2, 1, 0):
-            for row in await db.get_expiring_users(max(stage, 1) if stage else 1):
-                user_id = int(row["telegram_user_id"])
-                language = language_for(row["preferred_language"])
-                plan_label = str(row["plan"]).title()
-                expiry_raw = row["plan_expiry"]
-                expiry = (
-                    expiry_raw.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
-                    if expiry_raw else "—"
-                )
-                # Only send this stage to users actually inside its window.
-                if expiry_raw is not None:
-                    left = (expiry_raw - datetime.now(timezone.utc)).total_seconds() / 86400
-                    if stage and left > stage:
-                        continue
-                    if not stage and left > 1:
-                        continue
-
-                if stage == 0:
-                    text = safe_t(language, "expiry_today", plan=plan_label, expiry=expiry)
-                else:
-                    label = f"{stage} day" + ("s" if stage != 1 else "")
-                    text = safe_t(
-                        language, "expiry_warning",
-                        plan=plan_label, days=label, expiry=expiry,
-                    )
-                try:
-                    await bot.send_message(user_id, text, parse_mode="HTML")
-                    # Stage 0 is stored as -1 so it never blocks the others.
-                    await db.mark_expiry_reminder_sent(user_id, stage if stage else -1)
-                except TelegramForbiddenError:
-                    await db.mark_expiry_reminder_sent(user_id, stage if stage else -1)
-                    await db.mark_user_inactive(user_id)
-                except Exception:
-                    logger.warning("Could not send expiry reminder to %s", user_id)
+        for row in await db.get_users_expiring_within(5):
+            expiry_raw = row["plan_expiry"]
+            if expiry_raw is None:
+                continue
+            seconds_left = (expiry_raw - datetime.now(timezone.utc)).total_seconds()
+            stage, label = _expiry_stage(seconds_left, int(row["expiry_reminder_stage"] or 0))
+            if stage is None:
+                continue  # already warned at this stage or a more urgent one
+            user_id = int(row["telegram_user_id"])
+            language = language_for(row["preferred_language"])
+            expiry = expiry_raw.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+            text = safe_t(
+                language, "expiry_warning",
+                plan=str(row["plan"]).title(), days=label, expiry=expiry,
+            )
+            try:
+                await bot.send_message(user_id, text, parse_mode="HTML")
+                await db.mark_expiry_reminder_sent(user_id, stage)
+            except TelegramForbiddenError:
+                await db.mark_expiry_reminder_sent(user_id, stage)
+                await db.mark_user_inactive(user_id)
+            except Exception:
+                logger.warning("Could not send expiry reminder to %s", user_id)
 
     async def downgrade_expired_plans():
         for row in await db.downgrade_expired_users():
