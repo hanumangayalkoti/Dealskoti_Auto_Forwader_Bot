@@ -115,6 +115,15 @@ DEAD_SESSION_ERRORS = (
 RECONNECT_DELAYS = (30, 60, 120, 300, 600, 900)
 RECONNECT_MAX_ATTEMPTS = 20
 
+# A connected account receives EVERY message from every chat it is in, and
+# each one used to cost two database queries plus a slot in the plan's lane
+# before the bot even checked whether that chat was a source. An account in
+# a few hundred deal groups flooded the lanes with messages nobody forwards,
+# queueing the real ones behind them. Each user's source list is now kept in
+# memory and checked first. It is rebuilt whenever the client is refreshed
+# (every task create/edit does that) and at least this often regardless.
+SOURCE_CACHE_TTL = 30.0
+
 # ---- Reply Sync tuning ----
 # How long a reply may wait for its parent's copy to land in a destination.
 # Generous on purpose: with a Delay Timer the parent's later destinations go
@@ -653,6 +662,9 @@ class ForwardingEngine:
         # delay never consumes shared capacity.
         self._cooldowns: dict[int, float] = {}
 
+        # user_id -> (set of raw source chat ids across all tasks, loop time)
+        self._source_cache: dict[int, tuple[set, float]] = {}
+
         # ---- automatic reconnect after a TEMPORARY connect failure ----
         self._reconnect_attempts: dict[int, int] = {}
         self._reconnect_pending: set[int] = set()
@@ -726,8 +738,12 @@ class ForwardingEngine:
         logger.info("Forwarding Engine stopped.")
 
     async def run_until_stopped(self) -> None:
+        tick = 0
         while self._running:
             await asyncio.sleep(1)
+            tick += 1
+            if tick % 15 == 0:
+                await self._sweep_auto_deletes()
 
     # ==========================================
     # CLIENT MANAGEMENT
@@ -794,6 +810,8 @@ class ForwardingEngine:
 
             self.clients[user_id] = client
             self._reconnect_attempts.pop(user_id, None)
+            with suppress(Exception):
+                self._cache_sources(user_id, await self.db.list_tasks(user_id))
             return "ok"
 
         except DEAD_SESSION_ERRORS as e:
@@ -862,6 +880,7 @@ class ForwardingEngine:
                 await client.disconnect()
         self._peer_cache.pop(user_id, None)
         self._dialogs_synced.discard(user_id)
+        self._source_cache.pop(user_id, None)
 
     async def refresh_task(self, task_id: int) -> None:
         """Hot-reloads a user's client if a specific task was updated."""
@@ -1318,6 +1337,27 @@ class ForwardingEngine:
     # any problem means the message goes out as a plain message, exactly as it
     # did before this feature existed — never a lost or delayed-forever post.
 
+    def _cache_sources(self, user_id: int, tasks) -> None:
+        sources: set = set()
+        for task in tasks or []:
+            for ref in self._json_field(task["sources"], []) or []:
+                if isinstance(ref, dict):
+                    raw = raw_peer_id(ref.get("id"))
+                    if raw is not None:
+                        sources.add(raw)
+        self._source_cache[user_id] = (sources, asyncio.get_running_loop().time())
+
+    def _might_be_source(self, user_id: int, chat_id) -> bool:
+        """False only when this chat is DEFINITELY not a source of any task.
+        Unknown or stale -> True, so the full check runs (and refreshes)."""
+        entry = self._source_cache.get(user_id)
+        if entry is None:
+            return True
+        sources, cached_at = entry
+        if asyncio.get_running_loop().time() - cached_at > SOURCE_CACHE_TTL:
+            return True
+        return raw_peer_id(chat_id) in sources
+
     def _reply_sync_on(self, settings: dict, plan_name: str) -> bool:
         """Silver and above, and only when the task has it switched on."""
         return plan_has(plan_name, F_REPLY_SYNC) and bool(settings.get("reply_sync"))
@@ -1513,6 +1553,8 @@ class ForwardingEngine:
         database. The marker is released in finally, so a crash or a filter
         can never leave a reply waiting on a parent that will never send.
         """
+        if not self._might_be_source(user_id, event.chat_id):
+            return
         arrival = self._mark_arrival(event, user_id)
         try:
             await self._handle_new_message(event, user_id)
@@ -1586,6 +1628,7 @@ class ForwardingEngine:
             return
 
         tasks = await self.db.list_tasks(user_id)
+        self._cache_sources(user_id, tasks)
         if not tasks:
             return
 
@@ -1974,9 +2017,14 @@ class ForwardingEngine:
                     except (TypeError, ValueError):
                         auto_delete_secs = 0
                     if auto_delete_secs > 0:
-                        asyncio.create_task(
-                            self._auto_delete(client, dest_peer, sent_id, auto_delete_secs)
-                        )
+                        # Bot-sent posts (Inline Buttons) are deleted by the
+                        # bot, which is an admin there; everything else by the
+                        # user's account.
+                        bot_sent = getattr(sent_msg, "id", None) is None
+                        asyncio.create_task(self._schedule_auto_delete(
+                            user_id, dest, sent_id, auto_delete_secs,
+                            self._bot_api_chat_id(dest_raw, dest) if bot_sent else None,
+                        ))
 
                 asyncio.create_task(self._maybe_react(
                     client, settings, plan_name, "destination", dest_peer, sent_id
@@ -2340,6 +2388,8 @@ class ForwardingEngine:
 
     async def _on_message_edited(self, event: events.MessageEdited.Event, user_id: int) -> None:
         """Mirrors an edit in the source chat onto every copy we sent."""
+        if not self._might_be_source(user_id, event.chat_id):
+            return
         try:
             message: Message = event.message
             source_raw = raw_peer_id(event.chat_id)
@@ -2416,6 +2466,14 @@ class ForwardingEngine:
                             text=new_text, parse_mode=parse_mode,
                             formatting_entities=_edit_entities,
                         )
+                    except errors.MessageAuthorRequiredError:
+                        # The copy was posted by the BOT (Inline Buttons), and
+                        # Telegram only lets the author edit. This used to fail
+                        # silently, so edits never reached posts with buttons.
+                        await self._bot_edit_copy(
+                            ref, dest_raw, int(row["dest_message_id"]), message,
+                            new_text, _edit_entities, settings, plan_name,
+                        )
                     except Exception as e:
                         # Telegram refuses edits older than 48h and rejects
                         # "content unchanged" — both are normal, not errors.
@@ -2428,6 +2486,42 @@ class ForwardingEngine:
     # ==========================================
     # AUTO REACTION
     # ==========================================
+
+    async def _bot_edit_copy(self, dest_ref: dict, dest_raw: int, message_id: int, message,
+                             text: str, entities, settings: dict, plan_name: str) -> None:
+        """Edits a bot-posted copy through the Bot API.
+
+        The buttons are passed again on purpose: an edit without reply_markup
+        removes the inline keyboard from the post.
+        """
+        if self.bot is None:
+            return
+        chat_id = self._bot_api_chat_id(dest_raw, dest_ref)
+        if not chat_id:
+            return
+        markup = None
+        if plan_has(plan_name, F_INLINE_BUTTONS):
+            with suppress(Exception):
+                markup = self._button_markup(self._json_field(settings.get("inline_buttons"), {}))
+        bot_entities = self._to_bot_entities(entities)
+        media = getattr(message, "media", None)
+        try:
+            if media is not None and not isinstance(media, MessageMediaWebPage):
+                await self.bot.edit_message_caption(
+                    chat_id=chat_id, message_id=message_id, caption=text,
+                    caption_entities=bot_entities or None,
+                    parse_mode=None if bot_entities else "HTML",
+                    reply_markup=markup,
+                )
+            else:
+                await self.bot.edit_message_text(
+                    text=text, chat_id=chat_id, message_id=message_id,
+                    entities=bot_entities or None,
+                    parse_mode=None if bot_entities else "HTML",
+                    reply_markup=markup,
+                )
+        except Exception as exc:
+            logger.debug("Bot edit sync skipped for %s in %s: %s", message_id, dest_raw, exc)
 
     async def _maybe_react(
         self, client: TelegramClient, settings: dict, plan_name: str,
@@ -2848,9 +2942,65 @@ class ForwardingEngine:
             return default
         return parsed if isinstance(parsed, type(default)) else default
 
-    async def _auto_delete(self, client: TelegramClient, chat_id, message_id: int, delay_seconds: int) -> None:
-        """Background task to delete a forwarded message after X seconds."""
+    # ==========================================
+    # AUTO DELETE
+    # ==========================================
+    # Every job is written to the database first. The old version was only an
+    # in-memory timer holding a reference to the client it started with, so a
+    # deploy — or ANY task edit, which reconnects the user's client — cancelled
+    # every pending delete without a word. A 24-hour Auto Delete almost never
+    # survived. Now a sweeper picks up whatever is due, whatever happened.
+
+    AUTO_DELETE_PRECISE_LIMIT = 300  # short delays also get an exact timer
+
+    async def _schedule_auto_delete(self, user_id: int, dest_ref: dict, message_id: int,
+                                    delay_seconds: int, bot_chat_id: int | None) -> None:
+        job_id = await self.db.add_pending_delete(
+            user_id, dest_ref, message_id, bot_chat_id, delay_seconds,
+        )
+        if delay_seconds > self.AUTO_DELETE_PRECISE_LIMIT:
+            return  # the sweeper handles it, to within ~15 seconds
         await asyncio.sleep(delay_seconds)
-        if client.is_connected():
+        if await self._execute_delete(user_id, dest_ref, message_id, bot_chat_id):
+            await self.db.finish_pending_delete(job_id)
+
+    async def _execute_delete(self, user_id: int, dest_ref, message_id: int,
+                              bot_chat_id: int | None) -> bool:
+        """Deletes one post, using whoever can. Never raises."""
+        if isinstance(dest_ref, str):
             with suppress(Exception):
-                await client.delete_messages(chat_id, message_id)
+                dest_ref = json.loads(dest_ref)
+        if bot_chat_id and self.bot is not None:
+            try:
+                await self.bot.delete_message(int(bot_chat_id), int(message_id))
+                return True
+            except Exception as exc:
+                logger.debug("Bot could not auto-delete %s: %s", message_id, exc)
+        client = self.clients.get(user_id)   # the CURRENT client, never a stale one
+        if client is None or not client.is_connected() or not isinstance(dest_ref, dict):
+            return False
+        try:
+            peer = await self._resolve_peer(client, user_id, dest_ref)
+            if peer is None:
+                return False
+            await client.delete_messages(peer, [int(message_id)])
+            return True
+        except Exception as exc:
+            logger.debug("Auto-delete of %s failed for user %s: %s", message_id, user_id, exc)
+            return False
+
+    async def _sweep_auto_deletes(self) -> None:
+        try:
+            jobs = await self.db.due_pending_deletes()
+        except Exception as exc:
+            logger.debug("Auto-delete sweep skipped: %s", exc)
+            return
+        for job in jobs:
+            done = await self._execute_delete(
+                int(job["user_id"]), job["dest_ref"], int(job["dest_message_id"]),
+                job["bot_chat_id"],
+            )
+            if done:
+                await self.db.finish_pending_delete(int(job["id"]))
+            else:
+                await self.db.retry_pending_delete(int(job["id"]), int(job["attempts"] or 0))
