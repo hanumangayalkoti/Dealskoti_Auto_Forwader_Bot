@@ -67,6 +67,7 @@ from .plans import (
     F_MONO_TEXT,
     F_PER_TARGET_HF,
     F_POST_EDIT_SYNC,
+    F_REPLY_SYNC,
     F_REMOVE_LINKS,
     F_REMOVE_USERNAMES,
     F_REPLACE_LINKS,
@@ -269,6 +270,8 @@ _spec("auto_delete_seconds", "🗑️ Auto Delete Messages", CAT_FORWARDING, "nu
       F_AUTO_DELETE, "autodelete_prompt", 0)
 _spec("post_edit_sync", "🔄 Post Edit Sync", CAT_FORWARDING, "toggle", F_POST_EDIT_SYNC,
       "editsync_prompt", False)
+_spec("reply_sync", "↩️ Reply Sync", CAT_FORWARDING, "toggle", F_REPLY_SYNC,
+      "replysync_prompt", False)
 _spec("delay_timer", "⏱️ Delay Timer Per Target", CAT_FORWARDING, "choice", F_DELAY_TIMER,
       "delay_timer_prompt", "off", tuple(DELAY_PRESETS.keys()))
 _spec("antiban_speed", "🛡️ Anti-Ban Speed", CAT_FORWARDING, "choice", F_ANTIBAN,
