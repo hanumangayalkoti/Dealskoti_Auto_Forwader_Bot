@@ -25,10 +25,12 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from collections import OrderedDict
 from contextlib import suppress
 
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, ReplyParameters
 from telethon import TelegramClient, errors, events, functions, types
+from telethon import utils as tl_utils
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     InputPeerChannel,
@@ -75,6 +77,7 @@ from .plans import (
     F_REPLACE_LINKS,
     F_REPLACE_USERNAMES,
     F_REPLACE_WORDS,
+    F_REPLY_SYNC,
     F_SENDER_FILTER,
     F_TOPICS,
     F_TRIM_WORDS,
@@ -86,6 +89,54 @@ from .plans import (
 from .telethon_service import TelethonService
 
 logger = logging.getLogger("dealskoti.forwarding")
+
+# ---- Reply Sync tuning ----
+# How long a reply may wait for its parent's copy to land in a destination.
+# Generous on purpose: with a Delay Timer the parent's later destinations go
+# out seconds apart, and the reply must not give up before its own copy of
+# the parent exists. It never waits for a parent that was filtered out or
+# failed — those release the reply immediately.
+REPLY_WAIT_SECONDS = 25.0
+# A parent whose message id is this close to the reply's is assumed to be
+# arriving right now (ids in one chat are sequential), so the reply gives it
+# a short grace period to register before falling back to a plain message.
+REPLY_RECENT_GAP = 20
+REPLY_GRACE_SECONDS = 3.0
+# In-memory caps — the database is the long-term store, these only cover the
+# milliseconds-to-minutes window where the database has not caught up.
+REPLY_CACHE_MAX = 50_000
+REPLY_DONE_MAX = 20_000
+
+
+def _sent_message_id(sent_msg) -> int | None:
+    """The id of a message we just sent, whoever sent it.
+
+    Telethon messages carry .id; messages sent by the BOT (the Inline Buttons
+    path) are aiogram objects that carry .message_id instead. Reading .id on
+    those raised AttributeError right after the post had already gone out —
+    with a Delay Timer that aborted every remaining destination and task for
+    the message, which is how forwarding appeared to "stop".
+    """
+    value = getattr(sent_msg, "id", None)
+    if value is None:
+        value = getattr(sent_msg, "message_id", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_reply_target_error(exc: Exception) -> bool:
+    """True when Telegram rejected the REPLY TARGET, not the message itself.
+
+    Only asked about sends that carried reply_to, where the only message id in
+    play is the parent's — so an invalid-id error means the parent copy is
+    gone from the destination, and the right move is to resend without it.
+    """
+    if isinstance(exc, errors.MessageIdInvalidError):
+        return True
+    text = str(exc).upper()
+    return "REPLY_MESSAGE_ID_INVALID" in text or "MESSAGE_ID_INVALID" in text
 
 # Finds @handles in text (Replace Usernames / Remove Usernames).
 USERNAME_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{3,}")
@@ -576,6 +627,24 @@ class ForwardingEngine:
         # again. Enforced BEFORE taking a lane slot, so a user's own anti-ban
         # delay never consumes shared capacity.
         self._cooldowns: dict[int, float] = {}
+
+        # ---- Reply Sync state ----
+        # (task_id, source_raw, source_msg_id, dest_raw) -> destination msg id.
+        # Every key carries the task AND the destination, so channel A's copy
+        # (100 -> 500) and channel B's (100 -> 800) can never be confused, and
+        # no two users or tasks share an entry.
+        self._reply_cache: OrderedDict = OrderedDict()
+        # (user_id, source_raw, source_msg_id) -> Event, set once that message
+        # is completely processed (sent, filtered or failed). Created before
+        # the first await of the handler, so a reply can see that its parent
+        # has arrived even while the parent is still waiting on the database.
+        self._reply_inflight: dict[tuple[int, int, int], asyncio.Event] = {}
+        # Messages fully processed recently — lets a reply stop waiting for a
+        # parent that already finished without reaching some destination.
+        self._reply_done: OrderedDict = OrderedDict()
+        # (task_id, source_raw, source_msg_id, dest_raw) -> Event a waiting
+        # reply sleeps on; set the moment that parent copy lands.
+        self._reply_waiters: dict[tuple[int, int, int, int], asyncio.Event] = {}
 
     def _remember_send(self, chat_id: int, message_id: int) -> None:
         raw = raw_peer_id(chat_id)
@@ -1152,7 +1221,216 @@ class ForwardingEngine:
     def _lane_for(self, plan_name: str) -> asyncio.Semaphore:
         return self._lanes.get((plan_name or "free").lower(), self._lanes["free"])
 
+    # ==========================================
+    # REPLY SYNC
+    # ==========================================
+    # If source message 101 replies to 100, every destination's copy of 101
+    # replies to THAT destination's copy of 100. Everything here is fail-safe:
+    # any problem means the message goes out as a plain message, exactly as it
+    # did before this feature existed — never a lost or delayed-forever post.
+
+    def _reply_sync_on(self, settings: dict, plan_name: str) -> bool:
+        """Silver and above, and only when the task has it switched on."""
+        return plan_has(plan_name, F_REPLY_SYNC) and bool(settings.get("reply_sync"))
+
+    @staticmethod
+    def _reply_parent_id(message: Message, source_raw: int) -> int | None:
+        """The source message this one GENUINELY replies to, else None.
+
+        Excluded on purpose:
+          * replies to a message in another chat (the parent is not ours)
+          * replies to scheduled messages
+          * forum topics: every message inside a topic carries reply_to with
+            reply_to_msg_id = the topic's root. That is topic membership, not
+            a reply. A real reply to a specific message additionally carries
+            reply_to_top_id (the root), with reply_to_msg_id pointing at the
+            message actually replied to.
+        """
+        reply_to = getattr(message, "reply_to", None)
+        if reply_to is None or getattr(reply_to, "reply_to_scheduled", False):
+            return None
+        parent = getattr(reply_to, "reply_to_msg_id", None)
+        if not parent:
+            return None
+        peer = getattr(reply_to, "reply_to_peer_id", None)
+        if peer is not None:
+            try:
+                if raw_peer_id(tl_utils.get_peer_id(peer)) != source_raw:
+                    return None
+            except Exception:
+                return None  # cannot tell which chat it is from: do not guess
+        if getattr(reply_to, "forum_topic", False):
+            top = getattr(reply_to, "reply_to_top_id", None)
+            if top is None or int(parent) == int(top):
+                return None
+        return int(parent)
+
+    def _mark_arrival(self, event, user_id: int) -> tuple[int, int, int] | None:
+        """Synchronous on purpose — it must run before the handler's first await."""
+        try:
+            source_raw = raw_peer_id(event.chat_id)
+            message_id = int(event.message.id)
+        except Exception:
+            return None
+        if source_raw is None:
+            return None
+        key = (user_id, source_raw, message_id)
+        if key in self._reply_inflight:
+            return None  # a duplicate delivery; the first handler owns the marker
+        self._reply_inflight[key] = asyncio.Event()
+        return key
+
+    def _finish_arrival(self, key: tuple[int, int, int] | None) -> None:
+        if key is None:
+            return
+        # "done" is recorded BEFORE the event fires, so a woken reply always
+        # sees that the parent finished and stops waiting at once.
+        self._reply_done[key] = True
+        self._reply_done.move_to_end(key)
+        while len(self._reply_done) > REPLY_DONE_MAX:
+            self._reply_done.popitem(last=False)
+        event = self._reply_inflight.pop(key, None)
+        if event is not None:
+            event.set()
+        _user, source_raw, message_id = key
+        for waiter_key in [k for k in self._reply_waiters if k[1] == source_raw and k[2] == message_id]:
+            waiter = self._reply_waiters.pop(waiter_key, None)
+            if waiter is not None:
+                waiter.set()
+
+    def _cache_reply(self, key: tuple, dest_message_id: int) -> None:
+        self._reply_cache[key] = dest_message_id
+        self._reply_cache.move_to_end(key)
+        while len(self._reply_cache) > REPLY_CACHE_MAX:
+            self._reply_cache.popitem(last=False)
+
+    def _note_reply_map(self, task_id: int, source_raw: int, source_message_id: int,
+                        dest_raw: int, dest_message_id: int | None) -> None:
+        """Called the moment ONE destination copy lands — not after the whole
+        fan-out — so a reply to destination 1 never waits on destination 5."""
+        if not dest_message_id:
+            return
+        key = (task_id, source_raw, source_message_id, dest_raw)
+        self._cache_reply(key, dest_message_id)
+        waiter = self._reply_waiters.pop(key, None)
+        if waiter is not None:
+            waiter.set()
+        # Never raises; a failed write only costs a future reply its link.
+        asyncio.create_task(self.db.record_reply_map(
+            task_id, source_raw, source_message_id, dest_raw, dest_message_id,
+        ))
+
+    @staticmethod
+    async def _wait_any(waitables: tuple[asyncio.Event, ...], timeout: float) -> None:
+        pending = [asyncio.ensure_future(item.wait()) for item in waitables]
+        try:
+            await asyncio.wait(pending, timeout=max(0.0, timeout),
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for future in pending:
+                future.cancel()
+
+    async def _resolve_reply_target(self, user_id: int, task_id: int, source_raw: int,
+                                    parent_id: int, dest_raw: int, reply_id: int) -> int | None:
+        """This destination's copy of the parent, or None. Never raises.
+
+        Order: memory -> wait if the parent is still being sent -> database ->
+        a short grace period if the parent is so recent it may not have
+        registered yet -> give up and send as a plain message.
+        """
+        key = (task_id, source_raw, parent_id, dest_raw)
+        try:
+            hit = self._reply_cache.get(key)
+            if hit:
+                return hit
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + REPLY_WAIT_SECONDS
+            grace_until = loop.time() + REPLY_GRACE_SECONDS
+            recent = 0 < reply_id - parent_id <= REPLY_RECENT_GAP
+            arrival_key = (user_id, source_raw, parent_id)
+            db_checked = False
+            while True:
+                hit = self._reply_cache.get(key)
+                if hit:
+                    return hit
+                inflight = self._reply_inflight.get(arrival_key)
+                if inflight is not None and not inflight.is_set():
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    waiter = self._reply_waiters.get(key)
+                    if waiter is None:
+                        waiter = asyncio.Event()
+                        self._reply_waiters[key] = waiter
+                    # Wakes when this destination's parent copy lands, or when
+                    # the parent finishes without reaching it.
+                    await self._wait_any((waiter, inflight), remaining)
+                    continue
+                if not db_checked:
+                    db_checked = True
+                    found = await self.db.get_reply_dest(task_id, source_raw, parent_id, dest_raw)
+                    if found:
+                        self._cache_reply(key, found)
+                        return found
+                if arrival_key in self._reply_done:
+                    break  # parent was processed and never reached this destination
+                if recent and loop.time() < grace_until:
+                    await asyncio.sleep(0.25)
+                    continue
+                break
+            return self._reply_cache.get(key)
+        except Exception as exc:
+            logger.debug("Reply target lookup failed for %s: %s", key, exc)
+            return None
+
+    async def _send_maybe_reply(self, client, dest_peer, reply_to: int | None, **kwargs):
+        """client.send_message, as a reply when there is a target.
+
+        If Telegram rejects the reply target (the parent copy was deleted in
+        the destination) the SAME message is sent again without it. This must
+        happen here: the generic handler further up treats "message ID is
+        invalid" as an unforwardable post and skips it — which would have
+        silently lost the whole message just because its parent was gone.
+        FloodWait is re-raised untouched so the existing wait-and-retry runs.
+        """
+        if not reply_to:
+            return await client.send_message(dest_peer, **kwargs)
+        payload = kwargs.get("file")
+        saved = None
+        if isinstance(payload, io.BytesIO):
+            # A stream can only be read once; keep the bytes for a resend.
+            saved = (payload.getvalue(), getattr(payload, "name", None))
+        try:
+            return await client.send_message(dest_peer, reply_to=reply_to, **kwargs)
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            if not _is_reply_target_error(exc):
+                raise
+            logger.info("Reply target %s is gone at the destination; sending without the link", reply_to)
+            if saved is not None:
+                fresh = io.BytesIO(saved[0])
+                if saved[1]:
+                    fresh.name = saved[1]
+                kwargs["file"] = fresh
+            return await client.send_message(dest_peer, **kwargs)
+
     async def _on_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
+        """Entry point for every incoming message.
+
+        Reply Sync needs to know a message has ARRIVED before the handler's
+        first await: Telethon runs handlers concurrently, so a reply can
+        otherwise overtake its parent while the parent is still waiting on the
+        database. The marker is released in finally, so a crash or a filter
+        can never leave a reply waiting on a parent that will never send.
+        """
+        arrival = self._mark_arrival(event, user_id)
+        try:
+            await self._handle_new_message(event, user_id)
+        finally:
+            self._finish_arrival(arrival)
+
+    async def _handle_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         # Read the plan BEFORE queueing so a paying user never waits in the
         # free lane just to find out which lane they belong in.
         plan_name = "free"
@@ -1328,6 +1606,12 @@ class ForwardingEngine:
             # tag. Every paid tier gets a clean copy — that IS "No BOT Watermark".
             clean_copy = plan_has(plan_name, F_NO_WATERMARK)
 
+            # Reply Sync (Silver+, per task). Clean copies only: a native
+            # forward cannot carry a reply link. reply_sync also decides
+            # whether this message is RECORDED, so later replies can find it.
+            reply_sync = clean_copy and self._reply_sync_on(settings, plan_name)
+            reply_parent = self._reply_parent_id(message, source_raw) if reply_sync else None
+
             # Inline Buttons (Gold+), configured PER TASK — one channel may
             # want "Join Channel" while another wants "Buy Now".
             button_markup = None
@@ -1381,6 +1665,7 @@ class ForwardingEngine:
             async def _deliver(dest: dict):
                 """Sends one copy. Returns (dest_raw, sent_msg) or None."""
                 new_text, parse_mode, entities = "", None, None
+                reply_target = None
                 if dest.get("id") is None:
                     return None
                 dest_raw = raw_peer_id(dest.get("id"))
@@ -1439,6 +1724,12 @@ class ForwardingEngine:
                         # bot can attach them. If it is not an admin there, we
                         # fall straight through to the user's own account so
                         # the post still goes out, just without buttons.
+                        if reply_parent is not None:
+                            reply_target = await self._resolve_reply_target(
+                                user_id, int(task["id"]), source_raw, reply_parent,
+                                dest_raw, int(message.id),
+                            )
+
                         sent_msg = None
                         if button_markup:
                             bot_chat_id = self._bot_api_chat_id(dest_raw, dest)
@@ -1446,6 +1737,7 @@ class ForwardingEngine:
                                 sent_msg = await self._send_with_buttons(
                                     bot_chat_id, new_text, button_markup, message,
                                     entities=entities, media_payload=payload,
+                                    reply_to=reply_target,
                                 )
                                 if sent_msg is None:
                                     # The bot IS an admin here, so permissions
@@ -1470,8 +1762,8 @@ class ForwardingEngine:
                                     dest=str(dest.get("title") or dest_raw),
                                 )
                         if sent_msg is None:
-                            sent_msg = await client.send_message(
-                                dest_peer,
+                            sent_msg = await self._send_maybe_reply(
+                                client, dest_peer, reply_target,
                                 message=new_text,
                                 file=payload,
                                 link_preview=link_preview,
@@ -1513,8 +1805,8 @@ class ForwardingEngine:
                             if isinstance(retry_payload, io.BytesIO):
                                 retry_payload = io.BytesIO(media_file.getvalue())
                                 retry_payload.name = getattr(media_file, "name", "photo.jpg")
-                            sent_msg = await client.send_message(
-                                dest_peer,
+                            sent_msg = await self._send_maybe_reply(
+                                client, dest_peer, reply_target,
                                 message=new_text,
                                 file=retry_payload,
                                 link_preview=link_preview,
@@ -1571,7 +1863,15 @@ class ForwardingEngine:
                 if not sent_msg:
                     return None
 
-                self._remember_send(dest_raw, sent_msg.id)
+                # Bot-sent posts are aiogram objects with .message_id, not .id.
+                sent_id = _sent_message_id(sent_msg)
+                if sent_id is None:
+                    return None
+                self._remember_send(dest_raw, sent_id)
+                if reply_sync:
+                    self._note_reply_map(
+                        int(task["id"]), source_raw, int(message.id), dest_raw, sent_id,
+                    )
                 fail_key = (int(task["id"]), dest_raw)
                 self._dest_failures.pop(fail_key, None)
                 self._dest_reported.discard(fail_key)
@@ -1586,11 +1886,11 @@ class ForwardingEngine:
                         auto_delete_secs = 0
                     if auto_delete_secs > 0:
                         asyncio.create_task(
-                            self._auto_delete(client, dest_peer, sent_msg.id, auto_delete_secs)
+                            self._auto_delete(client, dest_peer, sent_id, auto_delete_secs)
                         )
 
                 asyncio.create_task(self._maybe_react(
-                    client, settings, plan_name, "destination", dest_peer, sent_msg.id
+                    client, settings, plan_name, "destination", dest_peer, sent_id
                 ))
                 return dest_raw, sent_msg
 
@@ -1627,8 +1927,9 @@ class ForwardingEngine:
                 if self._edit_sync_enabled(settings, plan_name):
                     edit_rows = [
                         (int(task["id"]), user_id, source_raw, int(message.id),
-                         int(dest_raw), int(sent_msg.id))
+                         int(dest_raw), _sent_message_id(sent_msg))
                         for dest_raw, sent_msg in results
+                        if _sent_message_id(sent_msg) is not None
                     ]
                     await self.db.record_sent_messages(edit_rows)
 
@@ -1739,7 +2040,7 @@ class ForwardingEngine:
 
     async def _send_with_buttons(
         self, chat_id: int, text: str, markup, media_message,
-        entities=None, media_payload=None,
+        entities=None, media_payload=None, reply_to: int | None = None,
     ):
         """Sends the post from the BOT so buttons can be attached.
 
@@ -1751,6 +2052,13 @@ class ForwardingEngine:
         """
         if self.bot is None:
             return None
+        # Reply Sync: allow_sending_without_reply means a parent deleted at the
+        # destination never blocks the post — it simply arrives unlinked.
+        reply_kwargs = {}
+        if reply_to:
+            reply_kwargs["reply_parameters"] = ReplyParameters(
+                message_id=int(reply_to), allow_sending_without_reply=True,
+            )
         try:
             bot_entities = self._to_bot_entities(entities)
 
@@ -1783,6 +2091,7 @@ class ForwardingEngine:
                     caption_entities=bot_entities if caption else None,
                     parse_mode=None if (bot_entities and caption) else "HTML",
                     reply_markup=markup,
+                    **reply_kwargs,
                 )
                 upload = BufferedInputFile(data, filename=filename)
                 if kind == "photo":
@@ -1802,6 +2111,7 @@ class ForwardingEngine:
                 entities=bot_entities,
                 parse_mode=None if bot_entities else "HTML",
                 reply_markup=markup,
+                **reply_kwargs,
             )
         except Exception as exc:
             logger.debug("Bot send with buttons failed for %s: %s", chat_id, exc)
