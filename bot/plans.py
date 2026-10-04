@@ -131,6 +131,8 @@ F_VIP_SUPPORT           = "vip_support"
 F_FAST_DELIVERY         = "fast_delivery"
 F_BULK_DELETE           = "bulk_delete"           # wipe a chat's history
 F_INLINE_BUTTONS        = "inline_buttons"        # 2 buttons under every post
+F_REPLY_SYNC            = "reply_sync"            # keep source reply links
+F_BULK_TRANSFER         = "bulk_transfer"         # one-time history copy
 
 
 # ==========================================
@@ -152,6 +154,7 @@ _BASIC_ADDS: set[str] = {
 
 _SILVER_ADDS: set[str] = {
     F_INLINE_BUTTONS,
+    F_REPLY_SYNC,
     F_HEADER,
     F_FOOTER,
     F_LINK_PREVIEW,
@@ -169,6 +172,7 @@ _SILVER_ADDS: set[str] = {
 
 _GOLD_ADDS: set[str] = {
     F_BULK_DELETE,
+    F_BULK_TRANSFER,
     F_AUTO_DELETE,
     F_POST_EDIT_SYNC,
     F_TRIM_WORDS,
@@ -252,7 +256,8 @@ FEATURE_LABELS: list[tuple[str, str | None]] = [
     ("No BOT Watermark",                F_NO_WATERMARK),
 
     ("Set Inline Buttons",              F_INLINE_BUTTONS),
-    ("Mono Text ON/OFF",                F_MONO_TEXT),
+    ("Reply Sync ON/OFF",               F_REPLY_SYNC),
+    ("Code Filter ON/OFF",              F_MONO_TEXT),
     ("Blacklist Keywords",              F_BLACKLIST),
     ("Whitelist Keywords",              F_WHITELIST),
     ("Replace Usernames",               F_REPLACE_USERNAMES),
@@ -267,6 +272,7 @@ FEATURE_LABELS: list[tuple[str, str | None]] = [
     ("Super Fast Message Delivery",     F_FAST_DELIVERY),
 
     ("Bulk Delete Messages",            F_BULK_DELETE),
+    ("Bulk Transfer Messages",          F_BULK_TRANSFER),
     ("Topics Forwarding",               F_TOPICS),
     ("Delay Timer Per Target",          F_DELAY_TIMER),
     ("Post Edit Sync ON/OFF",           F_POST_EDIT_SYNC),
@@ -364,10 +370,9 @@ FEATURE_PRIORITY = [
     "Custom Header/Footer Per Target",
     "Advanced Text Replacement",
     "Advanced Link Replacement",
-    # 🚀 Gold and above
+    # 🟡 Gold and above
     "Bulk Delete Messages",
     "Bulk Transfer Messages",
-    "Set Inline Buttons",
     "Topics Forwarding",
     "Delay Timer Per Target",
     "Post Edit Sync ON/OFF",
@@ -375,9 +380,10 @@ FEATURE_PRIORITY = [
     "Trim Single Words/Lines",
     "Replace Links",
     "Instant VIP Support",
-    "Header & Footer Control",
-    # ⚡ Silver and above
-    "Mono Text ON/OFF",
+    # ⚪ Silver and above
+    "Set Inline Buttons",
+    "Reply Sync ON/OFF",
+    "Code Filter ON/OFF",
     "Blacklist Keywords",
     "Whitelist Keywords",
     "Replace Usernames",
@@ -408,6 +414,9 @@ TIER_WEIGHT = {"platinum": 0, "gold": 1, "silver": 2, "basic": 3}
 # removed.
 FEATURE_RENAMES = {
     "attach_custom_file": "replace_file",
+    # The settings screen has always called this "Code Filter"; the feature
+    # list said "Mono Text", so the same feature had two names.
+    "mono_text_on_off": "code_filter_on_off",
 }
 
 
