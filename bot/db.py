@@ -1644,6 +1644,22 @@ class Database:
                 now, cutoff, days,
             )
 
+    async def get_users_expiring_within(self, days: int) -> list[asyncpg.Record]:
+        """Paid users expiring within `days`, with the last warning stage sent.
+        The caller picks ONE stage per user — see send_expiry_reminders."""
+        if self.pool is None: return []
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT telegram_user_id, plan, preferred_language, plan_expiry,
+                          COALESCE(expiry_reminder_stage, 0) AS expiry_reminder_stage
+                   FROM users
+                   WHERE plan != 'free' AND plan_expiry IS NOT NULL
+                     AND plan_expiry > $1 AND plan_expiry <= $2
+                   ORDER BY plan_expiry ASC""",
+                now, now + timedelta(days=days),
+            )
+
     async def mark_expiry_reminder_sent(self, user_id: int, stage: int) -> bool:
         """Records that the `stage`-day warning has gone out.
 
