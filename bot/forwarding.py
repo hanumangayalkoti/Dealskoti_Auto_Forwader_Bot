@@ -704,6 +704,9 @@ class ForwardingEngine:
         # (task_id, source_raw, source_msg_id, dest_raw) -> Event a waiting
         # reply sleeps on; set the moment that parent copy lands.
         self._reply_waiters: dict[tuple[int, int, int, int], asyncio.Event] = {}
+        # (task_id, source_raw, source_msg_id) delivered while Reply Sync was
+        # OFF — so a later reply can be told the real reason it is unlinked.
+        self._reply_unmapped: OrderedDict = OrderedDict()
 
     def _remember_send(self, chat_id: int, message_id: int) -> None:
         raw = raw_peer_id(chat_id)
@@ -1418,6 +1421,27 @@ class ForwardingEngine:
                 return None
         return int(parent)
 
+    def _note_unmapped(self, task_id: int, source_raw: int, message_id: int) -> None:
+        key = (task_id, source_raw, message_id)
+        self._reply_unmapped[key] = True
+        self._reply_unmapped.move_to_end(key)
+        while len(self._reply_unmapped) > REPLY_DONE_MAX:
+            self._reply_unmapped.popitem(last=False)
+
+    def _reply_miss_reason(self, user_id: int, task_id: int, source_raw: int, parent_id: int) -> str:
+        """Why a reply could not be linked, as precisely as the bot can know.
+
+        "old": the parent DID go out but was not recorded (Reply Sync was off
+        then), or the bot has no record at all (older than 14 days, or from
+        before the last restart). "skipped": the parent was processed just now
+        and never reached this channel (filter, limit, error).
+        """
+        if (task_id, source_raw, parent_id) in self._reply_unmapped:
+            return "old"
+        if (user_id, source_raw, parent_id) in self._reply_done:
+            return "skipped"
+        return "old"
+
     def _mark_arrival(self, event, user_id: int) -> tuple[int, int, int] | None:
         """Synchronous on purpose — it must run before the handler's first await."""
         try:
@@ -1539,7 +1563,7 @@ class ForwardingEngine:
     ALBUM_CAPTION_LIMIT = 1024
 
     async def _send_album_maybe_reply(self, client, dest_peer, reply_to, album, caption_msg,
-                                      files, text, entities):
+                                      files, text, entities, lost=None):
         """Sends the album with the caption on the SAME item as in the source.
 
         If the processed caption is too long for a media caption (headers and
@@ -1581,6 +1605,8 @@ class ForwardingEngine:
             if not (reply_to and _is_reply_target_error(exc)):
                 raise
             logger.info("Reply target %s is gone at the destination; album sent without the link", reply_to)
+            if lost is not None:
+                lost.append("deleted")
             sent = await send(None)
         if too_long and text:
             with suppress(Exception):
@@ -1590,7 +1616,7 @@ class ForwardingEngine:
                 )
         return sent
 
-    async def _send_maybe_reply(self, client, dest_peer, reply_to: int | None, **kwargs):
+    async def _send_maybe_reply(self, client, dest_peer, reply_to: int | None, *, lost=None, **kwargs):
         """client.send_message, as a reply when there is a target.
 
         If Telegram rejects the reply target (the parent copy was deleted in
@@ -1615,6 +1641,8 @@ class ForwardingEngine:
             if not _is_reply_target_error(exc):
                 raise
             logger.info("Reply target %s is gone at the destination; sending without the link", reply_to)
+            if lost is not None:
+                lost.append("deleted")
             if saved is not None:
                 fresh = io.BytesIO(saved[0])
                 if saved[1]:
@@ -1933,11 +1961,15 @@ class ForwardingEngine:
             results: list[tuple[int, object]] = []
             # dest_raw -> [(source item id, destination item id)] for albums
             album_pairs: dict[int, list[tuple[int, int]]] = {}
+            # (channel title, reason) for each copy whose reply could not be linked
+            reply_misses: list[tuple[str, str]] = []
 
             async def _deliver(dest: dict):
                 """Sends one copy. Returns (dest_raw, sent_msg) or None."""
                 new_text, parse_mode, entities = "", None, None
                 reply_target = None
+                miss_reason = None
+                link_lost: list[str] = []
                 if dest.get("id") is None:
                     return None
                 dest_raw = raw_peer_id(dest.get("id"))
@@ -2003,12 +2035,16 @@ class ForwardingEngine:
                                 user_id, int(task["id"]), source_raw, reply_parent,
                                 dest_raw, int(message.id),
                             )
+                            if reply_target is None:
+                                miss_reason = self._reply_miss_reason(
+                                    user_id, int(task["id"]), source_raw, reply_parent,
+                                )
 
                         sent_msg = None
                         if album_files is not None:
                             sent_msg = await self._send_album_maybe_reply(
                                 client, dest_peer, reply_target, album, message,
-                                album_files, new_text, entities,
+                                album_files, new_text, entities, lost=link_lost,
                             )
                         if button_markup:
                             bot_chat_id = self._bot_api_chat_id(dest_raw, dest)
@@ -2042,7 +2078,7 @@ class ForwardingEngine:
                                 )
                         if sent_msg is None:
                             sent_msg = await self._send_maybe_reply(
-                                client, dest_peer, reply_target,
+                                client, dest_peer, reply_target, lost=link_lost,
                                 message=new_text,
                                 file=payload,
                                 link_preview=link_preview,
@@ -2082,7 +2118,7 @@ class ForwardingEngine:
                         elif album_files is not None:
                             sent_msg = await self._send_album_maybe_reply(
                                 client, dest_peer, reply_target, album, message,
-                                album_files, new_text, entities,
+                                album_files, new_text, entities, lost=link_lost,
                             )
                         else:
                             retry_payload = media_file
@@ -2090,7 +2126,7 @@ class ForwardingEngine:
                                 retry_payload = io.BytesIO(media_file.getvalue())
                                 retry_payload.name = getattr(media_file, "name", "photo.jpg")
                             sent_msg = await self._send_maybe_reply(
-                                client, dest_peer, reply_target,
+                                client, dest_peer, reply_target, lost=link_lost,
                                 message=new_text,
                                 file=retry_payload,
                                 link_preview=link_preview,
@@ -2165,6 +2201,13 @@ class ForwardingEngine:
                 if sent_id is None:
                     return None
                 self._remember_send(dest_raw, sent_id)
+                if link_lost:
+                    miss_reason = "deleted"
+                if not reply_sync:
+                    for src_id in ([s for s, _d in album_pairs.get(dest_raw, [])] or [int(message.id)]):
+                        self._note_unmapped(int(task["id"]), source_raw, src_id)
+                if reply_sync and miss_reason:
+                    reply_misses.append((str(dest.get("title") or dest.get("username") or dest_raw), miss_reason))
                 if reply_sync and not album_pairs.get(dest_raw):
                     self._note_reply_map(
                         int(task["id"]), source_raw, int(message.id), dest_raw, sent_id,
@@ -2226,6 +2269,19 @@ class ForwardingEngine:
                 # three per destination.
                 await self.db.increment_usage_bulk(user_id, int(task["id"]), len(results))
                 usage += len(results)
+
+                if reply_sync and reply_misses:
+                    # Reply Sync is ON but some copies went out unlinked. Say
+                    # which channels, which message, and exactly why.
+                    reasons = [reason for _title, reason in reply_misses]
+                    reason = max(set(reasons), key=reasons.count)
+                    channels = ", ".join(dict.fromkeys(title for title, _r in reply_misses))
+                    await self._warn_once(
+                        user_id, f"replymiss:{task['id']}", f"notify_reply_miss_{reason}",
+                        hours=24, task=str(task["task_name"]),
+                        channels=html_lib.escape(channels[:200]),
+                        snippet=safe_snippet(message.message or ""),
+                    )
 
                 if not reply_sync and self._reply_parent_id(message, source_raw):
                     # In the source this was a reply; here it went out as a
