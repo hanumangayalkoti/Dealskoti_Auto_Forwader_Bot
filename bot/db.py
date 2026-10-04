@@ -1236,6 +1236,28 @@ class Database:
                 max(0, offset), max(1, limit),
             )
 
+    async def count_paid_users(self) -> int:
+        """Users on a paid plan that has not expired."""
+        if self.pool is None: return 0
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval(
+                """SELECT COUNT(*) FROM users
+                   WHERE plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry > NOW()"""
+            ) or 0)
+
+    async def list_paid_users_page(self, offset: int = 0, limit: int = 10) -> list[asyncpg.Record]:
+        """One page of paid members, soonest-expiring first — the ones that
+        most need a renewal nudge sit at the top."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT * FROM users
+                   WHERE plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry > NOW()
+                   ORDER BY plan_expiry ASC
+                   OFFSET $1 LIMIT $2""",
+                max(0, offset), max(1, limit),
+            )
+
     async def list_all_tasks_page(self, offset: int = 0, limit: int = 10) -> list[asyncpg.Record]:
         """One page of EVERY user's tasks, newest first — the /usertasks view."""
         if self.pool is None: return []
