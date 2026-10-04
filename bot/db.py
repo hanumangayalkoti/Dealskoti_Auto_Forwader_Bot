@@ -251,6 +251,16 @@ CREATE TABLE IF NOT EXISTS pending_deletes (
 CREATE INDEX IF NOT EXISTS idx_pending_deletes_due
     ON pending_deletes (delete_at);
 
+CREATE TABLE IF NOT EXISTS user_notices (
+    -- When each warning was last sent to each user. Kept in the database so a
+    -- deploy does not reset the "at most once every N hours" rule and send
+    -- the same warning again; that turned helpful notices into spam.
+    user_id BIGINT NOT NULL,
+    tag TEXT NOT NULL,
+    sent_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, tag)
+);
+
 CREATE TABLE IF NOT EXISTS engine_lease (
     name TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -798,6 +808,20 @@ class Database:
         except Exception as exc:
             logger.warning("Could not read reply map: %s", exc)
             return None
+
+    async def claim_notice(self, user_id: int, tag: str, hours: float) -> bool:
+        """True if this warning may be sent now (and records that it was).
+        Atomic, so two parallel messages can never both send it."""
+        if self.pool is None: return True
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval(
+                """INSERT INTO user_notices (user_id, tag, sent_at) VALUES ($1, $2, NOW())
+                   ON CONFLICT (user_id, tag) DO UPDATE SET sent_at = NOW()
+                       WHERE user_notices.sent_at < NOW() - make_interval(secs => $3)
+                   RETURNING 1""",
+                user_id, tag[:200], float(hours) * 3600,
+            )
+        return bool(row)
 
     async def add_pending_delete(self, user_id: int, dest_ref: dict, dest_message_id: int,
                                  bot_chat_id: int | None, delay_seconds: int) -> int | None:
