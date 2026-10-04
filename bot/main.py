@@ -7278,9 +7278,14 @@ async def _run(settings: Settings) -> None:
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
     db = Database(settings.database_url)
     await db.connect()
-    # Load any feature that is not in the database yet. Existing rows — and so
-    # every name and link the admin has set — are never touched.
-    with suppress(Exception):
+    startup_clock = asyncio.get_running_loop().time
+
+    def _since(started: float) -> str:
+        return f"{startup_clock() - started:.1f}s"
+
+    async def _sync_feature_catalogue() -> None:
+        """Load any feature that is not in the database yet. Existing rows —
+        and so every name and link the admin has set — are never touched."""
         feature_rows = seed_feature_rows()
         added = await db.seed_features(feature_rows)
         if added:
@@ -7334,32 +7339,54 @@ async def _run(settings: Settings) -> None:
     dispatcher.include_router(bulk_delete_router)
     dispatcher.include_router(router)
 
+    # The web server (and so /health) starts FIRST. Railway gives a new deploy
+    # 30 seconds to answer /health, and everything below used to run before
+    # the server existed: one slow Telegram or database call was enough to
+    # fail the healthcheck, keep the old version live and retry the new one up
+    # to 10 times — with no log line saying which step was slow.
+    api = build_app(bot, db, settings, billing, forwarding)
+    server = uvicorn.Server(uvicorn.Config(
+        api, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info",
+    ))
+    server_task = asyncio.create_task(server.serve())
+    logger.info("Startup: web server task started")
+
+    # Every remaining chore is optional for running the bot, so each one is
+    # time-boxed and logged rather than allowed to block (or crash) startup.
+    async def _startup_step(label: str, coro, timeout: float) -> None:
+        started = startup_clock()
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+            logger.info("Startup: %s done in %s", label, _since(started))
+        except asyncio.TimeoutError:
+            logger.warning("Startup: %s TIMED OUT after %s — skipped", label, _since(started))
+        except Exception as exc:
+            logger.warning("Startup: %s failed after %s: %s", label, _since(started), exc)
+
+    async def _set_commands() -> None:
+        await bot.set_my_commands(_bot_commands())
+        for admin_id in settings.admin_telegram_ids:
+            with suppress(Exception):
+                await bot.set_my_commands(
+                    _bot_commands() + _admin_bot_commands(),
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+
     # SAFETY: clear any stale webhook so polling cannot conflict after a restart.
     # drop_pending_updates is deliberately FALSE: every deploy restarts the bot,
     # and dropping the queue silently threw away whatever users sent during
     # that window — including referral /start payloads, which only ever arrive
     # once.
-    with suppress(Exception):
-        await bot.delete_webhook(drop_pending_updates=False)
-
-    await bot.set_my_commands(_bot_commands())
-    for admin_id in settings.admin_telegram_ids:
-        with suppress(Exception):
-            await bot.set_my_commands(
-                _bot_commands() + _admin_bot_commands(),
-                scope=BotCommandScopeChat(chat_id=admin_id),
-            )
-
-    api = build_app(bot, db, settings, billing, forwarding)
-    server = uvicorn.Server(uvicorn.Config(
-        api, host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info",
-    ))
+    await _startup_step(
+        "delete webhook", bot.delete_webhook(drop_pending_updates=False), 15,
+    )
+    await _startup_step("feature catalogue", _sync_feature_catalogue(), 20)
+    await _startup_step("bot commands", _set_commands(), 20)
 
     dispatcher_task = asyncio.create_task(dispatcher.start_polling(
         bot, db=db, settings=settings, telethon=telethon,
         billing=billing, forwarding=forwarding,
     ))
-    server_task = asyncio.create_task(server.serve())
     membership_task = asyncio.create_task(_membership_monitor(bot, db, settings, forwarding))
 
     try:
