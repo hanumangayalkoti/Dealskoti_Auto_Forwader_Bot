@@ -7500,14 +7500,93 @@ async def _run(settings: Settings) -> None:
     scheduler.add_job(prune_fsm, CronTrigger(hour=4, minute=50, timezone=scheduler_tz), replace_existing=True)
     scheduler.start()
 
+    # ---- ENGINE LEASE: one server runs the Telegram sessions, never two ----
+    # A deploy briefly runs the old and new server together. If both logged
+    # into the same accounts, Telegram would revoke those sessions and the
+    # customers would have to /connect again. The new server therefore waits
+    # here until the old one has released (or stopped renewing) the lease.
+    lease_name = "telethon"
+    lease_holder = f"{os.getenv('RAILWAY_DEPLOYMENT_ID', 'local')[:12]}-{os.getpid()}-{os.urandom(3).hex()}"
+    lease_ttl = 30          # an unrenewed lease frees itself after this
+    lease_renew_every = 10
+    first_run_grace = 45    # the very first time, the old server has no lease to release
+
+    async def _acquire_engine_lease() -> None:
+        try:
+            first_run = not await db.lease_exists(lease_name)
+        except Exception:
+            first_run = False
+        if first_run:
+            # The server being replaced predates the lease, so it cannot hand
+            # one over. Give Railway time to stop it before logging in.
+            logger.warning(
+                "Startup: first run with the session lock — waiting %ss for the old server to stop",
+                first_run_grace,
+            )
+            await asyncio.sleep(first_run_grace)
+        announced = False
+        while True:
+            try:
+                if await db.try_acquire_lease(lease_name, lease_holder, lease_ttl):
+                    break
+            except Exception as exc:
+                logger.warning("Startup: session lock check failed, retrying: %s", exc)
+            if not announced:
+                logger.info("Startup: waiting for the previous server to release the Telegram sessions…")
+                announced = True
+            await asyncio.sleep(3)
+        logger.info("Startup: session lock acquired — connecting Telegram accounts")
+
+    async def _keep_engine_lease() -> None:
+        """Renews the lease. If it cannot be renewed in time, this server
+        disconnects every account FIRST, so two servers can never overlap."""
+        clock = asyncio.get_running_loop().time
+        last_ok = clock()
+        while True:
+            await asyncio.sleep(lease_renew_every)
+            try:
+                if await db.renew_lease(lease_name, lease_holder, lease_ttl):
+                    last_ok = clock()
+                    continue
+                logger.error("Session lock taken by another server — disconnecting Telegram accounts here")
+            except Exception as exc:
+                if clock() - last_ok < lease_ttl - 5:
+                    logger.warning("Session lock renew failed, will retry: %s", exc)
+                    continue
+                logger.error("Session lock could not be renewed in time — disconnecting Telegram accounts")
+            with suppress(Exception):
+                await forwarding.stop()
+            return
+
     forwarding_task = None
     try:
         async def run_forwarding_engine():
-            await forwarding.start()
-            await forwarding.run_until_stopped()
+            await _acquire_engine_lease()
+            lease_task = asyncio.create_task(_keep_engine_lease())
+            try:
+                await forwarding.start()
+                await forwarding.run_until_stopped()
+            finally:
+                lease_task.cancel()
 
         forwarding_task = asyncio.create_task(run_forwarding_engine())
-        await asyncio.gather(dispatcher_task, server_task, forwarding_task)
+        # Shut the WHOLE server down as soon as polling or the web server ends.
+        # On a deploy Railway sends SIGTERM; aiogram reacts by stopping polling.
+        # gather() then kept waiting on the other tasks, so the old server went
+        # on forwarding with every customer's session while the new server
+        # started — two IPs on one session, which is exactly what makes
+        # Telegram revoke it. Now SIGTERM leads straight to the finally block:
+        # accounts are disconnected, the lease is released, the process exits.
+        running = {dispatcher_task, server_task, forwarding_task}
+        while running:
+            done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                if not finished.cancelled() and finished.exception() is not None:
+                    raise finished.exception()
+            if dispatcher_task in done or server_task in done:
+                break
+            # Only the forwarding engine ended (it disconnects itself if it ever
+            # loses the session lock) — the bot itself keeps running.
     finally:
         server.should_exit = True
         dispatcher_task.cancel()
@@ -7516,6 +7595,9 @@ async def _run(settings: Settings) -> None:
         if forwarding_task is not None:
             forwarding_task.cancel()
         await forwarding.stop()
+        # Accounts are disconnected above, so the next server may start now
+        # instead of waiting for the lease to expire.
+        await db.release_lease(lease_name, lease_holder)
         await telethon.cancel_all_logins()
         with suppress(asyncio.CancelledError):
             await dispatcher_task
@@ -7524,6 +7606,11 @@ async def _run(settings: Settings) -> None:
         if forwarding_task is not None:
             with suppress(asyncio.CancelledError):
                 await forwarding_task
+        # Let the web server finish its own shutdown (should_exit is set above)
+        # instead of being cancelled mid-way, which printed a scary but harmless
+        # "ERROR: Traceback ... CancelledError" on every deploy.
+        with suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(server_task, timeout=5)
         await db.close()
         await bot.session.close()
 
