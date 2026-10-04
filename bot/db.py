@@ -202,6 +202,28 @@ CREATE INDEX IF NOT EXISTS idx_sent_messages_lookup
 CREATE INDEX IF NOT EXISTS idx_sent_messages_age
     ON sent_messages (created_at);
 
+-- ===== REPLY SYNC MAP =====
+-- Which destination message each source message became, PER TASK and PER
+-- DESTINATION, so a reply in the source can be sent as a reply to the right
+-- copy in every destination (100 -> 500 in channel A, 100 -> 800 in B).
+--
+-- Kept separate from sent_messages on purpose: that table is written only
+-- when edit sync is on, only after every destination is done, and is pruned
+-- at 3 days. This one is written per destination the moment a copy lands,
+-- only for tasks that turned Reply Sync on, and lives for two weeks.
+CREATE TABLE IF NOT EXISTS reply_map (
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    source_chat_id BIGINT NOT NULL,
+    source_message_id BIGINT NOT NULL,
+    dest_chat_id BIGINT NOT NULL,
+    dest_message_id BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (task_id, source_chat_id, source_message_id, dest_chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reply_map_age
+    ON reply_map (created_at);
+
 -- ===== REFERRAL PAYOUT ACCOUNTING =====
 -- How much of a referrer's lifetime commission has actually been paid out.
 --
@@ -701,6 +723,60 @@ class Database:
                    WHERE source_chat_id = $1 AND source_message_id = $2""",
                 source_chat_id, source_message_id,
             )
+
+    async def record_reply_map(self, task_id: int, source_chat_id: int, source_message_id: int,
+                               dest_chat_id: int, dest_message_id: int) -> None:
+        """Remembers where one source message landed in one destination.
+
+        An upsert, so re-sending the same message (a retry) simply points the
+        row at the newest copy. Never raises — a failed write only means a
+        later reply goes out without its reply link, never a lost message.
+        """
+        if self.pool is None: return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO reply_map
+                       (task_id, source_chat_id, source_message_id, dest_chat_id, dest_message_id)
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT (task_id, source_chat_id, source_message_id, dest_chat_id)
+                       DO UPDATE SET dest_message_id = EXCLUDED.dest_message_id,
+                                     created_at = CURRENT_TIMESTAMP""",
+                    task_id, source_chat_id, source_message_id, dest_chat_id, dest_message_id,
+                )
+        except Exception as exc:
+            logger.warning("Could not record reply map: %s", exc)
+
+    async def get_reply_dest(self, task_id: int, source_chat_id: int, source_message_id: int,
+                             dest_chat_id: int) -> int | None:
+        """The destination copy of a source message, for ONE task and ONE
+        destination — never a global lookup, so channels and users cannot
+        get each other's ids."""
+        if self.pool is None: return None
+        try:
+            async with self.pool.acquire() as conn:
+                value = await conn.fetchval(
+                    """SELECT dest_message_id FROM reply_map
+                       WHERE task_id = $1 AND source_chat_id = $2
+                         AND source_message_id = $3 AND dest_chat_id = $4""",
+                    task_id, source_chat_id, source_message_id, dest_chat_id,
+                )
+            return int(value) if value is not None else None
+        except Exception as exc:
+            logger.warning("Could not read reply map: %s", exc)
+            return None
+
+    async def prune_reply_map(self, older_than_days: int = 14) -> int:
+        """Two weeks covers real conversations; older replies just arrive as
+        plain messages. Keeps the table small."""
+        if self.pool is None: return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        async with self.pool.acquire() as conn:
+            res = await conn.execute("DELETE FROM reply_map WHERE created_at < $1", cutoff)
+        try:
+            return int(str(res).split()[-1])
+        except (ValueError, IndexError):
+            return 0
 
     async def prune_sent_map(self, older_than_days: int = 3) -> int:
         """Deletes old rows from the edit-sync map.
