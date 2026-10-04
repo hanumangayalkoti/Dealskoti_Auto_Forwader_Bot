@@ -224,6 +224,22 @@ CREATE TABLE IF NOT EXISTS reply_map (
 CREATE INDEX IF NOT EXISTS idx_reply_map_age
     ON reply_map (created_at);
 
+-- ===== ENGINE LEASE =====
+-- Only ONE server may run the customers' Telegram sessions at a time.
+--
+-- During a deploy Railway runs the old and the new server side by side for a
+-- while. Both logging into the same accounts from two different IPs makes
+-- Telegram revoke those sessions for good ("authorization key was used under
+-- two different IP addresses simultaneously") — customers then have to
+-- /connect again. The running server holds this lease and renews it every few
+-- seconds; a new server waits until the lease is released or has expired
+-- before it touches a single session.
+CREATE TABLE IF NOT EXISTS engine_lease (
+    name TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+
 -- ===== REFERRAL PAYOUT ACCOUNTING =====
 -- How much of a referrer's lifetime commission has actually been paid out.
 --
@@ -765,6 +781,53 @@ class Database:
         except Exception as exc:
             logger.warning("Could not read reply map: %s", exc)
             return None
+
+    async def lease_exists(self, name: str) -> bool:
+        """Has any server ever held this lease? False only on the very first run."""
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT 1 FROM engine_lease WHERE name = $1", name))
+
+    async def try_acquire_lease(self, name: str, holder: str, ttl_seconds: int) -> bool:
+        """Takes the lease if it is free, expired, or already ours. Atomic, so
+        two servers racing for it can never both win."""
+        if self.pool is None: return True
+        async with self.pool.acquire() as conn:
+            got = await conn.fetchval(
+                """INSERT INTO engine_lease (name, holder, expires_at)
+                   VALUES ($1, $2, NOW() + make_interval(secs => $3))
+                   ON CONFLICT (name) DO UPDATE
+                       SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+                       WHERE engine_lease.expires_at < NOW()
+                          OR engine_lease.holder = EXCLUDED.holder
+                   RETURNING holder""",
+                name, holder, float(ttl_seconds),
+            )
+        return got == holder
+
+    async def renew_lease(self, name: str, holder: str, ttl_seconds: int) -> bool:
+        """Extends OUR lease. False means another server owns it now."""
+        if self.pool is None: return True
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval(
+                """UPDATE engine_lease SET expires_at = NOW() + make_interval(secs => $3)
+                   WHERE name = $1 AND holder = $2 RETURNING 1""",
+                name, holder, float(ttl_seconds),
+            )
+        return bool(row)
+
+    async def release_lease(self, name: str, holder: str) -> None:
+        """Expires our lease at once so the next server can start without
+        waiting. The row is kept (not deleted): a missing row means "first run
+        ever", which deliberately waits longer."""
+        if self.pool is None: return
+        with suppress(Exception):
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE engine_lease SET expires_at = NOW() - INTERVAL '1 second'
+                       WHERE name = $1 AND holder = $2""",
+                    name, holder,
+                )
 
     async def prune_reply_map(self, older_than_days: int = 14) -> int:
         """Two weeks covers real conversations; older replies just arrive as
