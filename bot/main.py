@@ -5766,7 +5766,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🎁 Grant Days", callback_data="admin:grantpicker")],
         [InlineKeyboardButton(text="➖ Reduce Days", callback_data="admin:reducepicker"),
          InlineKeyboardButton(text="📋 All Tasks", callback_data="admin:tasks:0")],
-        [InlineKeyboardButton(text="📣 Broadcasts", callback_data="admin:broadcasts")],
+        [InlineKeyboardButton(text="📣 Broadcasts", callback_data="admin:broadcasts"),
+         InlineKeyboardButton(text="💎 Paid Members", callback_data="admin:paidlist")],
         [InlineKeyboardButton(text="💾 Backup Now", callback_data="admin:backup")],
         [InlineKeyboardButton(text="🏠 User Menu", callback_data="menu:home")],
     ])
@@ -6079,6 +6080,29 @@ async def admin_block_toggle(
     await callback.answer("Updated" if changed else "Not found", show_alert=True)
 
 
+@router.callback_query(F.data == "admin:paidlist")
+async def admin_paid_list_cb(callback: CallbackQuery, db: Database, settings: Settings) -> None:
+    """Every member on a paid plan, numbered and paged like the other pickers;
+    tapping a number opens that member's full info card."""
+    if not _is_admin(settings, callback.from_user.id):
+        return await callback.answer("Admin only", show_alert=True)
+    if callback.message is None:
+        return
+    await _render_user_picker(callback.message, db, "paid", ADMIN_PICKER_TITLES["paid"], 0)
+    await callback.answer()
+
+
+def _days_left_label(expiry) -> str:
+    if expiry is None:
+        return "no expiry"
+    seconds = (expiry - datetime.now(timezone.utc)).total_seconds()
+    if seconds <= 0:
+        return "expired"
+    if seconds < 86400:
+        return f"{max(1, math.ceil(seconds / 3600))}h left"
+    return f"{math.ceil(seconds / 86400)}d left"
+
+
 @router.callback_query(F.data == "admin:grantpicker")
 async def admin_grant_picker_cb(
     callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings,
@@ -6223,15 +6247,20 @@ async def _render_user_picker(
     message_obj, db: Database, action: str, title: str, page: int = 0,
     selected: list[int] | None = None,
 ) -> None:
-    total = await db.count_all_users()
+    paid_only = action == "paid"
+    total = await (db.count_paid_users() if paid_only else db.count_all_users())
     pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
-    users = await db.list_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
+    if paid_only:
+        users = await db.list_paid_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
+    else:
+        users = await db.list_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
     selected = selected or []
     multi = action in MULTI_SELECT_ACTIONS
 
     if not users:
-        text, markup = "No users found.", admin_keyboard()
+        text = "💎 No paid members right now." if paid_only else "No users found."
+        markup = admin_keyboard()
     else:
         lines = [title, ""]
         number_row: list[InlineKeyboardButton] = []
@@ -6243,7 +6272,12 @@ async def _render_user_picker(
             plan = str(u["plan"] or "free").title()
             flag = " ⛔" if u["is_blocked"] else ""
             tick = " ✅" if uid in selected else ""
-            lines.append(f"{number}. {label} — {plan}{flag}{tick}")
+            if paid_only:
+                # Who is paying, on what, and how long until they need to renew.
+                left = _days_left_label(u["plan_expiry"])
+                lines.append(f"{number}. {label} — {plan_label(str(u['plan']))} · {left}{flag}")
+            else:
+                lines.append(f"{number}. {label} — {plan}{flag}{tick}")
             number_row.append(InlineKeyboardButton(
                 text=f"✅{number}" if uid in selected else str(number),
                 callback_data=f"apick:{action}:{page}:{uid}",
@@ -6273,7 +6307,10 @@ async def _render_user_picker(
         rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
 
         lines.append("")
-        lines.append(f"Page {page + 1} of {pages} · {total} users total")
+        lines.append(
+            f"Page {page + 1} of {pages} · {total} paid members" if paid_only
+            else f"Page {page + 1} of {pages} · {total} users total"
+        )
         if multi:
             lines.append(f"✅ Selected: <b>{len(selected)}</b> — selection is kept while you page")
             lines.append("👆 Tap numbers to select, then tap Done")
@@ -6294,6 +6331,7 @@ ADMIN_PICKER_TITLES = {
     "uinfo": "👤 <b>User info — select a user</b>",
     "block": "⛔ <b>Block / unblock — select a user</b>",
     "payout": "💰 <b>Referral payout — select a user</b>",
+    "paid": "💎 <b>Paid members</b> — soonest expiry first",
 }
 
 # Actions where a number TOGGLES selection instead of acting at once, so
@@ -6353,7 +6391,7 @@ async def admin_picker_select_cb(
         )
         return await callback.answer(note)
 
-    if action == "uinfo":
+    if action in ("uinfo", "paid"):
         text, keyboard = await _full_user_info_card(db, user)
         await _safe_edit(callback.message, text, keyboard)
         return await callback.answer()
