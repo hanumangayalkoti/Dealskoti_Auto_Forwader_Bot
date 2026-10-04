@@ -234,6 +234,23 @@ CREATE INDEX IF NOT EXISTS idx_reply_map_age
 -- /connect again. The running server holds this lease and renews it every few
 -- seconds; a new server waits until the lease is released or has expired
 -- before it touches a single session.
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    -- Auto Delete jobs, kept in the database so a restart, a deploy or a
+    -- reconnect (any task edit reconnects the user's client) can no longer
+    -- silently cancel them. They used to live only as in-memory timers.
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    dest_ref JSONB NOT NULL,
+    dest_message_id BIGINT NOT NULL,
+    bot_chat_id BIGINT,
+    delete_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_deletes_due
+    ON pending_deletes (delete_at);
+
 CREATE TABLE IF NOT EXISTS engine_lease (
     name TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -781,6 +798,62 @@ class Database:
         except Exception as exc:
             logger.warning("Could not read reply map: %s", exc)
             return None
+
+    async def add_pending_delete(self, user_id: int, dest_ref: dict, dest_message_id: int,
+                                 bot_chat_id: int | None, delay_seconds: int) -> int | None:
+        if self.pool is None: return None
+        try:
+            async with self.pool.acquire() as conn:
+                return await conn.fetchval(
+                    """INSERT INTO pending_deletes
+                       (user_id, dest_ref, dest_message_id, bot_chat_id, delete_at)
+                       VALUES ($1, $2::jsonb, $3, $4, NOW() + make_interval(secs => $5))
+                       RETURNING id""",
+                    user_id, json.dumps(dest_ref, default=str), dest_message_id,
+                    bot_chat_id, float(delay_seconds),
+                )
+        except Exception as exc:
+            logger.warning("Could not record auto-delete: %s", exc)
+            return None
+
+    async def due_pending_deletes(self, grace_seconds: int = 5, limit: int = 200) -> list[asyncpg.Record]:
+        """Jobs whose time has come. The short grace lets the precise in-memory
+        timer (used for short delays) act first, so nothing is deleted twice."""
+        if self.pool is None: return []
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """SELECT id, user_id, dest_ref, dest_message_id, bot_chat_id, attempts, delete_at
+                   FROM pending_deletes
+                   WHERE delete_at < NOW() - make_interval(secs => $1)
+                   ORDER BY delete_at LIMIT $2""",
+                float(grace_seconds), limit,
+            )
+
+    async def finish_pending_delete(self, job_id: int) -> None:
+        if self.pool is None or job_id is None: return
+        with suppress(Exception):
+            async with self.pool.acquire() as conn:
+                await conn.execute("DELETE FROM pending_deletes WHERE id = $1", job_id)
+
+    async def retry_pending_delete(self, job_id: int, attempts: int) -> None:
+        """Backs off a job that could not run yet (e.g. the user is
+        disconnected): 1, 4, 9 ... minutes, capped at an hour. Jobs more than
+        two days of failing are dropped — Telegram may refuse old deletes anyway."""
+        if self.pool is None: return
+        with suppress(Exception):
+            async with self.pool.acquire() as conn:
+                # ~50 attempts with this backoff is roughly two days.
+                await conn.execute(
+                    "DELETE FROM pending_deletes WHERE id = $1 AND attempts >= 50",
+                    job_id,
+                )
+                await conn.execute(
+                    """UPDATE pending_deletes
+                       SET attempts = attempts + 1,
+                           delete_at = NOW() + make_interval(secs => $2)
+                       WHERE id = $1""",
+                    job_id, float(min(3600, 60 * (attempts + 1) ** 2)),
+                )
 
     async def lease_exists(self, name: str) -> bool:
         """Has any server ever held this lease? False only on the very first run."""
