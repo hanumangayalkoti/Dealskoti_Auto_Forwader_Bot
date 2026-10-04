@@ -142,6 +142,24 @@ REPLY_CACHE_MAX = 50_000
 REPLY_DONE_MAX = 20_000
 
 
+class _EventShim:
+    """One album item presented like a single-message event. (`types` in this
+    module is Telethon's TL types, so Python's SimpleNamespace is not used.)"""
+
+    def __init__(self, message, album_event):
+        self.message = message
+        self.chat_id = album_event.chat_id
+        self.get_chat = album_event.get_chat
+        self.get_input_chat = album_event.get_input_chat
+
+
+def safe_snippet(text: str, limit: int = 60) -> str:
+    """First words of a message, HTML-escaped, for warnings that name it."""
+    flat = " ".join((text or "").split())
+    short = flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+    return html_lib.escape(short or "(media)")
+
+
 def _sent_message_id(sent_msg) -> int | None:
     """The id of a message we just sent, whoever sent it.
 
@@ -802,6 +820,12 @@ class ForwardingEngine:
             client.add_event_handler(
                 lambda event: self._on_new_message(event, user_id),
                 events.NewMessage()
+            )
+            # Albums arrive as several messages sharing one grouped_id; this
+            # event hands them over together so they can go out together.
+            client.add_event_handler(
+                lambda event: self._on_album(event, user_id),
+                events.Album()
             )
             client.add_event_handler(
                 lambda event: self._on_message_edited(event, user_id),
@@ -1512,6 +1536,60 @@ class ForwardingEngine:
             logger.debug("Reply target lookup failed for %s: %s", key, exc)
             return None
 
+    ALBUM_CAPTION_LIMIT = 1024
+
+    async def _send_album_maybe_reply(self, client, dest_peer, reply_to, album, caption_msg,
+                                      files, text, entities):
+        """Sends the album with the caption on the SAME item as in the source.
+
+        If the processed caption is too long for a media caption (headers and
+        footers can push it over), the album goes out first and the full text
+        right after it, rather than being cut off. A reply target that no
+        longer exists is retried without it, like single posts.
+        """
+        index = next((i for i, m in enumerate(album) if m.id == caption_msg.id), 0)
+        too_long = len(text or "") > self.ALBUM_CAPTION_LIMIT
+
+        def payload():
+            clones = []
+            for item in files:
+                if isinstance(item, io.BytesIO):
+                    fresh = io.BytesIO(item.getvalue())
+                    fresh.name = getattr(item, "name", None) or "photo.jpg"
+                    clones.append(fresh)
+                else:
+                    clones.append(item)
+            captions = [""] * len(files)
+            ents: list[list] = [[] for _ in files]
+            if text and not too_long:
+                captions[index] = text
+                ents[index] = list(entities or [])
+            return clones, captions, ents
+
+        async def send(target):
+            clones, captions, ents = payload()
+            return await client.send_file(
+                dest_peer, clones, caption=captions, formatting_entities=ents,
+                reply_to=target or None,
+            )
+
+        try:
+            sent = await send(reply_to)
+        except errors.FloodWaitError:
+            raise
+        except Exception as exc:
+            if not (reply_to and _is_reply_target_error(exc)):
+                raise
+            logger.info("Reply target %s is gone at the destination; album sent without the link", reply_to)
+            sent = await send(None)
+        if too_long and text:
+            with suppress(Exception):
+                await client.send_message(
+                    dest_peer, message=text, formatting_entities=entities or None,
+                    link_preview=False,
+                )
+        return sent
+
     async def _send_maybe_reply(self, client, dest_peer, reply_to: int | None, **kwargs):
         """client.send_message, as a reply when there is a target.
 
@@ -1555,13 +1633,45 @@ class ForwardingEngine:
         """
         if not self._might_be_source(user_id, event.chat_id):
             return
+        if getattr(event.message, "grouped_id", None):
+            return  # part of an album: _on_album sends the whole album at once
         arrival = self._mark_arrival(event, user_id)
         try:
             await self._handle_new_message(event, user_id)
         finally:
             self._finish_arrival(arrival)
 
-    async def _handle_new_message(self, event: events.NewMessage.Event, user_id: int) -> None:
+    async def _on_album(self, event, user_id: int) -> None:
+        """An album (several photos/videos posted together) as ONE post.
+
+        Before this, every item was forwarded as its own post with the
+        caption on only one of them; a whitelist dropped the caption-less
+        items, a blacklist let them through, and the daily limit counted each.
+        If the album path ever fails, the items are forwarded one by one the
+        old way, so nothing is lost.
+        """
+        if not self._might_be_source(user_id, event.chat_id):
+            return
+        items = sorted(getattr(event, "messages", None) or [], key=lambda m: int(m.id))
+        if not items:
+            return
+        arrivals = [
+            self._mark_arrival(_EventShim(m, event), user_id)
+            for m in items
+        ]
+        try:
+            await self._handle_new_message(event, user_id, album=items)
+        except Exception:
+            logger.exception("Album path failed for user %s — forwarding items one by one", user_id)
+            for item in items:
+                single = _EventShim(item, event)
+                with suppress(Exception):
+                    await self._handle_new_message(single, user_id)
+        finally:
+            for marker in arrivals:
+                self._finish_arrival(marker)
+
+    async def _handle_new_message(self, event: events.NewMessage.Event, user_id: int, album=None) -> None:
         # Read the plan BEFORE queueing so a paying user never waits in the
         # free lane just to find out which lane they belong in.
         plan_name = "free"
@@ -1584,17 +1694,27 @@ class ForwardingEngine:
                 # The user row is passed straight through: reading it again
                 # inside meant two identical database round-trips for every
                 # single incoming message.
-                await self._process_new_message(event, user_id, user)
+                await self._process_new_message(event, user_id, user, album=album)
             except Exception:
+                if album is not None:
+                    raise  # _on_album falls back to sending the items one by one
                 # A crash here would be swallowed by Telethon with a stack trace
                 # nobody reads. Log it loudly with context instead.
                 logger.exception("Unhandled error while forwarding for user %s", user_id)
 
     async def _process_new_message(
-        self, event: events.NewMessage.Event, user_id: int, user=None,
+        self, event: events.NewMessage.Event, user_id: int, user=None, album=None,
     ) -> None:
-        """Triggered when the user's account receives a new message in any chat."""
-        message: Message = event.message
+        """Triggered when the user's account receives a new message in any chat.
+
+        With `album` (the items, oldest first) the whole album is handled as
+        one post: filters run on its caption, it counts once, and it is sent
+        as an album. `message` is then the item carrying the caption.
+        """
+        if album:
+            message: Message = next((m for m in album if (m.message or "").strip()), album[0])
+        else:
+            message = event.message
         source_raw = raw_peer_id(event.chat_id)
         if source_raw is None:
             return
@@ -1713,8 +1833,16 @@ class ForwardingEngine:
                         )
             # With the code filter on the user wants the code only, so media is
             # deliberately dropped rather than sent alongside it.
+            # Albums go out as albums unless the Code Filter is on (then only
+            # the code text is wanted, exactly as for a single post).
+            album_files = None
+            if album and not mono_on:
+                album_files = [await self._prepare_media(client, m, settings, plan_name) for m in album]
+                if any(f is None for f in album_files):
+                    album_files = None  # an item that cannot be re-sent: one by one
+                    raise RuntimeError("album item is not sendable media")
             media_file = (
-                None if mono_on
+                None if (mono_on or album_files is not None)
                 else await self._prepare_media(client, message, settings, plan_name)
             )
 
@@ -1744,14 +1872,22 @@ class ForwardingEngine:
             reply_sync = clean_copy and self._reply_sync_on(settings, plan_name)
             reply_parent = self._reply_parent_id(message, source_raw) if reply_sync else None
 
-            # Inline Buttons (Gold+), configured PER TASK — one channel may
-            # want "Join Channel" while another wants "Buy Now".
+            # Inline Buttons, configured PER TASK — one channel may want
+            # "Join Channel" while another wants "Buy Now".
             button_markup = None
             if plan_has(plan_name, F_INLINE_BUTTONS):
                 with suppress(Exception):
                     button_markup = self._button_markup(
                         self._json_field(settings.get("inline_buttons"), {})
                     )
+            if album_files is not None and button_markup is not None:
+                # Telegram allows no buttons on albums. Say so once, rather
+                # than leave the user wondering where their buttons went.
+                button_markup = None
+                await self._warn_once(
+                    user_id, f"albumbtn:{task['id']}", "notify_album_no_buttons",
+                    hours=72, task=str(task["task_name"]),
+                )
 
             # Buttons on media need the actual bytes: the Bot API rejects a
             # file_id that came from a user account. The watermark step already
@@ -1779,6 +1915,8 @@ class ForwardingEngine:
                         buffer.name = _media_filename(message, is_photo)
                         buffer.seek(0)
                         media_file = buffer
+            if album_files is not None:
+                replacement_file = None  # one file cannot stand in for a whole album
             if replacement_file is not None and not clean_copy:
                 # A native forward carries the ORIGINAL file and cannot swap it.
                 replacement_file = None
@@ -1793,6 +1931,8 @@ class ForwardingEngine:
 
             edit_rows: list[tuple] = []
             results: list[tuple[int, object]] = []
+            # dest_raw -> [(source item id, destination item id)] for albums
+            album_pairs: dict[int, list[tuple[int, int]]] = {}
 
             async def _deliver(dest: dict):
                 """Sends one copy. Returns (dest_raw, sent_msg) or None."""
@@ -1812,7 +1952,9 @@ class ForwardingEngine:
                         forward_kwargs = {}
                         if source_entity is not None:
                             forward_kwargs["from_peer"] = source_entity
-                        sent_msg = await client.forward_messages(dest_peer, message, **forward_kwargs)
+                        sent_msg = await client.forward_messages(
+                            dest_peer, album or message, **forward_kwargs,
+                        )
                     else:
                         # Entities come back with the text, so this
                         # destination's formatting can never be mixed up with
@@ -1820,7 +1962,7 @@ class ForwardingEngine:
                         new_text, parse_mode, entities = self.build_text(
                             message, message.message or "", settings, plan_name, dest_raw
                         )
-                        if not new_text and media_file is None:
+                        if not new_text and media_file is None and album_files is None:
                             return None  # nothing to send (e.g. service message)
 
                         payload = media_file
@@ -1863,6 +2005,11 @@ class ForwardingEngine:
                             )
 
                         sent_msg = None
+                        if album_files is not None:
+                            sent_msg = await self._send_album_maybe_reply(
+                                client, dest_peer, reply_target, album, message,
+                                album_files, new_text, entities,
+                            )
                         if button_markup:
                             bot_chat_id = self._bot_api_chat_id(dest_raw, dest)
                             if bot_chat_id and await self._bot_can_post(bot_chat_id):
@@ -1930,7 +2077,12 @@ class ForwardingEngine:
                             if source_entity is not None:
                                 forward_kwargs["from_peer"] = source_entity
                             sent_msg = await client.forward_messages(
-                                dest_peer, message, **forward_kwargs,
+                                dest_peer, album or message, **forward_kwargs,
+                            )
+                        elif album_files is not None:
+                            sent_msg = await self._send_album_maybe_reply(
+                                client, dest_peer, reply_target, album, message,
+                                album_files, new_text, entities,
                             )
                         else:
                             retry_payload = media_file
@@ -1990,6 +2142,19 @@ class ForwardingEngine:
                         )
                     return None
 
+                if album and isinstance(sent_msg, list) and sent_msg:
+                    pairs = [
+                        (int(src.id), int(dst.id))
+                        for src, dst in zip(album, sent_msg)
+                        if getattr(dst, "id", None) is not None
+                    ]
+                    album_pairs[dest_raw] = pairs
+                    for src_id, dst_id in pairs:
+                        self._remember_send(dest_raw, dst_id)
+                        if reply_sync:
+                            # Each item maps to its own copy, so a reply to ANY
+                            # photo of the album finds the right one.
+                            self._note_reply_map(int(task["id"]), source_raw, src_id, dest_raw, dst_id)
                 if isinstance(sent_msg, list):
                     sent_msg = sent_msg[0] if sent_msg else None
                 if not sent_msg:
@@ -2000,7 +2165,7 @@ class ForwardingEngine:
                 if sent_id is None:
                     return None
                 self._remember_send(dest_raw, sent_id)
-                if reply_sync:
+                if reply_sync and not album_pairs.get(dest_raw):
                     self._note_reply_map(
                         int(task["id"]), source_raw, int(message.id), dest_raw, sent_id,
                     )
@@ -2021,10 +2186,11 @@ class ForwardingEngine:
                         # bot, which is an admin there; everything else by the
                         # user's account.
                         bot_sent = getattr(sent_msg, "id", None) is None
-                        asyncio.create_task(self._schedule_auto_delete(
-                            user_id, dest, sent_id, auto_delete_secs,
-                            self._bot_api_chat_id(dest_raw, dest) if bot_sent else None,
-                        ))
+                        for delete_id in ([d for _s, d in album_pairs.get(dest_raw, [])] or [sent_id]):
+                            asyncio.create_task(self._schedule_auto_delete(
+                                user_id, dest, delete_id, auto_delete_secs,
+                                self._bot_api_chat_id(dest_raw, dest) if bot_sent else None,
+                            ))
 
                 asyncio.create_task(self._maybe_react(
                     client, settings, plan_name, "destination", dest_peer, sent_id
@@ -2061,13 +2227,36 @@ class ForwardingEngine:
                 await self.db.increment_usage_bulk(user_id, int(task["id"]), len(results))
                 usage += len(results)
 
+                if not reply_sync and self._reply_parent_id(message, source_raw):
+                    # In the source this was a reply; here it went out as a
+                    # plain post. Explain why, once every few days per task.
+                    snippet = safe_snippet(message.message or "")
+                    if clean_copy and plan_has(plan_name, F_REPLY_SYNC):
+                        await self._warn_once(
+                            user_id, f"replyhint:{task['id']}", "notify_reply_sync_off",
+                            hours=72, task=str(task["task_name"]), snippet=snippet,
+                        )
+                    else:
+                        await self._warn_once(
+                            user_id, f"replyhint:{task['id']}", "notify_reply_sync_upgrade",
+                            hours=72, task=str(task["task_name"]), snippet=snippet,
+                            plan=str(PLANS.get(plan_name, PLANS["free"]).name),
+                        )
+
                 if self._edit_sync_enabled(settings, plan_name):
-                    edit_rows = [
-                        (int(task["id"]), user_id, source_raw, int(message.id),
-                         int(dest_raw), _sent_message_id(sent_msg))
-                        for dest_raw, sent_msg in results
-                        if _sent_message_id(sent_msg) is not None
-                    ]
+                    edit_rows = []
+                    for dest_raw, sent_msg in results:
+                        pairs = album_pairs.get(dest_raw)
+                        if pairs:
+                            # Every album item gets its own row, so an edit to
+                            # any item's caption reaches its own copy.
+                            edit_rows += [
+                                (int(task["id"]), user_id, source_raw, src_id, int(dest_raw), dst_id)
+                                for src_id, dst_id in pairs
+                            ]
+                        elif _sent_message_id(sent_msg) is not None:
+                            edit_rows.append((int(task["id"]), user_id, source_raw, int(message.id),
+                                              int(dest_raw), _sent_message_id(sent_msg)))
                     await self.db.record_sent_messages(edit_rows)
 
                 # Auto Reaction on the source message — once per task
@@ -2354,6 +2543,13 @@ class ForwardingEngine:
         if last is not None and now - last < hours * 3600:
             return
         self._notice_sent[marker] = now
+        # The database remembers across deploys. Memory alone forgot on every
+        # restart, so the same warning could arrive again after each deploy.
+        try:
+            if not await self.db.claim_notice(user_id, tag, hours):
+                return
+        except Exception:
+            pass  # database unavailable: memory-only, as before
         await self._warn_user(user_id, key, **kwargs)
 
     async def _warn_user(self, user_id: int, key: str, **kwargs) -> None:
@@ -3002,5 +3198,18 @@ class ForwardingEngine:
             )
             if done:
                 await self.db.finish_pending_delete(int(job["id"]))
-            else:
-                await self.db.retry_pending_delete(int(job["id"]), int(job["attempts"] or 0))
+                continue
+            attempts = int(job["attempts"] or 0)
+            await self.db.retry_pending_delete(int(job["id"]), attempts)
+            if attempts >= 2 and int(job["user_id"]) in self.clients:
+                # Connected, yet three tries failed: a permission problem the
+                # user can fix — not something to retry silently for two days.
+                ref = job["dest_ref"]
+                if isinstance(ref, str):
+                    with suppress(Exception):
+                        ref = json.loads(ref)
+                title = (ref.get("title") or ref.get("username") or ref.get("id")) if isinstance(ref, dict) else "?"
+                await self._warn_once(
+                    int(job["user_id"]), f"autodel:{(ref or {}).get('id') if isinstance(ref, dict) else '?'}",
+                    "notify_auto_delete_failed", hours=24, dest=str(title),
+                )
