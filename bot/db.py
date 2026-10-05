@@ -22,6 +22,14 @@ import asyncpg
 
 from .plans import PLANS, referral_commission_paise
 
+# Daily limits reset at midnight India time, not UTC midnight (05:30 IST).
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _usage_today():
+    """The calendar day a usage counter belongs to, in IST."""
+    return datetime.now(IST).date()
+
 logger = logging.getLogger("dealskoti.db")
 
 PLAN_RANKS = {
@@ -615,7 +623,7 @@ class Database:
 
     async def daily_usage(self, user_id: int) -> int:
         if self.pool is None: return 0
-        today = datetime.now(timezone.utc).date()
+        today = _usage_today()
         async with self.pool.acquire() as conn:
             val = await conn.fetchval("SELECT message_count FROM usage_daily WHERE user_id = $1 AND usage_date = $2", user_id, today)
             return val or 0
@@ -629,7 +637,7 @@ class Database:
         """
         if self.pool is None: return
         now = datetime.now(timezone.utc)
-        today = now.date()
+        today = _usage_today()
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO usage_daily (user_id, usage_date, message_count)
@@ -647,23 +655,30 @@ class Database:
                     now, task_id,
                 )
 
-    async def increment_usage_bulk(self, user_id: int, task_id: int | None, count: int) -> None:
+    async def increment_usage_bulk(
+        self, user_id: int, task_id: int | None, count: int, quota: int | None = None,
+    ) -> None:
         """Records `count` successful forwards in ONE round-trip.
 
         The per-message version issued three statements for every destination —
         with 50 targets that was 150 database round-trips for a single incoming
         post, and it dominated the forwarding time.
+
+        `quota` is what is charged against the daily limit (defaults to
+        `count`). The task's forward_count always records every copy.
         """
         if self.pool is None or count <= 0: return
+        if quota is None:
+            quota = count
         now = datetime.now(timezone.utc)
-        today = now.date()
+        today = _usage_today()
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO usage_daily (user_id, usage_date, message_count)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (user_id, usage_date)
                 DO UPDATE SET message_count = usage_daily.message_count + $3
-            """, user_id, today, count)
+            """, user_id, today, quota)
             await conn.execute(
                 "UPDATE users SET last_forward_at = $1 WHERE telegram_user_id = $2", now, user_id,
             )
@@ -694,8 +709,8 @@ class Database:
         """Everything the /stats screen needs, in one round-trip."""
         if self.pool is None:
             return {"today": 0, "month": 0, "total": 0, "last_forward_at": None}
-        now = datetime.now(timezone.utc)
-        month_start = now.date().replace(day=1)
+        today = _usage_today()
+        month_start = today.replace(day=1)
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT
@@ -703,7 +718,7 @@ class Database:
                      COALESCE(SUM(CASE WHEN usage_date >= $3 THEN message_count END), 0) AS month,
                      COALESCE(SUM(message_count), 0) AS total
                    FROM usage_daily WHERE user_id = $1""",
-                user_id, now.date(), month_start,
+                user_id, today, month_start,
             )
             last = await conn.fetchval(
                 "SELECT last_forward_at FROM users WHERE telegram_user_id = $1", user_id,
@@ -719,7 +734,7 @@ class Database:
         """True at most once per day, so hitting the cap on message 501 through
         5000 does not produce 4500 notifications."""
         if self.pool is None: return False
-        today = datetime.now(timezone.utc).date()
+        today = _usage_today()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """UPDATE users SET limit_notice_date = $1

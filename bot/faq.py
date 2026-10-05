@@ -50,7 +50,7 @@ FAQS: dict[str, list[FAQItem]] = {
         ),
         FAQItem(
             "How do the daily message limits work?",
-            "Daily limits: Free 50 messages, Basic 100, Silver 500, Gold 2,000, Platinum unlimited. The limit is for ALL your tasks together, not per task — and every copy counts, so one post sent to 5 channels uses 5. An album counts as 1 per channel. The counter resets at 5:30 AM IST every day. You are warned at 80%, told once when you hit the limit, and forwarding resumes by itself after the reset.",
+            "Daily limits: Free 50 messages, Basic 100, Silver 500, Gold 2,000, Platinum unlimited. The limit is for ALL your tasks together, not per task. One post counts as 1 however many channels it goes to, and an album counts as 1 too. The counter resets at midnight (12:00 AM IST) every day. You are warned at 80%, told once when you hit the limit, and forwarding resumes by itself after the reset.",
         ),
         FAQItem(
             "How do I pay, and how fast does my plan activate?",
@@ -74,7 +74,7 @@ FAQS: dict[str, list[FAQItem]] = {
         ),
         FAQItem(
             "One post goes to 5 of my channels — how many messages is that?",
-            "Five. Every copy delivered to a channel counts once. So on Silver (500 a day), posting to 5 channels gives you about 100 posts a day. If you need more, use fewer destinations per task or move to a higher plan. Albums count as 1 per channel, however many photos they have.",
+            "One. A post counts once per task, however many channels it is delivered to. So on Silver (500 a day) you can forward 500 posts a day, even to 5 channels each. Albums also count as 1, however many photos they have. If the same source is used in two tasks, each task counts its own copy.",
         ),
         FAQItem(
             "What is Reply Sync?",
@@ -132,7 +132,7 @@ FAQS: dict[str, list[FAQItem]] = {
         ),
         FAQItem(
             "Daily message limit kaise kaam karti hai?",
-            "Roz ki limit: Free 50 messages, Basic 100, Silver 500, Gold 2,000, Platinum unlimited. Ye limit aapke SAARE tasks milake hai, har task ki alag nahi — aur har copy ginti hoti hai, yani ek post 5 channels me gayi to 5 gini jaayengi. Album har channel me 1 ginta hai. Counter roz subah 5:30 baje (IST) reset hota hai. 80% pe pehle chetavni milti hai, limit poori hone pe ek baar suchna aati hai, aur reset ke baad forwarding apne aap chalu ho jaati hai.",
+            "Roz ki limit: Free 50 messages, Basic 100, Silver 500, Gold 2,000, Platinum unlimited. Ye limit aapke SAARE tasks milake hai, har task ki alag nahi. Ek post kitne bhi channels me jaaye, 1 hi gini jaati hai, aur album bhi 1 ginta hai. Counter roz raat 12 baje (IST) reset hota hai. 80% pe pehle chetavni milti hai, limit poori hone pe ek baar suchna aati hai, aur reset ke baad forwarding apne aap chalu ho jaati hai.",
         ),
         FAQItem(
             "Payment kaise karein, plan kitni jaldi activate hota hai?",
@@ -156,7 +156,7 @@ FAQS: dict[str, list[FAQItem]] = {
         ),
         FAQItem(
             "Ek post mere 5 channels me jaati hai — kitne messages gine jaayenge?",
-            "Paanch. Har channel me gayi har copy ek baar ginti hai. To Silver (roz 500) par 5 channels me bhejne se lagbhag 100 posts roz ban paati hain. Zyada chahiye to task me destinations kam rakhiye ya upar ka plan lijiye. Album me kitni bhi photos hon, har channel me 1 ginta hai.",
+            "Ek. Post kitne bhi channels me jaaye, har task me 1 hi gini jaati hai. To Silver (roz 500) par aap roz 500 posts forward kar sakte hain, chahe har post 5 channels me jaaye. Album me kitni bhi photos hon, 1 hi ginta hai. Agar same source do tasks me hai, to har task apni copy alag ginta hai.",
         ),
         FAQItem(
             "Reply Sync kya hai?",

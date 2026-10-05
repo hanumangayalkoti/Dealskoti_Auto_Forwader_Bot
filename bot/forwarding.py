@@ -9,7 +9,8 @@ NON-NEGOTIABLE RULES (do not "optimise" these away in a rewrite):
      `if plan == "platinum"` in this file — a tier change must only ever
      require editing plans.py.
   2. Usage is incremented only AFTER a send succeeds. A failed send must
-     never consume the user's daily quota.
+     never consume the user's daily quota. One post counts once per task,
+     however many destinations it reaches.
   3. Every message this engine sends is registered with _remember_send() so
      an A->B / B->A task pair cannot ping-pong forever.
   4. Cosmetic extras (reactions, stored-file attachment, edit-sync bookkeeping)
@@ -1949,13 +1950,10 @@ class ForwardingEngine:
                 # A native forward carries the ORIGINAL file and cannot swap it.
                 replacement_file = None
 
-            # Daily cap is applied UP FRONT so the parallel path can never
-            # overshoot it mid-flight.
-            if plan.daily_messages:
-                remaining = max(0, plan.daily_messages - usage)
-                if remaining <= 0:
-                    continue
-                destinations = destinations[:remaining]
+            # The daily limit counts source posts, not copies: one post sent
+            # to every destination of this task uses ONE message of quota, so
+            # the fan-out is never trimmed here (the cap check above already
+            # stopped the post if the quota was used up).
 
             edit_rows: list[tuple] = []
             results: list[tuple[int, object]] = []
@@ -2267,8 +2265,10 @@ class ForwardingEngine:
             if sent_any:
                 # One database round-trip for the whole fan-out instead of
                 # three per destination.
-                await self.db.increment_usage_bulk(user_id, int(task["id"]), len(results))
-                usage += len(results)
+                await self.db.increment_usage_bulk(
+                    user_id, int(task["id"]), len(results), quota=1,
+                )
+                usage += 1
 
                 if reply_sync and reply_misses:
                     # Reply Sync is ON but some copies went out unlinked. Say
