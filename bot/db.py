@@ -1704,7 +1704,8 @@ class Database:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 expired = await conn.fetch(
-                    """SELECT telegram_user_id, scheduled_plan, scheduled_days, preferred_language
+                    # `plan` is the plan that just ENDED — the message needs it.
+                    """SELECT telegram_user_id, plan, scheduled_plan, scheduled_days, preferred_language
                        FROM users
                        WHERE plan != 'free' AND plan_expiry < $1 FOR UPDATE""",
                     now,
