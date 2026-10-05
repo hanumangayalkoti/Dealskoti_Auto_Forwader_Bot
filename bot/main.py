@@ -7496,15 +7496,22 @@ async def _run(settings: Settings) -> None:
 
     async def downgrade_expired_plans():
         for row in await db.downgrade_expired_users():
-            with suppress(Exception):
-                await bot.send_message(
-                    int(row["telegram_user_id"]),
-                    safe_t(
-                        language_for(row["preferred_language"]), "expiry_done",
-                        plan=plan_label(str(row["scheduled_plan"] or "free")),
-                    ),
-                    parse_mode="HTML",
+            # Name the plan that ENDED. This used to pass the NEW plan, so a
+            # Silver user was told "Your Free plan has expired".
+            language = language_for(row["preferred_language"])
+            ended = plan_label(str(row["plan"] or "free"))
+            if row["scheduled_plan"] and row["scheduled_days"]:
+                # A downgrade they had already booked takes over — they are
+                # NOT on Free, so the Free-plan message would be wrong.
+                text = safe_t(
+                    language, "expiry_switched", plan=ended,
+                    new_plan=plan_label(str(row["scheduled_plan"])),
+                    days=int(row["scheduled_days"]),
                 )
+            else:
+                text = safe_t(language, "expiry_done", plan=ended)
+            with suppress(Exception):
+                await bot.send_message(int(row["telegram_user_id"]), text, parse_mode="HTML")
             with suppress(Exception):
                 await forwarding.refresh_user(int(row["telegram_user_id"]))
 
