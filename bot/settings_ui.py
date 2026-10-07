@@ -65,6 +65,7 @@ from .plans import (
     F_INLINE_BUTTONS,
     F_LINK_PREVIEW,
     F_MONO_TEXT,
+    F_NO_WATERMARK,
     F_PER_TARGET_HF,
     F_POST_EDIT_SYNC,
     F_REPLY_SYNC,
