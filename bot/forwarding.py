@@ -1453,6 +1453,15 @@ class ForwardingEngine:
             return "skipped"
         return "old"
 
+    def _seen_before(self, message, chat_id, user_id: int) -> bool:
+        """Telegram kabhi-kabhi wahi message dobara deliver karta hai (reconnect
+        ke baad). Wo dobara forward hota aur daily count mein 2 baar judta."""
+        try:
+            key = (user_id, raw_peer_id(chat_id), int(message.id))
+        except Exception:
+            return False
+        return key in self._reply_inflight or key in self._reply_done
+
     def _mark_arrival(self, event, user_id: int) -> tuple[int, int, int] | None:
         """Synchronous on purpose — it must run before the handler's first await."""
         try:
@@ -1674,6 +1683,10 @@ class ForwardingEngine:
             return
         if getattr(event.message, "grouped_id", None):
             return  # part of an album: _on_album sends the whole album at once
+        if self._seen_before(event.message, event.chat_id, user_id):
+            logger.info("Duplicate delivery of %s/%s for user %s — skipped",
+                        event.chat_id, getattr(event.message, "id", "?"), user_id)
+            return
         arrival = self._mark_arrival(event, user_id)
         try:
             await self._handle_new_message(event, user_id)
@@ -1693,6 +1706,9 @@ class ForwardingEngine:
             return
         items = sorted(getattr(event, "messages", None) or [], key=lambda m: int(m.id))
         if not items:
+            return
+        if all(self._seen_before(m, event.chat_id, user_id) for m in items):
+            logger.info("Duplicate album delivery in %s for user %s — skipped", event.chat_id, user_id)
             return
         arrivals = [
             self._mark_arrival(_EventShim(m, event), user_id)
@@ -1796,6 +1812,9 @@ class ForwardingEngine:
 
         # One usage read per incoming message instead of one per task.
         usage = await self.db.daily_usage(user_id)
+        # Ek source post = 1 count, chahe kitne bhi tasks/destinations mein jaye.
+        # Pehle har task alag count karta tha: same source wale 2 tasks = 2 count.
+        charged = False
 
         for task in tasks:
             if task["is_paused"]:
@@ -1819,7 +1838,7 @@ class ForwardingEngine:
                 continue
 
             # --- LIMITS ---
-            if plan.daily_messages and usage >= plan.daily_messages:
+            if plan.daily_messages and usage >= plan.daily_messages and not charged:
                 # Tell the user ONCE per day. Previously this skipped silently,
                 # which looks identical to the bot being broken.
                 if await self.db.should_send_limit_notice(user_id):
@@ -2283,10 +2302,12 @@ class ForwardingEngine:
             if sent_any:
                 # One database round-trip for the whole fan-out instead of
                 # three per destination.
+                quota = 0 if charged else 1
                 await self.db.increment_usage_bulk(
-                    user_id, int(task["id"]), len(results), quota=1,
+                    user_id, int(task["id"]), len(results), quota=quota,
                 )
-                usage += 1
+                usage += quota
+                charged = True
 
                 if reply_sync and reply_misses:
                     # Reply Sync is ON but some copies went out unlinked. Say
