@@ -354,6 +354,7 @@ TRANSLATIONS = {
 
         # ---------- SETTINGS: TEXT CLEANUP ----------
         "link_preview_prompt": "🔗 <b>Link Preview</b>\n\nWhen ON, forwarded messages show the website preview card below the link.\nWhen OFF, only the plain text is sent.",
+        "media_forward_prompt": "🖼️ <b>Media Forwarding</b>\n\nWhen ON, photos, videos, files and albums are forwarded as usual.\nWhen OFF, only the text goes out: a post with media sends just its caption, and media without any caption is skipped (it does not use your daily limit).",
         "remove_usernames_prompt": "🙈 <b>Remove Usernames</b>\n\nWhen ON, every <code>@handle</code> is stripped out of the forwarded text.\n\n💡 If you want to swap a handle for your own instead of deleting it, use <b>Replace Usernames</b>.",
         "remove_links_prompt": "🚫 <b>Remove Links</b>\n\nWhen ON, every URL is stripped out of the forwarded text.\n\n💡 If you want to swap a link for your own instead of deleting it, use <b>Replace Links</b>.",
         "mono_text_prompt": "🎁 <b>Code Filter</b>\n\nForwards ONLY the gift/coupon code from a post and drops everything else.\n\nChannels hide codes in two different formats, so pick the one your source uses:\n\n🔠 <b>Monospace only</b> — code-style text, tap to copy\n🫥 <b>Spoiler only</b> — hidden text with shimmering dots, tap to reveal\n🔠+🫥 <b>Both</b> — catches either one\n\n⚠️ Posts with no code are <b>skipped completely</b>, and media is not forwarded. Your header and footer are still added.",
@@ -721,6 +722,7 @@ TRANSLATIONS = {
 
         # ---------- SETTINGS: TEXT CLEANUP ----------
         "link_preview_prompt": "🔗 <b>Link Preview</b>\n\nON hone par forwarded message me link ke neeche website ka preview card dikhega.\nOFF hone par sirf plain text jayega.",
+        "media_forward_prompt": "🖼️ <b>Media Forwarding</b>\n\nON hone par photo, video, file aur album normal forward honge.\nOFF hone par sirf text jayega: media wali post ka sirf caption jayega, aur bina caption wali media skip hogi (daily limit bhi nahi kategi).",
         "remove_usernames_prompt": "🙈 <b>Remove Usernames</b>\n\nON hone par har <code>@handle</code> forwarded text se hata diya jayega.\n\n💡 Agar handle hatane ki jagah apna handle lagana hai to <b>Replace Usernames</b> use karo.",
         "remove_links_prompt": "🚫 <b>Remove Links</b>\n\nON hone par har URL forwarded text se hata diya jayega.\n\n💡 Agar link hatane ki jagah apna link lagana hai to <b>Replace Links</b> use karo.",
         "mono_text_prompt": "🎁 <b>Code Filter</b>\n\nPost me se sirf gift/coupon code forward hoga, baaki sab hat jayega.\n\nChannels code do alag formats me chhupate hain, apne source wala chuno:\n\n🔠 <b>Monospace only</b> — code jaisa text, tap se copy\n🫥 <b>Spoiler only</b> — chhupa hua text, chamakte dots wala, tap se reveal\n🔠+🫥 <b>Both</b> — dono me se koi bhi ho to chalega\n\n⚠️ Jis post me code nahi hoga wo <b>poora skip</b> ho jayega, aur media forward nahi hoga. Aapka header aur footer phir bhi lagega.",

@@ -1386,6 +1386,16 @@ class ForwardingEngine:
             return True
         return raw_peer_id(chat_id) in sources
 
+    @staticmethod
+    def _media_on(settings: dict, plan_name: str) -> bool:
+        """Media Forwarding toggle. Free plan native forward karta hai (photo hata
+        nahi sakta) — wahan hamesha ON, bilkul pehle jaisa. Paid: task ki setting,
+        default ON."""
+        if not plan_has(plan_name, F_NO_WATERMARK):
+            return True
+        value = settings.get("media_forward")
+        return True if value is None else bool(value)
+
     def _reply_sync_on(self, settings: dict, plan_name: str) -> bool:
         """Silver and above, and only when the task has it switched on."""
         return plan_has(plan_name, F_REPLY_SYNC) and bool(settings.get("reply_sync"))
@@ -1837,6 +1847,12 @@ class ForwardingEngine:
             if mono_on and not self.code_body(message, code_mode):
                 continue
 
+            # Media Forwarding (per task, paid plans). OFF → sirf text jaata hai:
+            # photo / video / file / album hata ke caption. Bina caption wali
+            # media post skip (kuch nahi jaata, quota nahi katta). Free plan
+            # native forward karta hai, wahan ye kabhi lagu nahi hota.
+            media_on = self._media_on(settings, plan_name)
+
             # Replace File: swap the source's document for the user's own when
             # the extensions match.
             #
@@ -1864,14 +1880,16 @@ class ForwardingEngine:
             # deliberately dropped rather than sent alongside it.
             # Albums go out as albums unless the Code Filter is on (then only
             # the code text is wanted, exactly as for a single post).
+            if not media_on:
+                replacement_file = None  # media OFF: koi file nahi, user ki bhi nahi
             album_files = None
-            if album and not mono_on:
+            if album and not mono_on and media_on:
                 album_files = [await self._prepare_media(client, m, settings, plan_name) for m in album]
                 if any(f is None for f in album_files):
                     album_files = None  # an item that cannot be re-sent: one by one
                     raise RuntimeError("album item is not sendable media")
             media_file = (
-                None if (mono_on or album_files is not None)
+                None if (mono_on or album_files is not None or not media_on)
                 else await self._prepare_media(client, message, settings, plan_name)
             )
 
@@ -2757,23 +2775,40 @@ class ForwardingEngine:
                 markup = self._button_markup(self._json_field(settings.get("inline_buttons"), {}))
         bot_entities = self._to_bot_entities(entities)
         media = getattr(message, "media", None)
+        # Copy media ke saath gayi thi ya sirf text? Media OFF / Code Filter mein
+        # source pe photo hone par bhi copy TEXT hoti hai — tab caption edit fail
+        # hota tha aur edit chupchap reh jaata tha.
+        copy_has_media = (
+            media is not None and not isinstance(media, MessageMediaWebPage)
+            and self._media_on(settings, plan_name) and not self.mono_enabled(settings, plan_name)
+        )
+
+        async def as_caption():
+            await self.bot.edit_message_caption(
+                chat_id=chat_id, message_id=message_id, caption=text,
+                caption_entities=bot_entities or None,
+                parse_mode=None if bot_entities else "HTML",
+                reply_markup=markup,
+            )
+
+        async def as_text():
+            await self.bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id,
+                entities=bot_entities or None,
+                parse_mode=None if bot_entities else "HTML",
+                reply_markup=markup,
+            )
+
+        first, second = (as_caption, as_text) if copy_has_media else (as_text, as_caption)
         try:
-            if media is not None and not isinstance(media, MessageMediaWebPage):
-                await self.bot.edit_message_caption(
-                    chat_id=chat_id, message_id=message_id, caption=text,
-                    caption_entities=bot_entities or None,
-                    parse_mode=None if bot_entities else "HTML",
-                    reply_markup=markup,
-                )
-            else:
-                await self.bot.edit_message_text(
-                    text=text, chat_id=chat_id, message_id=message_id,
-                    entities=bot_entities or None,
-                    parse_mode=None if bot_entities else "HTML",
-                    reply_markup=markup,
-                )
+            await first()
         except Exception as exc:
-            logger.debug("Bot edit sync skipped for %s in %s: %s", message_id, dest_raw, exc)
+            if "not modified" in str(exc).lower():
+                return
+            try:
+                await second()          # andaaza galat tha (purani copy) — doosra tareeka
+            except Exception as exc2:
+                logger.debug("Bot edit sync skipped for %s in %s: %s / %s", message_id, dest_raw, exc, exc2)
 
     async def _maybe_react(
         self, client: TelegramClient, settings: dict, plan_name: str,

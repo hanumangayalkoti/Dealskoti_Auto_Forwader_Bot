@@ -253,6 +253,9 @@ _spec("replace_links", "🔗 Replace Links", CAT_REPLACE, "map", F_REPLACE_LINKS
       "replace_links_prompt", {})
 
 # --- Media & watermark ---
+# Free plan native forward karta hai (photo hata nahi sakta) — isliye Basic se.
+_spec("media_forward", "🖼️ Media Forwarding", CAT_MEDIA, "toggle", F_NO_WATERMARK,
+      "media_forward_prompt", True)
 _spec("watermark", "💧 Image Watermark", CAT_MEDIA, "toggle", F_WATERMARK_IMAGE, None, False)
 _spec("watermark_text", "✏️ Watermark Text", CAT_MEDIA, "text", F_WATERMARK_IMAGE,
       "watermark_text_prompt", "")
