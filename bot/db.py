@@ -2000,9 +2000,12 @@ class Database:
                        SET plan = $1,
                            plan_expiry = CURRENT_TIMESTAMP + ($2 || ' days')::INTERVAL,
                            scheduled_plan = NULL, scheduled_days = NULL,
-                           expiry_reminder_stage = 0
+                           expiry_reminder_stage = $4
                        WHERE telegram_user_id = $3""",
                     plan, str(int(days)), user_id,
+                    # 5 din ya kam ka trial: "5 din bache" wala reminder trial shuru
+                    # hote hi na chala jaye — use bheja hua maano (3/2/1 din wale aayenge).
+                    5 if int(days) <= 5 else 0,
                 )
         return True
 

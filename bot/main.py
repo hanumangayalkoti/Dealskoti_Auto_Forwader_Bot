@@ -3852,7 +3852,7 @@ async def myfile_cb(callback: CallbackQuery, db: Database) -> None:
 
 
 # ==========================================
-# 7-DAY GOLD TRIAL
+# 5-DAY GOLD TRIAL
 # ==========================================
 # Gold, not Platinum, and deliberately so. Dropping from Platinum (unlimited
 # messages, watermark, 50 targets) straight to Free is a big enough fall that
@@ -3860,11 +3860,11 @@ async def myfile_cb(callback: CallbackQuery, db: Database) -> None:
 # hosting cost. From Gold, the paid tiers still look reachable.
 #
 # The trial starts when the account is CONNECTED, not when /start is pressed:
-# an unconnected user cannot forward anything, so their week would be spent
+# an unconnected user cannot forward anything, so their trial would be spent
 # before they could use it.
 
 TRIAL_PLAN = "gold"
-TRIAL_DAYS = 7
+TRIAL_DAYS = 5
 
 
 async def _trial_available(db: Database, user_id: int) -> bool:
@@ -3882,7 +3882,7 @@ async def _trial_available(db: Database, user_id: int) -> bool:
 
 
 def _trial_button() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="🎁 Try Gold FREE for 7 Days", callback_data="trial:offer", style=STYLE_GO)]
+    return [InlineKeyboardButton(text=f"🎁 Try Gold FREE for {TRIAL_DAYS} Days", callback_data="trial:offer", style=STYLE_GO)]
 
 
 @router.message(Command("trial"))
@@ -4011,7 +4011,7 @@ async def trial_start_cb(
 
     # Tell the admins. A trial is the moment a stranger becomes a real
     # prospect, so it is worth knowing about while it is still running —
-    # there are only 7 days to follow up in.
+    # there are only TRIAL_DAYS days to follow up in.
     total_users = await db.count_all_users()
     referred_by = ""
     with suppress(Exception):
@@ -4030,7 +4030,7 @@ async def trial_start_cb(
         f"📅 Joined: "
         f"{user['created_at'].astimezone(IST).strftime('%d %b %Y, %I:%M %p IST') if user and user['created_at'] else '—'}"
         f"{referred_by}\n\n"
-        f"Plan: <b>{plan_label(TRIAL_PLAN)}</b> (7-day trial)\n"
+        f"Plan: <b>{plan_label(TRIAL_PLAN)}</b> ({TRIAL_DAYS}-day trial)\n"
         f"⏳ Ends: <b>{expiry}</b>\n"
         f"🔌 Account connected: ✅\n"
         f"📋 Tasks: {len(await db.list_tasks(callback.from_user.id))}\n\n"
