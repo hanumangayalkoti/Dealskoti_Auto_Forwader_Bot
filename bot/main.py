@@ -1365,7 +1365,7 @@ async def _account_text(db: Database, user_id: int, user, language: str) -> str:
         name=_format_name(user),
         username=f"@{safe_html(user['username'])}" if user and user["username"] else "—",
         user_id=user_id,
-        plan=plan_label(str(user["plan"])) if user else "🆓 Free",
+        plan=_plan_text(user),
         plan_started=started,
         expiry=expiry,
         txn_id=safe_html(txn_id),
@@ -1522,7 +1522,7 @@ async def _finish_login_success(
         f"🆔 User ID: <code>{message.from_user.id}</code>\n"
         f"📱 Connected as: "
         f"{'@' + safe_html(tg_username_raw) if tg_username_raw else 'no username'}\n"
-        f"Plan: {safe_html(plan_label(str(user['plan'])) if user else '🆓 Free')}\n"
+        f"Plan: {safe_html(_plan_text(user))}\n"
         f"🕐 Connected: {_now_ist()}",
     )
     phone = str(account_info.get("phone") or "").strip()
@@ -2909,7 +2909,7 @@ async def _finish_destinations(
         f"👤 User: {_format_name(user)}\n"
         f"🔗 Username: {_handle(user)}\n"
         f"🆔 User ID: <code>{user_id}</code>\n"
-        f"Plan: {safe_html(plan_label(str(user['plan'])) if user else '🆓 Free')}\n\n"
+        f"Plan: {safe_html(_plan_text(user))}\n\n"
         f"📥 <b>Sources ({len(source_list)}):</b>\n{source_text}\n\n"
         f"📤 <b>Destinations ({len(destinations)}):</b>\n{destination_text}\n\n"
         f"▶️ Status: Active\n"
@@ -3865,6 +3865,29 @@ async def myfile_cb(callback: CallbackQuery, db: Database) -> None:
 
 TRIAL_PLAN = "gold"
 TRIAL_DAYS = 5
+
+
+def _on_trial(u) -> bool:
+    """User abhi free trial pe hai? (trial liya, plan wahi, aur expiry trial se
+    aage nahi badhi — pay ya admin grant hua to wo trial nahi maana jaata)."""
+    try:
+        claimed, exp, plan = u["trial_claimed_at"], u["plan_expiry"], str(u["plan"] or "")
+    except (KeyError, TypeError, IndexError):
+        return False
+    if not claimed or not exp or plan != TRIAL_PLAN:
+        return False
+    if exp <= datetime.now(timezone.utc):
+        return False
+    # Purane trial 7 din ke the, naye 5 din ke — dono pakdo
+    return exp <= claimed + timedelta(days=max(TRIAL_DAYS, 7), hours=12)
+
+
+def _plan_text(u) -> str:
+    """Plan ka naam; trial wale ke aage '🎁 Trial'."""
+    if not u:
+        return "🆓 Free"
+    label = plan_label(str(u["plan"] or "free"))
+    return f"{label} (🎁 Trial)" if _on_trial(u) else label
 
 
 async def _trial_available(db: Database, user_id: int) -> bool:
@@ -5937,7 +5960,7 @@ async def _full_user_info_card(db: Database, u) -> tuple[str, InlineKeyboardMark
         f"Membership: {'✅ Joined' if u['updates_channel_member'] else '❌ Not joined'}\n"
         f"Telegram account: {'✅ Connected' if connected else '❌ Not connected'}\n\n"
         f"💎 <b>Subscription</b>\n"
-        f"Plan: {safe_html(str(u['plan']).title())}\n"
+        f"Plan: {safe_html(str(u['plan']).title())}{' (🎁 Trial)' if _on_trial(u) else ''}\n"
         f"Plan expiry: {u['plan_expiry'] or '—'}\n"
         f"Scheduled plan: "
         f"{safe_html(str(u['scheduled_plan']).title()) if u['scheduled_plan'] else '—'}\n\n"
@@ -5962,7 +5985,7 @@ async def _recent_users_picker(message: Message, db: Database, action: str, titl
     for u in users:
         label = safe_html(u["first_name"] or u["username"] or str(u["telegram_user_id"]))
         rows.append([InlineKeyboardButton(
-            text=f"👤 {label} ({u['plan']})",
+            text=f"👤 {label} ({u['plan']}{' · Trial' if _on_trial(u) else ''})",
             callback_data=f"admin:{action}:{u['telegram_user_id']}",
         )])
     rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
@@ -5982,7 +6005,7 @@ async def _recent_users_picker_edit(
     for u in users:
         label = safe_html(u["first_name"] or u["username"] or str(u["telegram_user_id"]))
         rows.append([InlineKeyboardButton(
-            text=f"👤 {label} ({u['plan']})",
+            text=f"👤 {label} ({u['plan']}{' · Trial' if _on_trial(u) else ''})",
             callback_data=f"admin:{action}:{u['telegram_user_id']}",
         )])
     rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
@@ -6275,9 +6298,9 @@ async def _render_user_picker(
             if paid_only:
                 # Who is paying, on what, and how long until they need to renew.
                 left = _days_left_label(u["plan_expiry"])
-                lines.append(f"{number}. {label} — {plan_label(str(u['plan']))} · {left}{flag}")
+                lines.append(f"{number}. {label} — {_plan_text(u)} · {left}{flag}")
             else:
-                lines.append(f"{number}. {label} — {plan}{flag}{tick}")
+                lines.append(f"{number}. {label} — {plan}{' (🎁 Trial)' if _on_trial(u) else ''}{flag}{tick}")
             number_row.append(InlineKeyboardButton(
                 text=f"✅{number}" if uid in selected else str(number),
                 callback_data=f"apick:{action}:{page}:{uid}",
@@ -6509,7 +6532,7 @@ async def _selection_summary(db: Database, user_ids: list[int], cut_days: int = 
             left, expiry = 0, "—"
 
         lines.append(f"{i}. <b>{name}</b> ({handle})")
-        lines.append(f"     {plan_label(plan)} · {left} day{'s' if left != 1 else ''} left")
+        lines.append(f"     {_plan_text(u)} · {left} day{'s' if left != 1 else ''} left")
         lines.append(f"     📅 Expires: {expiry}")
 
         purchase = await db.last_purchase_info(uid)
@@ -6907,7 +6930,7 @@ async def admin_task_info_cb(callback: CallbackQuery, db: Database, settings: Se
         f"👤 User: {_format_name(owner)}\n"
         f"🔗 Username: {_handle(owner)}\n"
         f"🆔 User ID: <code>{task['user_id']}</code>\n"
-        f"Plan: {safe_html(plan_label(str(owner['plan'])) if owner else '🆓 Free')}\n\n"
+        f"Plan: {safe_html(_plan_text(owner))}\n\n"
         f"📥 <b>Sources ({len(sources)}):</b>\n{src_text}\n\n"
         f"📤 <b>Destinations ({len(dests)}):</b>\n{dst_text}\n\n"
         f"{status}\n"
