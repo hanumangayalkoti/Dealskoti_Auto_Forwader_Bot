@@ -1251,6 +1251,37 @@ class Database:
                 max(0, offset), max(1, limit),
             )
 
+    # Admin list ke filter — Sab / Paid / Trial / Free / Block. Trial = trial liya,
+    # plan abhi Gold, aur expiry trial ke din se aage nahi badhi (main._on_trial jaisa).
+    _TRIAL_SQL = ("(plan = 'gold' AND trial_claimed_at IS NOT NULL AND plan_expiry > NOW() "
+                  "AND plan_expiry <= trial_claimed_at + INTERVAL '7 days 12 hours')")
+    USER_SEGMENTS = {
+        "all": "TRUE",
+        "paid": ("plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry > NOW() "
+                 "AND NOT COALESCE(" + _TRIAL_SQL + ", FALSE)"),
+        "trial": _TRIAL_SQL,
+        "free": "(plan = 'free' OR plan_expiry IS NULL OR plan_expiry <= NOW())",
+        "blocked": "is_blocked = TRUE",
+    }
+
+    async def count_users_segment(self, segment: str) -> int:
+        if self.pool is None: return 0
+        where = self.USER_SEGMENTS.get(segment, "TRUE")
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval(f"SELECT COUNT(*) FROM users WHERE {where}") or 0)
+
+    async def list_users_segment_page(self, segment: str, offset: int = 0, limit: int = 10) -> list[asyncpg.Record]:
+        """list_users_page jaisa (sabse naye active pehle), par filter ke saath."""
+        if self.pool is None: return []
+        where = self.USER_SEGMENTS.get(segment, "TRUE")
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                f"""SELECT * FROM users WHERE {where}
+                    ORDER BY last_seen_at DESC NULLS LAST, created_at DESC
+                    OFFSET $1 LIMIT $2""",
+                max(0, offset), max(1, limit),
+            )
+
     async def count_paid_users(self) -> int:
         """Users on a paid plan that has not expired."""
         if self.pool is None: return 0
@@ -2179,8 +2210,13 @@ class Database:
                 return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE")
             if audience == "active":
                 return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE AND last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'")
-            if audience == "paid":
-                return await conn.fetch("SELECT telegram_user_id FROM users WHERE plan != 'free' AND is_blocked = FALSE")
+            if audience in ("paid", "trial", "expired", "running"):
+                # Admin list wale filter jaise — paid = trial ke bina chalta plan
+                where = {"paid": self.USER_SEGMENTS["paid"], "trial": self.USER_SEGMENTS["trial"],
+                         "expired": "plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry <= NOW()",
+                         "running": "plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry > NOW()"}[audience]
+                return await conn.fetch(
+                    f"SELECT telegram_user_id FROM users WHERE is_blocked = FALSE AND {where}")
             if audience in ("english", "hinglish"):
                 lang = "en" if audience == "english" else "hinglish"
                 return await conn.fetch("SELECT telegram_user_id FROM users WHERE preferred_language = $1 AND is_blocked = FALSE", lang)

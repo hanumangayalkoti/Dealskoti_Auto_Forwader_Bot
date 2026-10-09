@@ -5946,32 +5946,94 @@ async def recent_users_cb(callback: CallbackQuery, db: Database, settings: Setti
     await callback.answer()
 
 
+def _ist_text(dt) -> str:
+    return dt.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST") if dt else "—"
+
+
 async def _full_user_info_card(db: Database, u) -> tuple[str, InlineKeyboardMarkup]:
-    label = safe_html(u["first_name"] or u["username"] or "No name")
+    """Admin ke liye user ki poori detail — Affiliate bot jaisa card."""
+    uid = int(u["telegram_user_id"])
+    name = safe_html(u["first_name"] or "—")
     block_label = "✅ Unblock" if u["is_blocked"] else "⛔ Block"
     block_action = "unblock" if u["is_blocked"] else "block"
-    task_count = await db.count_tasks(int(u["telegram_user_id"]))
-    connected = await db.has_active_session(int(u["telegram_user_id"]))
-    text = (
-        f"👤 <b>{label}</b>\n"
-        f"Username: @{safe_html(u['username'] or '—')}\n"
-        f"Telegram ID: <code>{u['telegram_user_id']}</code>\n"
-        f"Language: {safe_html(u['preferred_language'] or '—')}\n"
-        f"Membership: {'✅ Joined' if u['updates_channel_member'] else '❌ Not joined'}\n"
-        f"Telegram account: {'✅ Connected' if connected else '❌ Not connected'}\n\n"
-        f"💎 <b>Subscription</b>\n"
-        f"Plan: {safe_html(str(u['plan']).title())}{' (🎁 Trial)' if _on_trial(u) else ''}\n"
-        f"Plan expiry: {u['plan_expiry'] or '—'}\n"
-        f"Scheduled plan: "
-        f"{safe_html(str(u['scheduled_plan']).title()) if u['scheduled_plan'] else '—'}\n\n"
-        f"📋 Tasks: {task_count}\n"
-        f"Blocked: {'Yes' if u['is_blocked'] else 'No'}\n"
-        f"Joined bot: {u['created_at']}\n"
-        f"Last active: {u['last_seen_at']}"
-    )
+    connected = await db.has_active_session(uid)
+    tasks = await db.list_tasks(uid)
+    stats = await db.usage_stats(uid)
+    now = datetime.now(timezone.utc)
+    plan_key = str(u["plan"] or "free")
+    expiry = u["plan_expiry"]
+    active = plan_key != "free" and expiry is not None and expiry > now
+    trial = _on_trial(u)
+
+    if u["is_blocked"]:
+        status = "⛔ Admin ne block kiya"
+    elif active:
+        status = "✅ Active"
+    elif plan_key != "free":
+        status = "⌛ Plan khatam"
+    else:
+        status = "🆓 Free plan"
+    if trial:
+        started = f"{_ist_text(u['trial_claimed_at'])} (trial)"
+    else:
+        purchase = None
+        with suppress(Exception):
+            purchase = await db.last_purchase_info(uid)
+        started = (f"{_ist_text(purchase['when'])} (last payment)" if purchase and purchase.get("when")
+                   else "—")
+    if active:
+        secs = (expiry - now).total_seconds()
+        left = f"{secs / 86400:.1f} din"
+    else:
+        left = "0"
+    plan = PLANS.get(plan_key, PLANS["free"])
+    cap = plan.daily_messages if plan.daily_messages else "∞"
+    claimed = u["trial_claimed_at"]
+
+    lines = [
+        f"👤 <b>{name}</b>",
+        f"🔗 Username: {'@' + safe_html(u['username']) if u['username'] else '— (nahi hai)'}",
+        f"🆔 ID: <code>{uid}</code>   🌐 {safe_html(u['preferred_language'] or '—')}\n",
+        f"📊 Status: <b>{status}</b>",
+        f"📢 Channel membership: {'✅ Joined' if u['updates_channel_member'] else '❌ Join nahi kiya'}",
+        f"📱 Telegram account: {'✅ Connected' if connected else '❌ Connect nahi'}\n",
+        f"💳 Plan: <b>{safe_html(_plan_text(u))}</b>",
+        f"🟢 Shuru: {started}",
+        f"⏳ Din baaki: <b>{left}</b>",
+        f"📅 Expiry: {_ist_text(expiry)}",
+    ]
+    if u["scheduled_plan"]:
+        lines.append(f"🗓️ Agla plan (book): {safe_html(plan_label(str(u['scheduled_plan'])))}")
+    lines += [
+        f"🎁 Trial liya: {'haan — ' + _ist_text(claimed) if claimed else 'nahi'} ({TRIAL_DAYS} din wala)",
+        f"🗓️ Joined: {_ist_text(u['created_at'])}",
+        f"👀 Last seen: {_ist_text(u['last_seen_at'])}",
+        f"\n📤 Messages: aaj {stats['today']} (limit {cap}/din) | mahina {stats['month']} | total {stats['total']}",
+        f"🕐 Last forward: {_ago(stats['last_forward_at'])}",
+        f"\n📋 <b>Tasks ({len(tasks)}/{plan.tasks})</b>",
+    ]
+    if not tasks:
+        lines.append("<i>Abhi koi task nahi bana.</i>")
+    for tk in tasks[:6]:
+        srcs = [x for x in _json_field(tk["sources"], []) if isinstance(x, dict)]
+        dsts = [x for x in _json_field(tk["destinations"], []) if isinstance(x, dict)]
+        src_txt = ", ".join(_chat_label(x) for x in srcs[:3]) + (f" +{len(srcs) - 3}" if len(srcs) > 3 else "")
+        dst_txt = ", ".join(_chat_label(x) for x in dsts[:3]) + (f" +{len(dsts) - 3}" if len(dsts) > 3 else "")
+        lines.append(
+            f"{'⏸️' if tk['is_paused'] else '▶️'} <b>{safe_html(tk['task_name'])}</b>"
+            f"  ({int(tk['forward_count'] or 0):,} forwarded)\n"
+            f"     📥 Source: {src_txt or '—'}\n"
+            f"     📤 Destination: {dst_txt or '—'}")
+    if len(tasks) > 6:
+        lines.append(f"… aur {len(tasks) - 6} task")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3990] + "…"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Grant Days", callback_data=f"admin:grant:{u['telegram_user_id']}"),
-         InlineKeyboardButton(text=block_label, callback_data=f"admin:{block_action}:{u['telegram_user_id']}")],
+        [InlineKeyboardButton(text="🎁 Grant Days", callback_data=f"admin:grant:{uid}"),
+         InlineKeyboardButton(text=block_label, callback_data=f"admin:{block_action}:{uid}")],
+        [InlineKeyboardButton(text="🔄 Refresh", callback_data=f"admin:uinfo:{uid}"),
+         InlineKeyboardButton(text="⬅️ List", callback_data="apage:uinfo:0")],
         [InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")],
     ])
     return text, keyboard
@@ -6265,27 +6327,54 @@ async def grant_days_command(
 
 ADMIN_PAGE_SIZE = 10
 
+# Admin list ke filter (Affiliate bot jaisa). Action ke saath "~" se judta hai,
+# jaise "uinfo~trial" — purane buttons ("uinfo") Sab dikhate hain.
+USER_SEGMENT_NAMES = [("all", "👥 Sab"), ("paid", "💎 Paid"), ("trial", "🎁 Trial"),
+                      ("free", "🆓 Free"), ("blocked", "⛔ Block")]
+
+
+def _split_action(action: str) -> tuple[str, str]:
+    base, _, seg = action.partition("~")
+    return base, (seg if seg in dict(USER_SEGMENT_NAMES) else "all")
+
 
 async def _render_user_picker(
     message_obj, db: Database, action: str, title: str, page: int = 0,
     selected: list[int] | None = None,
 ) -> None:
-    paid_only = action == "paid"
-    total = await (db.count_paid_users() if paid_only else db.count_all_users())
+    base, segment = _split_action(action)
+    paid_only = base == "paid"
+    if paid_only:
+        total = await db.count_paid_users()
+    else:
+        total = await db.count_users_segment(segment)
     pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     if paid_only:
         users = await db.list_paid_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
     else:
-        users = await db.list_users_page(page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
+        users = await db.list_users_segment_page(segment, page * ADMIN_PAGE_SIZE, ADMIN_PAGE_SIZE)
     selected = selected or []
-    multi = action in MULTI_SELECT_ACTIONS
+    multi = base in MULTI_SELECT_ACTIONS
+    seg_rows: list[list[InlineKeyboardButton]] = []
+    if not paid_only:
+        seg_btns = [InlineKeyboardButton(
+            text=("✔️ " if s_ == segment else "") + name,
+            callback_data=f"apage:{base}~{s_}:0",
+            style=STYLE_GO if s_ == segment else None,
+        ) for s_, name in USER_SEGMENT_NAMES]
+        seg_rows = [seg_btns[:3], seg_btns[3:]]
 
     if not users:
-        text = "💎 No paid members right now." if paid_only else "No users found."
-        markup = admin_keyboard()
+        text = "💎 No paid members right now." if paid_only else (
+            f"{title}\n\nFilter: <b>{dict(USER_SEGMENT_NAMES)[segment]}</b>\n\nIs filter mein koi user nahi.")
+        markup = (admin_keyboard() if paid_only else InlineKeyboardMarkup(inline_keyboard=seg_rows + [
+            [InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")]]))
     else:
-        lines = [title, ""]
+        lines = [title]
+        if not paid_only:
+            lines.append(f"Filter: <b>{dict(USER_SEGMENT_NAMES)[segment]}</b>")
+        lines.append("")
         number_row: list[InlineKeyboardButton] = []
         rows: list[list[InlineKeyboardButton]] = []
         for idx, u in enumerate(users):
@@ -6299,11 +6388,14 @@ async def _render_user_picker(
                 # Who is paying, on what, and how long until they need to renew.
                 left = _days_left_label(u["plan_expiry"])
                 lines.append(f"{number}. {label} — {_plan_text(u)} · {left}{flag}")
+            elif str(u["plan"] or "free") != "free" and u["plan_expiry"]:
+                left = _days_left_label(u["plan_expiry"])
+                lines.append(f"{number}. {label} — {_plan_text(u)} · {left}{flag}{tick}")
             else:
-                lines.append(f"{number}. {label} — {plan}{' (🎁 Trial)' if _on_trial(u) else ''}{flag}{tick}")
+                lines.append(f"{number}. {label} — {plan}{flag}{tick}")
             number_row.append(InlineKeyboardButton(
                 text=f"✅{number}" if uid in selected else str(number),
-                callback_data=f"apick:{action}:{page}:{uid}",
+                callback_data=f"apick:{base}~{segment}:{page}:{uid}",
             ))
             if len(number_row) == 5:
                 rows.append(number_row)
@@ -6313,26 +6405,27 @@ async def _render_user_picker(
 
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"apage:{action}:{page - 1}"))
+            nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"apage:{base}~{segment}:{page - 1}"))
         if page < pages - 1:
-            nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"apage:{action}:{page + 1}"))
+            nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"apage:{base}~{segment}:{page + 1}"))
         if nav:
             rows.append(nav)
+        rows = seg_rows + rows
 
         if multi:
             rows.append([InlineKeyboardButton(
-                text=f"✅ Done ({len(selected)} selected)", callback_data=f"adone:{action}",
+                text=f"✅ Done ({len(selected)} selected)", callback_data=f"adone:{base}",
             )])
             if selected:
                 rows.append([InlineKeyboardButton(
-                    text="🗑️ Clear selection", callback_data=f"aclear:{action}:{page}",
+                    text="🗑️ Clear selection", callback_data=f"aclear:{base}~{segment}:{page}",
                 )])
         rows.append([InlineKeyboardButton(text="🏠 Admin", callback_data="admin:home")])
 
         lines.append("")
         lines.append(
             f"Page {page + 1} of {pages} · {total} paid members" if paid_only
-            else f"Page {page + 1} of {pages} · {total} users total"
+            else f"Page {page + 1} of {pages} · {total} users"
         )
         if multi:
             lines.append(f"✅ Selected: <b>{len(selected)}</b> — selection is kept while you page")
@@ -6372,11 +6465,12 @@ async def admin_picker_page_cb(
     if callback.message is None:
         return
     _, action, page = callback.data.split(":")
+    base, _seg = _split_action(action)
     data = await state.get_data()
     await _render_user_picker(
         callback.message, db, action,
-        ADMIN_PICKER_TITLES.get(action, "👥 <b>Select a user</b>"), int(page),
-        selected=list(data.get(f"sel_{action}") or []),
+        ADMIN_PICKER_TITLES.get(base, "👥 <b>Select a user</b>"), int(page),
+        selected=list(data.get(f"sel_{base}") or []),
     )
     await callback.answer()
 
@@ -6390,8 +6484,9 @@ async def admin_picker_select_cb(
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None:
         return
-    _, action, page, uid_str = callback.data.split(":")
+    _, full_action, page, uid_str = callback.data.split(":")
     target_user_id, page = int(uid_str), int(page)
+    action, _seg = _split_action(full_action)
 
     user = await db.get_user(target_user_id)
     if user is None:
@@ -6410,7 +6505,7 @@ async def admin_picker_select_cb(
             note = f"{label} selected"
         await state.update_data({key: selected})
         await _render_user_picker(
-            callback.message, db, action, ADMIN_PICKER_TITLES[action], page, selected=selected,
+            callback.message, db, full_action, ADMIN_PICKER_TITLES[action], page, selected=selected,
         )
         return await callback.answer(note)
 
@@ -6427,7 +6522,7 @@ async def admin_picker_select_cb(
         else:
             await forwarding.refresh_user(target_user_id)
         await _render_user_picker(
-            callback.message, db, "block", ADMIN_PICKER_TITLES["block"], page,
+            callback.message, db, full_action, ADMIN_PICKER_TITLES["block"], page,
         )
         return await callback.answer(f"{label} {'blocked' if blocked else 'unblocked'}")
 
@@ -6443,7 +6538,7 @@ async def admin_picker_select_cb(
             )
         await callback.answer(f"Paid {format_paise(total)}", show_alert=True)
         return await _render_user_picker(
-            callback.message, db, "payout", ADMIN_PICKER_TITLES["payout"], page,
+            callback.message, db, full_action, ADMIN_PICKER_TITLES["payout"], page,
         )
 
     await callback.answer()
@@ -6457,10 +6552,11 @@ async def admin_picker_clear_cb(
         return await callback.answer("Admin only", show_alert=True)
     if callback.message is None:
         return
-    _, action, page = callback.data.split(":")
+    _, full_action, page = callback.data.split(":")
+    action, _seg = _split_action(full_action)
     await state.update_data({f"sel_{action}": []})
     await _render_user_picker(
-        callback.message, db, action, ADMIN_PICKER_TITLES[action], int(page), selected=[],
+        callback.message, db, full_action, ADMIN_PICKER_TITLES[action], int(page), selected=[],
     )
     await callback.answer("Selection cleared")
 
@@ -6965,8 +7061,15 @@ async def broadcast_start(message: Message, state: FSMContext, settings: Setting
     )
 
 
+BROADCAST_AUDIENCES = [
+    ("all", "👥 Sabko"), ("running", "✅ Plan/Trial chalu"), ("paid", "💎 Sirf Paid"),
+    ("trial", "🎁 Sirf Trial"), ("expired", "⌛ Plan khatam"), ("active", "🟢 30 din active"),
+    ("english", "🇬🇧 English"), ("hinglish", "🇮🇳 Hinglish"),
+]
+
+
 @router.message(AdminBroadcastStates.waiting_message)
-async def broadcast_message(message: Message, state: FSMContext, settings: Settings) -> None:
+async def broadcast_message(message: Message, state: FSMContext, settings: Settings, db: Database) -> None:
     if not _is_admin(settings, message.from_user.id):
         return
     if not message.text:
@@ -6975,18 +7078,25 @@ async def broadcast_message(message: Message, state: FSMContext, settings: Setti
         await state.clear()
         return await message.answer("Broadcast cancelled.")
     await state.update_data(broadcast_text=message.text[:4000])
+    rows, pair = [], []
+    for key, name in BROADCAST_AUDIENCES:
+        count = 0
+        with suppress(Exception):
+            count = len(await db.list_broadcast_users(key))
+        pair.append(InlineKeyboardButton(text=f"{name} ({count})", callback_data=f"admin:broadcast:{key}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton(text="👥 Users chunein", callback_data="admin:broadcast:selectusers",
+                                      style=STYLE_GO)])
+    rows.append([InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")])
     await message.answer(
-        "📣 <b>Preview</b>\n\n" + safe_html(message.text[:4000]) + "\n\nChoose an audience:",
+        "📣 <b>Preview</b>\n\n" + safe_html(message.text[:4000])
+        + "\n\n<b>Ye message kisko bhejna hai?</b>\n<i>Bracket mein kitne users hain.</i>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="All users", callback_data="admin:broadcast:all"),
-             InlineKeyboardButton(text="Active users", callback_data="admin:broadcast:active")],
-            [InlineKeyboardButton(text="Paid users", callback_data="admin:broadcast:paid"),
-             InlineKeyboardButton(text="English", callback_data="admin:broadcast:english")],
-            [InlineKeyboardButton(text="Hinglish", callback_data="admin:broadcast:hinglish"),
-             InlineKeyboardButton(text="👥 Select Users", callback_data="admin:broadcast:selectusers")],
-            [InlineKeyboardButton(text="✖️ Cancel", callback_data="admin:home")],
-        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
