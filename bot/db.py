@@ -310,6 +310,16 @@ CREATE INDEX IF NOT EXISTS idx_fsm_state_age ON fsm_state (updated_at);
 -- non-NULL value means the trial has already been claimed, so it can never
 -- be taken a second time.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_claimed_at TIMESTAMP WITH TIME ZONE;
+-- User ne bot block kiya (admin block se ALAG — is_blocked sirf admin ka faisla)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked_at TIMESTAMP WITH TIME ZONE;
+-- Kabhi account connect kiya tha? (dobara connect = "Reconnected")
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ever_connected BOOLEAN DEFAULT FALSE;
+-- Jo pehle se connect hain / task bana chuke hain, unhe "pehle connect tha" maano
+UPDATE users SET ever_connected = TRUE
+ WHERE COALESCE(ever_connected, FALSE) = FALSE
+   AND (telegram_user_id IN (SELECT user_id FROM sessions)
+        OR telegram_user_id IN (SELECT user_id FROM tasks));
 
 -- ===== BROADCAST RECALL =====
 -- Which message id a broadcast landed on, per user. Without this a wrong
@@ -495,7 +505,32 @@ class Database:
             return res == "UPDATE 1"
 
     async def mark_user_inactive(self, user_id: int) -> None:
-        await self.set_blocked(user_id, True)
+        """User ne bot block kar diya (Telegram ne message mana kiya).
+
+        Pehle ye is_blocked (ADMIN block) laga deta tha — user ki forwarding band
+        ho jaati thi aur unblock karne ke baad bhi bot use nahi kar paata tha.
+        Ab sirf bot_blocked lagta hai; forwarding uske apne account se chalti rehti hai."""
+        await self.set_bot_blocked(user_id, True)
+
+    async def set_bot_blocked(self, user_id: int, blocked: bool) -> bool:
+        """True = haal badla (pehle aisa nahi tha). Admin ko khabar sirf tab."""
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            res = await conn.execute(
+                """UPDATE users SET bot_blocked = $1,
+                          bot_blocked_at = CASE WHEN $1 THEN CURRENT_TIMESTAMP ELSE bot_blocked_at END
+                   WHERE telegram_user_id = $2 AND COALESCE(bot_blocked, FALSE) <> $1""",
+                blocked, user_id)
+            return res == "UPDATE 1"
+
+    async def mark_connected(self, user_id: int) -> bool:
+        """Account connect hua. Returns True agar pehle bhi kabhi connect tha (reconnect)."""
+        if self.pool is None: return False
+        async with self.pool.acquire() as conn:
+            before = await conn.fetchval(
+                "SELECT COALESCE(ever_connected, FALSE) FROM users WHERE telegram_user_id = $1", user_id)
+            await conn.execute("UPDATE users SET ever_connected = TRUE WHERE telegram_user_id = $1", user_id)
+            return bool(before)
 
     async def get_users_for_membership_check(self) -> list[asyncpg.Record]:
         if self.pool is None: return []
@@ -2207,19 +2242,21 @@ class Database:
         if self.pool is None: return []
         async with self.pool.acquire() as conn:
             if audience == "all":
-                return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE")
+                return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE "
+                                        "AND COALESCE(bot_blocked, FALSE) = FALSE")
             if audience == "active":
-                return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE AND last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'")
+                return await conn.fetch("SELECT telegram_user_id FROM users WHERE is_blocked = FALSE AND COALESCE(bot_blocked, FALSE) = FALSE AND last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'")
             if audience in ("paid", "trial", "expired", "running"):
                 # Admin list wale filter jaise — paid = trial ke bina chalta plan
                 where = {"paid": self.USER_SEGMENTS["paid"], "trial": self.USER_SEGMENTS["trial"],
                          "expired": "plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry <= NOW()",
                          "running": "plan != 'free' AND plan_expiry IS NOT NULL AND plan_expiry > NOW()"}[audience]
                 return await conn.fetch(
-                    f"SELECT telegram_user_id FROM users WHERE is_blocked = FALSE AND {where}")
+                    f"SELECT telegram_user_id FROM users WHERE is_blocked = FALSE "
+                    f"AND COALESCE(bot_blocked, FALSE) = FALSE AND {where}")
             if audience in ("english", "hinglish"):
                 lang = "en" if audience == "english" else "hinglish"
-                return await conn.fetch("SELECT telegram_user_id FROM users WHERE preferred_language = $1 AND is_blocked = FALSE", lang)
+                return await conn.fetch("SELECT telegram_user_id FROM users WHERE preferred_language = $1 AND is_blocked = FALSE AND COALESCE(bot_blocked, FALSE) = FALSE", lang)
             return []
 
     async def create_broadcast(self, admin_id: int, audience: str, message: str, total_users: int) -> int:
