@@ -686,6 +686,8 @@ class ForwardingEngine:
 
         # ---- automatic reconnect after a TEMPORARY connect failure ----
         self._reconnect_attempts: dict[int, int] = {}
+        # Admin ko khabar (main.py set karta hai): async fn(user_id, reason)
+        self.on_session_dead = None
         self._reconnect_pending: set[int] = set()
 
         # ---- Reply Sync state ----
@@ -801,7 +803,7 @@ class ForwardingEngine:
             logger.warning(f"Dropping invalid session for user {user_id}: {exc}")
             with suppress(Exception):
                 await self.telethon.disconnect(user_id)
-            await self._session_dead(user_id)
+            await self._session_dead(user_id, "session kharab (invalid) tha")
             return "dead"
 
         try:
@@ -810,7 +812,7 @@ class ForwardingEngine:
                 await self.telethon.disconnect(user_id)
                 if client.is_connected():
                     await client.disconnect()
-                await self._session_dead(user_id)
+                await self._session_dead(user_id, "login khatam — user ne Telegram se session hataya ya logout kiya")
                 return "dead"
 
             # Telethon handles SHORT rate limits itself by sleeping. Setting
@@ -838,6 +840,7 @@ class ForwardingEngine:
 
             self.clients[user_id] = client
             self._reconnect_attempts.pop(user_id, None)
+            asyncio.create_task(self._watch_client(user_id, client))
             with suppress(Exception):
                 self._cache_sources(user_id, await self.db.list_tasks(user_id))
             return "ok"
@@ -852,7 +855,7 @@ class ForwardingEngine:
                     await client.disconnect()
             with suppress(Exception):
                 await self.telethon.disconnect(user_id)
-            await self._session_dead(user_id)
+            await self._session_dead(user_id, f"Telegram ne session band kiya ({type(e).__name__})")
             return "dead"
         except Exception as e:
             # Network blip, timeout, rate limit, Telegram hiccup: the session
@@ -864,11 +867,31 @@ class ForwardingEngine:
             self._schedule_reconnect(user_id)
             return "retry"
 
-    async def _session_dead(self, user_id: int) -> None:
+    async def _session_dead(self, user_id: int, reason: str = "") -> None:
         """The one message worth sending: forwarding has fully stopped."""
         self._reconnect_attempts.pop(user_id, None)
         with suppress(Exception):
             await self._warn_once(user_id, "session_dead", "notify_session_dead", hours=24)
+        if self.on_session_dead is not None:
+            with suppress(Exception):
+                await self.on_session_dead(user_id, reason)
+
+    async def _watch_client(self, user_id: int, client) -> None:
+        """Chalte-chalte session toot jaaye (user ne Telegram settings se session
+        hata diya, logout, account band) to pakdo. Pehle bot ko agle restart tak
+        pata hi nahi chalta tha — forwarding chup-chaap band rehti thi.
+
+        Telethon network ki chhoti dikkat khud theek kar leta hai; `disconnected`
+        tabhi poora hota hai jab connection sach mein khatam ho jaaye."""
+        with suppress(Exception):
+            await client.disconnected
+        if not self._running or self.clients.get(user_id) is not client:
+            return          # humne khud hataya/badla (refresh, stop, block) — kuch nahi karna
+        self.clients.pop(user_id, None)
+        logger.warning("Client for user %s disconnected unexpectedly — checking the session", user_id)
+        status = await self.refresh_user(user_id)
+        if status == "ok":
+            logger.info("Client for user %s reconnected automatically", user_id)
 
     def _schedule_reconnect(self, user_id: int) -> None:
         """Quietly tries again later. Never stacks up duplicate attempts."""
@@ -878,7 +901,8 @@ class ForwardingEngine:
         if attempt >= RECONNECT_MAX_ATTEMPTS:
             # Hours of failures: no longer a blip. Now it is worth telling them.
             logger.error("Giving up automatic reconnect for user %s after %s attempts", user_id, attempt)
-            asyncio.create_task(self._session_dead(user_id))
+            asyncio.create_task(self._session_dead(
+                user_id, f"{attempt} baar reconnect fail (kai ghante) — network/Telegram dikkat"))
             return
         self._reconnect_attempts[user_id] = attempt + 1
         delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]

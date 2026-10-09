@@ -50,6 +50,7 @@ from aiogram.types import (
     InputMediaPhoto,
     BotCommandScopeChat,
     CallbackQuery,
+    ChatMemberUpdated,
     ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
@@ -330,6 +331,21 @@ def _chat_label(entity: dict) -> str:
     title = safe_html(entity.get("title") or entity.get("id") or "?")
     username = entity.get("username")
     return f"{title} (@{safe_html(username)})" if username else f"{title} (private)"
+
+
+async def _admin_user_lines(db, user_id: int) -> str:
+    """Admin khabar ke liye user ki pehchaan — naam, username, ID, plan, tasks."""
+    user = None
+    with suppress(Exception):
+        user = await db.get_user(user_id)
+    tasks = 0
+    with suppress(Exception):
+        tasks = len(await db.list_tasks(user_id))
+    return (f"👤 Name: {_format_name(user)}\n"
+            f"🔗 Username: {_handle(user)}\n"
+            f"🆔 User ID: <code>{user_id}</code>\n"
+            f"💳 Plan: {safe_html(_plan_text(user))}\n"
+            f"📋 Tasks: {tasks}")
 
 
 def _format_name(user) -> str:
@@ -1514,10 +1530,14 @@ async def _finish_login_success(
     with suppress(Exception):
         await _offer_trial_after_connect(message.bot, db, message.from_user.id, language)
 
+    reconnected = False
+    with suppress(Exception):
+        reconnected = await db.mark_connected(message.from_user.id)
     await _notify_admins(
         message.bot, settings,
-        f"🔌 <b>Account Connected</b>\n\n"
-        f"👤 Name: {_format_name(user)}\n"
+        ("🔄 <b>Account Reconnected</b> (pehle bhi connect tha)\n\n" if reconnected
+         else "🔌 <b>Account Connected</b> (pehli baar)\n\n")
+        + f"👤 Name: {_format_name(user)}\n"
         f"🔗 Bot Username: {_handle(user)}\n"
         f"🆔 User ID: <code>{message.from_user.id}</code>\n"
         f"📱 Connected as: "
@@ -2151,6 +2171,35 @@ async def auth_disconnect_ask(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
+@router.my_chat_member(F.chat.type == "private")
+async def bot_blocked_or_unblocked(event: ChatMemberUpdated, db: Database, settings: Settings) -> None:
+    """User ne bot BLOCK / UNBLOCK kiya — admin ko turant khabar.
+
+    Block karne se forwarding NAHI rukti (wo user ke apne account se chalti hai);
+    bas bot use message nahi bhej payega — reminders, reports, warnings."""
+    raw = getattr(event.new_chat_member, "status", "")
+    status = str(getattr(raw, "value", raw) or "")       # enum ho ya string — "kicked" / "member"
+    user_id = event.chat.id
+    if status == "kicked":
+        if not await db.set_bot_blocked(user_id, True):
+            return                          # pehle se blocked mark tha
+        connected = await db.has_active_session(user_id)
+        await _notify_admins(
+            event.bot, settings,
+            "🚫 <b>User ne Bot BLOCK kiya</b>\n\n" + await _admin_user_lines(db, user_id)
+            + f"\n📱 Account: {'✅ Connected — forwarding chalti rahegi' if connected else '❌ Connect nahi'}"
+            + f"\n\nℹ️ Ab bot ise reminder / warning nahi bhej payega.\n🕐 {_now_ist()}",
+        )
+    elif status == "member":
+        if not await db.set_bot_blocked(user_id, False):
+            return                          # naya user / pehle se unblocked — /start wali khabar kaafi
+        await _notify_admins(
+            event.bot, settings,
+            "✅ <b>User ne Bot UNBLOCK kiya</b>\n\n" + await _admin_user_lines(db, user_id)
+            + f"\n\n🕐 {_now_ist()}",
+        )
+
+
 @router.callback_query(F.data == "auth:disconnect")
 async def auth_disconnect_callback(
     callback: CallbackQuery, db: Database, telethon: TelethonService,
@@ -2159,10 +2208,19 @@ async def auth_disconnect_callback(
     if callback.message is None:
         return
     language = await _language_for_callback(db, callback)
+    had_session = await db.has_active_session(callback.from_user.id)
     await forwarding.remove_user(callback.from_user.id)
     await telethon.disconnect(callback.from_user.id)
     await _safe_edit(callback.message, safe_t(language, "disconnect_done"), _nav_keyboard())
     await callback.answer()
+    if had_session:
+        with suppress(Exception):
+            await _notify_admins(
+                callback.bot, settings,
+                "🔌 <b>Account Disconnected</b> (user ne khud kiya)\n\n"
+                + await _admin_user_lines(db, callback.from_user.id)
+                + f"\n\n⛔ Iski forwarding ab band hai.\n🕐 {_now_ist()}",
+            )
 
 
 # ==========================================
@@ -5965,8 +6023,11 @@ async def _full_user_info_card(db: Database, u) -> tuple[str, InlineKeyboardMark
     active = plan_key != "free" and expiry is not None and expiry > now
     trial = _on_trial(u)
 
+    bot_blocked = bool(u["bot_blocked"]) if "bot_blocked" in u.keys() else False
     if u["is_blocked"]:
         status = "⛔ Admin ne block kiya"
+    elif bot_blocked:
+        status = "🚫 User ne bot block kiya (forwarding chalti hai, message nahi jaate)"
     elif active:
         status = "✅ Active"
     elif plan_key != "free":
@@ -7512,6 +7573,16 @@ async def _run(settings: Settings) -> None:
         storage_channel_id=settings.file_storage_channel_id,
         bot=bot,
     )
+
+    async def _on_session_dead(user_id: int, reason: str) -> None:
+        await _notify_admins(
+            bot, settings,
+            "🔴 <b>Session Disconnect</b> — forwarding band\n\n" + await _admin_user_lines(db, user_id)
+            + f"\n\n❓ Wajah: {safe_html(reason or 'session khatam')}"
+            + "\n📩 User ko /connect karne ka message bheja gaya."
+            + f"\n🕐 {_now_ist()}",
+        )
+    forwarding.on_session_dead = _on_session_dead
 
     # FSM state lives in Postgres, not memory. Railway restarts the bot on
     # every deploy, and in-memory state was wiped each time — anyone halfway
